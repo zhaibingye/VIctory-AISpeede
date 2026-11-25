@@ -41,13 +41,8 @@ use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
 use crate::shadow::Shadow;
 
-/// Pages per level-2 block: 4096 pages of 64 KiB, 256 MiB.
-const BLOCK: usize = 4096;
-/// Level-1 entries: 2^40 bytes in 256 MiB blocks.
-const LEVEL1: usize = 4096;
-/// Level-2 blocks a table has room for besides the null one: copies in 512
-/// distinct 256 MiB regions (the world's ~4,100 copies use a few dozen).
-const CAPACITY: usize = 512;
+use victory_memory::gpu_table::{ADDRESS_LIMIT, BLOCK, CAPACITY, LEVEL1, RawPageTable};
+
 /// The key of our own view heap ([`heap`]) among the title's.
 pub(crate) const OURS: usize = usize::MAX;
 
@@ -204,49 +199,39 @@ pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
 fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
     let mut order: Vec<usize> = (0..copies.len()).collect();
     order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
-    let mut level1 = vec![0u32; LEVEL1];
-    // Block 0 is the null block (no copy).
-    let mut blocks = vec![usize::MAX];
-    let mut owner: Vec<Option<(usize, bool)>> = vec![None; BLOCK];
+    let mut table = RawPageTable::new(null);
+    let mut owner = vec![None; BLOCK];
     let mut full = false;
     for &k in &order {
         let (start, len) = copies[k];
-        if len == 0 || start + len > 1 << 40 {
+        let Some(end) = start.checked_add(len).filter(|&end| len != 0 && end <= ADDRESS_LIMIT) else {
             continue;
-        }
-        for page in start >> 16..=(start + len - 1) >> 16 {
-            let l1 = (page >> 12) as usize;
-            if level1[l1] == 0 {
-                if blocks.len() > CAPACITY {
-                    full = true;
-                    continue;
+        };
+        for page in start >> 16..=(end - 1) >> 16 {
+            let base = page << 16;
+            let whole = base >= start && base + (1 << 16) <= end;
+            let bound = table.bind_bias_if(base, pairs[k], start as u32, |entry| {
+                if entry >= owner.len() {
+                    owner.resize((entry / BLOCK + 1) * BLOCK, None);
                 }
-                level1[l1] = blocks.len() as u32;
-                blocks.push(l1);
-                owner.resize(owner.len() + BLOCK, None);
-            }
-            let entry = level1[l1] as usize * BLOCK + (page & 0xFFF) as usize;
-            // Larger copies come first: a copy holding the whole page takes
-            // it from them; one holding part of it only takes it if free.
-            let whole = page << 16 >= start && (page + 1) << 16 <= start + len;
-            if whole || owner[entry].is_none() {
-                owner[entry] = Some((k, whole));
-            }
+                // Larger copies come first: a whole page takes precedence;
+                // a partial page only takes an otherwise unbound leaf.
+                if whole || owner[entry].is_none() {
+                    owner[entry] = Some(k);
+                    true
+                } else {
+                    false
+                }
+            });
+            full |= bound.is_err();
         }
     }
     if full {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
     }
-    let mut dwords = level1;
-    for o in &owner {
-        let entry = match *o {
-            Some((k, _)) => [pairs[k], copies[k].0 as u32],
-            None => [null, 0],
-        };
-        dwords.extend(entry);
-    }
-    (dwords, blocks, owner.into_iter().map(|o| o.map(|o| o.0)).collect())
+    let (dwords, blocks) = table.into_parts();
+    (dwords, blocks, owner)
 }
 
 impl Shared {

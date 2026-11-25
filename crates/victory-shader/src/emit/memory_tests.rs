@@ -23,6 +23,7 @@ const ZERO: u16 = 128;
 const SIXTY_FOUR: u16 = 192;
 /// The title address of the memory the program reads: above 4 GiB.
 const TITLE: u64 = 0x12_3450_0000;
+const TITLE_ALIAS: u64 = 0x91_0001_0000;
 
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
     0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
@@ -129,6 +130,7 @@ fn program() -> HostShader {
     w.push(v_mov_b32(5, 2)); // v5 = s2 (value)
     w.push(v_mov_b32(6, 3)); // v6 = s3 (operand)
     w.extend(global(29, 0, 1, 5, 30, 0)); // global_store_dwordx2
+    w.extend(global(28, 0, 1, 5, 12, 4)); // store through the distant alias
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -231,19 +233,13 @@ fn program() -> HostShader {
     shader
 }
 
-/// The page table for one copy of title memory at [`TITLE`] whose views
-/// are at heap index `view` (null pair at `null`).
+/// Independent D3D12 resources, plus a second VA for the first page.
 fn page_table(view: u32, null: u32) -> Vec<u32> {
-    let mut t = vec![0u32; 4096];
-    let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
-    t[(hi << 4 | lo >> 28) as usize] = 1;
-    for _ in 0..2 * 4096 {
-        t.extend([null, 0]);
-    }
-    let entry = 4096 + 2 * (4096 + (lo >> 16 & 0xFFF) as usize);
-    t[entry..entry + 2].copy_from_slice(&[view, lo]);
-    t[entry + 2..entry + 4].copy_from_slice(&[5, lo + 0x1_0000]);
-    t
+    let mut table = victory_memory::gpu_table::RawPageTable::new(null);
+    table.bind_page(TITLE, view, 0).unwrap();
+    table.bind_page(TITLE + 0x1_0000, 5, 0x1_0000).unwrap();
+    table.bind_page(TITLE_ALIAS, view, 0).unwrap();
+    table.into_parts().0
 }
 
 #[test]
@@ -254,10 +250,10 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
         .unwrap_or_else(|e| e.into_inner());
     let mut memory = vec![0u32; 0x1_0000 / 4];
     memory[0] = 0x1111_1111;
-    let pointer = TITLE + 0x100;
+    let pointer = TITLE_ALIAS + 0x100;
     memory[2] = pointer as u32;
     memory[3] = (pointer >> 32) as u32;
-    // The next page (no copy) and another 256 MiB region (no block).
+    // An unbound page and another 256 MiB region (no block).
     let (next, far) = (TITLE + 0x2_0010, 0x55_0000_0040u64);
     memory[4..8].copy_from_slice(&[next as u32, (next >> 32) as u32, far as u32, (far >> 32) as u32]);
     memory[0x40] = 0x2222_2222;
@@ -269,7 +265,8 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     let boundary = TITLE + 0xfffc;
     memory[0x30 / 4..0x38 / 4].copy_from_slice(&[boundary as u32, (boundary >> 32) as u32]);
     *memory.last_mut().unwrap() = 0x1122_3344;
-    let second_page = [0x5566_7788];
+    let mut second_page = vec![0u32; 0x1_0000 / 4 + 1];
+    second_page[0x1_0000 / 4] = 0x5566_7788;
     let value = 0xCAFE_F00D;
     // Heap index 1 (the memory's view) has the title address.
     let mut view_addresses = vec![0u32; 2 * (2 + 5)];
@@ -303,7 +300,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                         roots: vec![
                             (0, Root::Constants(ud)),
                             (1, Root::View { srv: true, data: page_table(1, 3) }),
-                            (2, Root::Uav(2 * 4096 / 32)),
+                            (2, Root::Uav(3 * 4096 / 32)),
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
@@ -327,18 +324,20 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
             assert_eq!(out[1][(0x200 + 0x20) / 4], value, "{label}: the root UAV store");
+            assert_eq!(out[1][0x104 / 4], value, "{label}: store through the alias");
             assert_eq!(*out[1].last().unwrap(), value, "{label}: first page store");
-            assert_eq!(out[2][0], operand.to_bits(), "{label}: second page store");
+            assert_eq!(out[2][0x1_0000 / 4], operand.to_bits(), "{label}: second page store");
             let floats = [f32::from_bits(out[1][0x20]), f32::from_bits(out[1][0x21])];
             let want = [operand.min(1.0), operand.max(-1.0)];
             assert_eq!(floats, want, "{label}: float min and max");
             // The far region by its level-1 index, both written pages,
-            // and the missed page after them; nothing else.
+            // the missed page after them, and the alias; nothing else.
             let entry = 4096 + (TITLE as u32 >> 16 & 0xFFF) as usize;
             let marked: Vec<usize> = (0..out[3].len() * 32)
                 .filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0)
                 .collect();
-            assert_eq!(marked, [(far >> 28) as usize, entry, entry + 1, entry + 2], "{label}: pages");
+            let alias_entry = 2 * 4096 + (TITLE_ALIAS as u32 >> 16 & 0xFFF) as usize;
+            assert_eq!(marked, [(far >> 28) as usize, entry, entry + 1, entry + 2, alias_entry], "{label}: pages");
         }
         ran += 1;
     }

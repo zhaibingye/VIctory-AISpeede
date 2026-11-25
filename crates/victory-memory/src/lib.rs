@@ -4,6 +4,7 @@
 pub mod budget;
 pub mod coherence;
 pub mod engine;
+pub mod gpu_table;
 pub mod guest;
 pub mod physical;
 pub mod residency;
