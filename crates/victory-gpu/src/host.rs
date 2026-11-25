@@ -1685,6 +1685,10 @@ impl HostList {
         &self.list
     }
 
+    pub(crate) fn mark_unlowered(&self) {
+        self.recording_flags.fetch_or(NATIVE_RECORDING, Ordering::Relaxed);
+    }
+
     /// Admit the complete closed page list or none of it. Native work,
     /// deferred uploads/refreshes and fence callbacks need their own
     /// ordered lowering before this gate can accept them.

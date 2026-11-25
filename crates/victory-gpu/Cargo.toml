@@ -21,6 +21,8 @@ victory-shader = { workspace = true, features = ["host"] }
 tempfile.workspace = true
 
 [features]
+# Development cutover: title queues use only the strict page renderer.
+paged-title = []
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
 

@@ -237,6 +237,9 @@ impl State {
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
         self.topology = topology;
+        if cfg!(feature = "paged-title") {
+            return;
+        }
         let host = match topology {
             RECTANGLES => 4,
             TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
@@ -353,7 +356,9 @@ impl State {
                 self.page_target = crate::resource::host_copy(record.resource)
                     .and_then(|copy| crate::page_draw::ColorTarget::capture(copy, desc));
             }
-            rtvs.push(host.rtv(texture, desc.as_ref()));
+            if !cfg!(feature = "paged-title") {
+                rtvs.push(host.rtv(texture, desc.as_ref()));
+            }
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -363,6 +368,9 @@ impl State {
             crate::capture::note_target(list, record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
+        if cfg!(feature = "paged-title") {
+            return;
+        }
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.recording().OMSetRenderTargets(
@@ -374,8 +382,17 @@ impl State {
         };
     }
 
-    #[allow(dead_code, reason = "used by the closed command recorder at cutover")]
-    pub(crate) fn capture_page_draw(
+    fn record_strict_draw(&self, list: &HostList, call: crate::page_draw::DrawCall) -> bool {
+        if let Some(draw) = self.capture_page_draw(call) {
+            list.record_page_draw(draw);
+            true
+        } else {
+            list.mark_unlowered();
+            false
+        }
+    }
+
+    fn capture_page_draw(
         &self,
         call: crate::page_draw::DrawCall,
     ) -> Option<crate::page_draw::ClosedDraw> {
@@ -1435,6 +1452,12 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        if cfg!(feature = "paged-title") {
+            self.record_strict_draw(list, crate::page_draw::DrawCall::Direct {
+                vertices, instances, first, first_instance,
+            });
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -1539,6 +1562,12 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        if cfg!(feature = "paged-title") {
+            self.record_strict_draw(list, crate::page_draw::DrawCall::Indexed {
+                indices, instances, first, base, first_instance,
+            });
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1579,6 +1608,20 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        if cfg!(feature = "paged-title") {
+            if max == 0 {
+                return true;
+            }
+            if !matches!(kind, 0 | 1) {
+                list.mark_unlowered();
+                return false;
+            }
+            return self.record_strict_draw(list, crate::page_draw::DrawCall::Indirect(
+                crate::page_indirect::IndirectDraw {
+                    indexed: kind == 1, stride, max, arguments, count,
+                },
+            ));
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1907,18 +1950,21 @@ const QUAD_STRIP: u32 = 20;
 impl State {
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
         self.page_viewport = match viewports { [v] => Some(*v), _ => None };
+        if cfg!(feature = "paged-title") { return; }
         // SAFETY: an open list.
         unsafe { list.recording().RSSetViewports(viewports) };
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
         self.page_scissor = match rects { [r] => Some(*r), _ => None };
+        if cfg!(feature = "paged-title") { return; }
         // SAFETY: an open list.
         unsafe { list.recording().RSSetScissorRects(rects) };
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
         self.page_blend = factor.copied();
+        if cfg!(feature = "paged-title") { return; }
         // SAFETY: an open list.
         unsafe { list.recording().OMSetBlendFactor(factor) };
     }

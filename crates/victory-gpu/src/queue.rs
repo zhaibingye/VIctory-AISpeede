@@ -123,7 +123,20 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.execute(&host_lists);
+        if cfg!(feature = "paged-title") {
+            if host_lists.len() != lists.len() {
+                crate::host::fail(format_args!("paged title submission has a list without a host recorder"));
+            }
+            let heap = crate::memory::heap().unwrap_or_else(|| {
+                crate::host::fail(format_args!("paged title submission has no descriptor heap"));
+            });
+            let mut backing = crate::title_backing::SubmissionBacking::default();
+            if let Err(error) = host.execute_paged_title(heap, &mut backing, &host_lists) {
+                crate::host::fail(format_args!("paged title submission rejected: {error:?}"));
+            }
+        } else {
+            host.execute(&host_lists);
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
