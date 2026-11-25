@@ -194,7 +194,7 @@ fn program() -> HostShader {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
-    assert_eq!(memory, 15, "every access through the pointer is title memory");
+    assert_eq!(memory, 16, "include the added global store through s[12:13]");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         native: &native,

@@ -39,6 +39,9 @@ mod indirect;
 pub mod list;
 #[cfg(windows)]
 mod memory;
+#[cfg(windows)]
+#[allow(dead_code, reason = "wired into title submissions together with direct/texture coherence at cutover")]
+mod page_slabs;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

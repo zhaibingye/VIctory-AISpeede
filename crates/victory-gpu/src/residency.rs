@@ -53,6 +53,26 @@ impl crate::host::Host {
     pub(crate) fn managed_gpu<T: Interface>(
         &self,
         bytes: u64,
+        make: impl FnMut(&D3D12_HEAP_PROPERTIES) -> Result<T>,
+    ) -> Result<T> {
+        self.allocate_gpu(bytes, false, make)
+    }
+
+    /// Page slabs are the evictable local working set on a discrete GPU.
+    /// Exceeding local admission asks the caller to reclaim a clean slot,
+    /// not to silently grow a second slab pool in system memory.
+    pub(crate) fn managed_page_slab<T: Interface>(
+        &self,
+        bytes: u64,
+        make: impl FnMut(&D3D12_HEAP_PROPERTIES) -> Result<T>,
+    ) -> Result<T> {
+        self.allocate_gpu(bytes, true, make)
+    }
+
+    fn allocate_gpu<T: Interface>(
+        &self,
+        bytes: u64,
+        local_only: bool,
         mut make: impl FnMut(&D3D12_HEAP_PROPERTIES) -> Result<T>,
     ) -> Result<T> {
         valid_size(bytes)?;
@@ -74,6 +94,9 @@ impl crate::host::Host {
                 Err(e) if e.code() != E_OUTOFMEMORY => return Err(e),
                 Err(_) => {} // Release the local reservation before trying RAM.
             }
+        }
+        if local_only {
+            return Err(E_OUTOFMEMORY.into());
         }
         let system_heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,

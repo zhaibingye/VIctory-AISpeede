@@ -1143,6 +1143,12 @@ impl Host {
         Some((info.CurrentUsage, info.Budget))
     }
 
+    pub(crate) fn completed_fence(&self) -> Option<victory_memory::coherence::Fence> {
+        // SAFETY: a plain query on the direct queue's live fence.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        (completed != u64::MAX).then_some(victory_memory::coherence::Fence(completed))
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         crate::working_set::sample(self.memory_adapter());

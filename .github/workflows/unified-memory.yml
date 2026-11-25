@@ -41,6 +41,14 @@ jobs:
       - run: cargo test -p victory-gpu --locked --lib residency_com_charge_stays_until_last_graphics_reference
       - run: cargo test -p victory-gpu --locked --lib addresses_find_the_copy_holding_them
       - run: cargo test -p victory-gpu --locked --lib a_full_table_names_the_largest_copies
+  renderer-page-slabs:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      VICTORY_D3D12_WARP: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo test -p victory-gpu --features diagnostics --locked --lib renderer_page_slab_roundtrip_uses_direct_queue_fence
   shader-pages:
     runs-on: windows-latest
     timeout-minutes: 25
