@@ -482,6 +482,27 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
+        if cfg!(feature = "paged-title") {
+            if let (Some(to), Some(from)) = (
+                crate::resource::buffer_bytes(dst), crate::resource::buffer_bytes(src),
+            ) {
+                if to.1 != from.1 || (to.1 != 0 && (to.0 == from.0
+                    || crate::copy_plan::GuestCopy::new(to.0 as usize, from.0 as usize, to.1 as usize).is_none()))
+                {
+                    list.mark_unlowered();
+                } else {
+                    list.defer_copy(to.0, from.0, to.1 as usize);
+                }
+            } else if let Some(copy) = crate::resource::host_copy(src)
+                .zip(crate::resource::host_copy(dst))
+                .and_then(|(from, to)| crate::page_resource::TextureCopy::capture(from, to))
+            {
+                list.record_page_texture_copy(copy);
+            } else {
+                list.mark_unlowered();
+            }
+            return;
+        }
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -511,6 +532,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
+    #[cfg(windows)]
+    if cfg!(feature = "paged-title") && _flags != 0 {
+        if let Some(list) = host_list(this) {
+            list.mark_unlowered();
+        }
+        return;
+    }
     copy_resource(this, dst, src);
 }
 

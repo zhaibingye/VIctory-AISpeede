@@ -35,6 +35,30 @@ impl ResourcePlan {
         )
     }
 
+    fn transition_texture(
+        &mut self, list: &HostList, copy: &Arc<HostTexture>, wanted: u32,
+    ) -> Result<(), BatchError> {
+        let writable = 0x4 | 0x8 | 0x10 | 0x400 | 0x1000;
+        let write = wanted & writable;
+        if copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
+            || wanted & !(writable | 0x20 | 0x40 | 0x80 | 0x800 | 0x2000) != 0
+            || write != 0 && (wanted != write || !write.is_power_of_two())
+            || legal_state(&copy.texture, wanted) != wanted
+        {
+            return Err(BatchError::UnsupportedBarrier);
+        }
+        let before = self.state(copy);
+        let after = D3D12_RESOURCE_STATES(wanted as i32);
+        if before != after {
+            list.keep(&copy.texture);
+            // SAFETY: live attachment, ordered submission-local state,
+            // and a checked whole-resource transition.
+            unsafe { list.recording().ResourceBarrier(&[transition(&copy.texture, before, after)]) };
+            self.state.insert(ResourcePlan::key(copy), (copy.clone(), after));
+        }
+        Ok(())
+    }
+
     pub(crate) fn commit(self) {
         for (copy, state) in self.state.into_values() {
             copy.state.store(state.0 as u32, Ordering::Release);
@@ -56,24 +80,7 @@ impl PageBarrier {
     ) -> Result<(), BatchError> {
         match self {
             Self::Texture(copy, wanted) => {
-                let writable = 0x4 | 0x8 | 0x10 | 0x400 | 0x1000;
-                let write = wanted & writable;
-                if copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
-                    || wanted & !(writable | 0x20 | 0x40 | 0x80 | 0x800 | 0x2000) != 0
-                    || write != 0 && (*wanted != write || !write.is_power_of_two())
-                    || legal_state(&copy.texture, *wanted) != *wanted
-                {
-                    return Err(BatchError::UnsupportedBarrier);
-                }
-                let before = resources.state(copy);
-                let after = D3D12_RESOURCE_STATES(*wanted as i32);
-                if before != after {
-                    list.keep(&copy.texture);
-                    // SAFETY: live attachment, ordered submission-local state,
-                    // and a checked whole-resource transition.
-                    unsafe { list.recording().ResourceBarrier(&[transition(&copy.texture, before, after)]) };
-                    resources.state.insert(ResourcePlan::key(copy), (copy.clone(), after));
-                }
+                resources.transition_texture(list, copy, *wanted)?;
             }
             Self::Uav => {
                 let barrier = D3D12_RESOURCE_BARRIER {
@@ -89,6 +96,53 @@ impl PageBarrier {
                 unsafe { list.recording().ResourceBarrier(&[barrier]) };
             }
         }
+        Ok(())
+    }
+}
+
+/// An ordered copy between exact, native-authoritative color surfaces.
+/// Title-backed uploads, conversion, sparse and twin surfaces are not
+/// interchangeable with this operation.
+pub(crate) struct TextureCopy {
+    src: Arc<HostTexture>,
+    dst: Arc<HostTexture>,
+}
+
+impl TextureCopy {
+    pub(crate) fn capture(src: Arc<HostTexture>, dst: Arc<HostTexture>) -> Option<Self> {
+        // SAFETY: the references retain both native resources.
+        let (a, b) = unsafe { (src.texture.GetDesc(), dst.texture.GetDesc()) };
+        let single_color = |d: D3D12_RESOURCE_DESC| {
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && d.MipLevels == 1 && d.DepthOrArraySize == 1
+                && d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0
+                && d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+                && !d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        };
+        if Arc::ptr_eq(&src, &dst) || src.texture == dst.texture
+            || !single_color(a) || !single_color(b)
+            || a.Format != b.Format || a.Width != b.Width || a.Height != b.Height
+            || src.sparse.is_some() || dst.sparse.is_some()
+            || src.twin.get().is_some_and(Option::is_some)
+            || dst.twin.get().is_some_and(Option::is_some)
+        {
+            return None;
+        }
+        Some(Self { src, dst })
+    }
+
+    pub(crate) fn encode(&self, list: &HostList, plan: &mut ResourcePlan) -> Result<(), BatchError> {
+        if !plan.authoritative(&self.src) {
+            return Err(BatchError::TargetNotInitialized);
+        }
+        plan.transition_texture(list, &self.src, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)?;
+        plan.transition_texture(list, &self.dst, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
+        list.keep(&self.src.texture);
+        list.keep(&self.dst.texture);
+        // SAFETY: same native format and geometry, separate resources in
+        // COPY_SOURCE/DEST retained through execution.
+        unsafe { list.recording().CopyResource(&self.dst.texture, &self.src.texture) };
+        plan.initialize(&self.dst);
         Ok(())
     }
 }

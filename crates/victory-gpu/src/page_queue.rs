@@ -35,6 +35,7 @@ pub(crate) struct PageStats {
 #[derive(Clone)]
 pub(crate) enum PageOp {
     Copy(GuestCopy),
+    CopyTexture(std::sync::Arc<crate::page_resource::TextureCopy>),
     Input(InputView),
     Draw(std::sync::Arc<crate::page_draw::ClosedDraw>),
     Dispatch(std::sync::Arc<crate::page_dispatch::ClosedDispatch>),
@@ -197,7 +198,7 @@ impl Host {
                 PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
                 PageOp::ClearRaw(clear) => ranges.push(clear.range()?),
                 PageOp::Dispatch(dispatch) => dispatch.ranges(&mut ranges)?,
-                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
+                PageOp::CopyTexture(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
             }
         }
         self.execute_paged_work(heap, backing, &ranges, |list, _, batch, pins, descriptors, targets| {
@@ -221,6 +222,7 @@ impl Host {
                         record_copy(list, batch, scratch.as_ref().expect("copy reserved scratch"), &pieces, &mut dirty)
                             .map_err(BatchError::Native)?;
                     }
+                    PageOp::CopyTexture(copy) => copy.encode(list, targets)?,
                     PageOp::Input(input) => input.encode(self, list, batch)?,
                     PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors)?,
                     PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets)?,
