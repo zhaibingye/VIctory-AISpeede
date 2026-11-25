@@ -343,6 +343,7 @@ pub(crate) struct HostPipeline {
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
     pub(crate) closed_color_format: Option<DXGI_FORMAT>,
+    pub(crate) closed_depth_format: Option<DXGI_FORMAT>,
     /// A graphics pipeline of the console's rectangle lists whose geometry
     /// shader completes each rectangle (`victory_shader::emit::rectangle_gs`):
     /// it draws them as triangles, one per rectangle.
@@ -618,6 +619,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 closed_color_format: None,
+                closed_depth_format: None,
                 name: format!("{shaders:?}"),
                 rectangles: false,
                 slots: 0,
@@ -653,6 +655,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 closed_color_format: None,
+                closed_depth_format: None,
                 name: format!("{shaders:?}"),
                 rectangles: false,
                 slots: 0,
@@ -739,9 +742,11 @@ impl HostPipeline {
             root,
             stages: bound,
             closed_color_format: (g.targets.NumRenderTargets == 1
-                && !g.depth.DepthEnable.as_bool()
-                && !g.depth.StencilEnable.as_bool()
-                && g.samples.Count == 1).then_some(g.targets.RTFormats[0]),
+                && g.samples.Count == 1
+                && (!(g.depth.DepthEnable.as_bool() || g.depth.StencilEnable.as_bool())
+                    || g.depth_format != DXGI_FORMAT_UNKNOWN))
+                .then_some(g.targets.RTFormats[0]),
+            closed_depth_format: (g.depth_format != DXGI_FORMAT_UNKNOWN).then_some(g.depth_format),
             name: format!("{shaders:?}"),
             rectangles: !gs.is_empty(),
             slots: g.slots(),

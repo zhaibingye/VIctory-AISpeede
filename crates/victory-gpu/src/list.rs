@@ -782,20 +782,38 @@ extern "system" fn clear_dsv(
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
-        else {
+        let Some(list) = host_list(this) else { return };
+        let Some(record) = crate::descriptor::dsv_record(handle) else {
+            if cfg!(feature = "paged-title") { list.mark_unlowered(); }
             return;
         };
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
         ) else {
+            if cfg!(feature = "paged-title") { list.mark_unlowered(); }
             return;
         };
+        if cfg!(feature = "paged-title") && count > 0 && rects.is_null() {
+            list.mark_unlowered();
+            return;
+        }
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        if cfg!(feature = "paged-title") {
+            let Some(target) = crate::resource::host_copy(record.resource)
+                .and_then(|copy| crate::page_draw::DepthTarget::capture(copy, record.depth_desc()))
+            else {
+                list.mark_unlowered();
+                return;
+            };
+            list.record_page_clear_depth(crate::page_draw::DepthClear {
+                target, flags, depth, stencil, rects: rects.unwrap_or_default().to_vec(),
+            });
+            return;
+        }
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
@@ -1066,7 +1084,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1098,9 +1116,7 @@ mod state {
         with_state(this, |list, s| s.set_blend_factor(list, unsafe { factor.as_ref() }));
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        if let Some(list) = host_list(this) {
-            crate::draw::stencil_ref(list, reference);
-        }
+        with_state(this, |list, state| state.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));

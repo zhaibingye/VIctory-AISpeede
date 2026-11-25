@@ -67,6 +67,8 @@ pub(crate) struct State {
     targets: Vec<usize>,
     depth: usize,
     page_target: Option<crate::page_draw::ColorTarget>,
+    page_depth: Option<crate::page_draw::DepthTarget>,
+    page_stencil: u32,
     page_viewport: Option<D3D12_VIEWPORT>,
     page_scissor: Option<RECT>,
     page_blend: Option<[f32; 4]>,
@@ -336,6 +338,7 @@ impl State {
         };
         self.targets.clear();
         self.page_target = None;
+        self.page_depth = None;
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -352,7 +355,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
             let desc = record.desc();
-            if handles.len() == 1 && depth == 0 {
+            if handles.len() == 1 {
                 self.page_target = crate::resource::host_copy(record.resource)
                     .and_then(|copy| crate::page_draw::ColorTarget::capture_candidate(copy, desc));
             }
@@ -361,6 +364,19 @@ impl State {
             }
         }
         self.depth = 0;
+        if cfg!(feature = "paged-title") {
+            if depth != 0 {
+                let depth_record = crate::descriptor::dsv_record(depth);
+                self.page_depth = depth_record.and_then(|record| {
+                    crate::resource::host_copy(record.resource)
+                        .and_then(|copy| crate::page_draw::DepthTarget::capture(copy, record.depth_desc()))
+                });
+                if self.page_depth.is_none() {
+                    list.mark_unlowered();
+                }
+            }
+            return;
+        }
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
@@ -368,9 +384,6 @@ impl State {
             crate::capture::note_target(list, record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
-        if cfg!(feature = "paged-title") {
-            return;
-        }
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.recording().OMSetRenderTargets(
@@ -396,7 +409,7 @@ impl State {
         &self,
         call: crate::page_draw::DrawCall,
     ) -> Option<crate::page_draw::ClosedDraw> {
-        if self.page_state_opaque || self.depth != 0 || !matches!(self.topology, 1..=5) {
+        if self.page_state_opaque || !matches!(self.topology, 1..=5) {
             return None;
         }
         let target = self.page_target.clone()?;
@@ -429,6 +442,8 @@ impl State {
                 table_view(*records.get(index as usize)?)?.paged_linear_srv()
             },
             target,
+            self.page_depth.clone(),
+            self.page_stencil,
             D3D_PRIMITIVE_TOPOLOGY(self.topology as i32),
             viewport,
             scissor,
@@ -1970,9 +1985,14 @@ impl State {
     }
 }
 
-pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
-    // SAFETY: an open list.
-    unsafe { list.recording().OMSetStencilRef(reference) };
+impl State {
+    pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        self.page_stencil = reference;
+        if !cfg!(feature = "paged-title") {
+            // SAFETY: an open list.
+            unsafe { list.recording().OMSetStencilRef(reference) };
+        }
+    }
 }
 
 #[cfg(test)]

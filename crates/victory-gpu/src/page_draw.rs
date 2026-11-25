@@ -122,10 +122,126 @@ impl ColorClear {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct DepthTarget {
+    copy: Arc<HostTexture>,
+    desc: Option<D3D12_DEPTH_STENCIL_VIEW_DESC>,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    planes: i32,
+}
+
+impl DepthTarget {
+    pub(crate) fn capture(
+        copy: Arc<HostTexture>, desc: Option<D3D12_DEPTH_STENCIL_VIEW_DESC>,
+    ) -> Option<Self> {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        // SAFETY: retained host resource.
+        let tex = unsafe { copy.texture.GetDesc() };
+        if copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
+            || tex.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || tex.SampleDesc.Count != 1 || tex.DepthOrArraySize != 1 || tex.MipLevels != 1
+            || tex.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0
+        {
+            return None;
+        }
+        let format = if let Some(d) = &desc {
+            if d.ViewDimension != D3D12_DSV_DIMENSION_TEXTURE2D || d.Flags.0 != 0 {
+                return None;
+            }
+            // SAFETY: dimension selects Texture2D.
+            if unsafe { d.Anonymous.Texture2D }.MipSlice != 0 {
+                return None;
+            }
+            if d.Format == DXGI_FORMAT_UNKNOWN { tex.Format } else { d.Format }
+        } else {
+            tex.Format
+        };
+        let (planes, typeless) = match format {
+            DXGI_FORMAT_D16_UNORM => (1, DXGI_FORMAT_R16_TYPELESS),
+            DXGI_FORMAT_D32_FLOAT => (1, DXGI_FORMAT_R32_TYPELESS),
+            DXGI_FORMAT_D24_UNORM_S8_UINT => (3, DXGI_FORMAT_R24G8_TYPELESS),
+            DXGI_FORMAT_D32_FLOAT_S8X24_UINT => (3, DXGI_FORMAT_R32G8X24_TYPELESS),
+            _ => return None,
+        };
+        if tex.Format != format && tex.Format != typeless {
+            return None;
+        }
+        Some(Self { copy, desc, format, planes })
+    }
+
+    fn key(&self) -> usize {
+        Arc::as_ptr(&self.copy) as usize
+    }
+
+    fn authoritative(&self, initialized: &TargetWrites) -> bool {
+        self.copy.host_written.load(Ordering::Acquire) || initialized.contains_key(&self.key())
+    }
+
+    fn begin(
+        &self, host: &Host, list: &HostList,
+    ) -> (D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_RESOURCE_STATES) {
+        let texture = &self.copy.texture;
+        let before = D3D12_RESOURCE_STATES(self.copy.state.load(Ordering::Acquire) as i32);
+        list.keep(texture);
+        if before != D3D12_RESOURCE_STATE_DEPTH_WRITE {
+            // SAFETY: held resource and direct queue lock; restored in end.
+            unsafe { list.recording().ResourceBarrier(&[transition(
+                texture, before, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            )]); }
+        }
+        (host.dsv(texture, self.desc.as_ref()), before)
+    }
+
+    fn end(&self, list: &HostList, before: D3D12_RESOURCE_STATES) {
+        if before != D3D12_RESOURCE_STATE_DEPTH_WRITE {
+            // SAFETY: the scoped depth use kept the resource in DEPTH_WRITE.
+            unsafe { list.recording().ResourceBarrier(&[transition(
+                &self.copy.texture, D3D12_RESOURCE_STATE_DEPTH_WRITE, before,
+            )]); }
+        }
+    }
+}
+
+pub(crate) struct DepthClear {
+    pub(crate) target: DepthTarget,
+    pub(crate) flags: u32,
+    pub(crate) depth: f32,
+    pub(crate) stencil: u8,
+    pub(crate) rects: Vec<RECT>,
+}
+
+impl DepthClear {
+    pub(crate) fn encode(
+        &self, host: &Host, list: &HostList, initialized: &mut TargetWrites,
+    ) -> Result<(), BatchError> {
+        let planes = self.target.planes as u32;
+        if self.flags == 0 || self.flags & !planes != 0
+            || self.flags & 1 != 0 && !(0.0..=1.0).contains(&self.depth)
+        {
+            return Err(BatchError::UnsupportedDepth);
+        }
+        if (!self.rects.is_empty() || self.flags != planes) && !self.target.authoritative(initialized) {
+            return Err(BatchError::TargetNotInitialized);
+        }
+        let (handle, before) = self.target.begin(host, list);
+        // SAFETY: retained matching DSV in the scoped depth state.
+        unsafe {
+            let rects = (!self.rects.is_empty()).then_some(self.rects.as_slice());
+            list.recording().ClearDepthStencilView(handle, D3D12_CLEAR_FLAGS(self.flags as i32),
+                self.depth, self.stencil, rects);
+        }
+        self.target.end(list, before);
+        initialized.insert(self.target.key(), self.target.copy.clone());
+        Ok(())
+    }
+}
+
 pub(crate) struct ClosedDraw {
     pipeline: ID3D12PipelineState,
     root: ID3D12RootSignature,
     target: ColorTarget,
+    depth: Option<DepthTarget>,
+    stencil_ref: u32,
     topology: D3D_PRIMITIVE_TOPOLOGY,
     viewport: D3D12_VIEWPORT,
     scissor: RECT,
@@ -153,7 +269,7 @@ impl ClosedDraw {
         call: DrawCall,
     ) -> Self {
         Self {
-            pipeline, root, target, topology, viewport, scissor, inputs, call,
+            pipeline, root, target, depth: None, stencil_ref: 0, topology, viewport, scissor, inputs, call,
             constants: Vec::new(),
             blend_factor: [1.0; 4],
             sample: None,
@@ -170,6 +286,8 @@ impl ClosedDraw {
         values: impl Fn(u8, u32) -> Option<u32>,
         texture: impl Fn(u8, u32) -> Option<crate::page_texture::LinearTexture>,
         target: ColorTarget,
+        depth: Option<DepthTarget>,
+        stencil_ref: u32,
         topology: D3D_PRIMITIVE_TOPOLOGY,
         viewport: D3D12_VIEWPORT,
         scissor: RECT,
@@ -183,7 +301,9 @@ impl ClosedDraw {
         let format = target.desc.as_ref().map_or_else(
             || unsafe { target.copy.texture.GetDesc() }.Format, |d| d.Format,
         );
-        if pipeline.closed_color_format != Some(format) {
+        if pipeline.closed_color_format != Some(format)
+            || pipeline.closed_depth_format != depth.as_ref().map(|d| d.format)
+        {
             return Err(UnloweredShader::GraphicsState);
         }
         let mut constants = Vec::new();
@@ -216,7 +336,7 @@ impl ClosedDraw {
         }
         Ok(Self {
             pipeline: pipeline.pso.clone(), root: pipeline.root.clone(),
-            target, topology, viewport, scissor, inputs, call, constants,
+            target, depth, stencil_ref, topology, viewport, scissor, inputs, call, constants,
             blend_factor: [1.0; 4],
             sample: None,
             texture_tables,
@@ -254,7 +374,9 @@ impl ClosedDraw {
         descriptors: &mut crate::page_queue::PageDescriptors<'_>,
         initialized: &TargetWrites,
     ) -> Result<(), BatchError> {
-        if !self.target.authoritative(initialized) {
+        if !self.target.authoritative(initialized)
+            || self.depth.as_ref().is_some_and(|d| !d.authoritative(initialized))
+        {
             return Err(BatchError::TargetNotInitialized);
         }
         let indirect = match self.call {
@@ -287,6 +409,7 @@ impl ClosedDraw {
         let render_target = D3D12_RESOURCE_STATE_RENDER_TARGET;
         list.keep(texture);
         let rtv = host.rtv(texture, self.target.desc.as_ref());
+        let dsv = self.depth.as_ref().map(|d| d.begin(host, list));
         // SAFETY: the proven draw owns its pipeline, root and target. The
         // inputs were gathered in this same list from admitted pages.
         unsafe {
@@ -316,7 +439,8 @@ impl ClosedDraw {
             cmd.RSSetViewports(&[self.viewport]);
             cmd.RSSetScissorRects(&[self.scissor]);
             cmd.OMSetBlendFactor(Some(&self.blend_factor));
-            cmd.OMSetRenderTargets(1, Some(&rtv), false, None);
+            cmd.OMSetStencilRef(self.stencil_ref);
+            cmd.OMSetRenderTargets(1, Some(&rtv), false, dsv.as_ref().map(|(h, _)| std::ptr::from_ref(h)));
             match self.call {
                 DrawCall::Direct { vertices, instances, first, first_instance } => {
                     cmd.DrawInstanced(vertices, instances, first, first_instance);
@@ -329,6 +453,9 @@ impl ClosedDraw {
             if before != render_target {
                 cmd.ResourceBarrier(&[transition(texture, render_target, before)]);
             }
+        }
+        if let (Some(depth), Some((_, before))) = (&self.depth, dsv) {
+            depth.end(list, before);
         }
         Ok(())
     }

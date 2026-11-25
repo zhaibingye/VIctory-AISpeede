@@ -37,6 +37,7 @@ pub(crate) enum PageOp {
     Input(InputView),
     Draw(std::sync::Arc<crate::page_draw::ClosedDraw>),
     Clear(std::sync::Arc<crate::page_draw::ColorClear>),
+    ClearDepth(std::sync::Arc<crate::page_draw::DepthClear>),
 }
 
 struct Completion {
@@ -176,7 +177,7 @@ impl Host {
                 }
                 PageOp::Input(input) => ranges.push(input.range()?),
                 PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
-                PageOp::Clear(_) => {},
+                PageOp::Clear(_) | PageOp::ClearDepth(_) => {},
             }
         }
         self.execute_paged_work(heap, backing, &ranges, |list, _, batch, pins, descriptors, targets| {
@@ -203,6 +204,7 @@ impl Host {
                     PageOp::Input(input) => input.encode(self, list, batch)?,
                     PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets)?,
                     PageOp::Clear(clear) => clear.encode(self, list, targets)?,
+                    PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,
                 }
             }
             Ok(dirty)
