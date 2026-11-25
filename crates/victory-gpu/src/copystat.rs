@@ -97,8 +97,10 @@ pub(crate) enum C {
     MarkedUs,
     MarkedKept,
     SavedPages,
+    /// Keep last: this gives the length of the counter array.
+    CounterCount,
 }
-const COUNTERS: usize = 57;
+const COUNTERS: usize = C::CounterCount as usize;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
