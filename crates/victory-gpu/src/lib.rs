@@ -62,6 +62,8 @@ mod switch;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
+pub mod title_backing;
+#[cfg(windows)]
 mod sparse;
 #[cfg(windows)]
 mod texture;

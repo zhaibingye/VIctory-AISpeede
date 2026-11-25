@@ -114,3 +114,15 @@ impl Aliases {
         }
     }
 }
+
+/// Retains real host backing across a GPU submission. Aliases and repeated
+/// ranges can name one allocation; there is only one retained reference to it.
+#[derive(Default)]
+pub struct BackingPins(HashMap<PhysicalPage, Arc<dyn Send + Sync>>);
+
+impl BackingPins {
+    /// `section` identifies the first physical page of this allocation.
+    pub fn keep<T: Send + Sync + 'static>(&mut self, section: PhysicalPage, backing: &Arc<T>) {
+        self.0.entry(section).or_insert_with(|| backing.clone());
+    }
+}

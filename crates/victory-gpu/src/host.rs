@@ -1208,11 +1208,14 @@ impl Host {
         let mut removed_in = None;
         let multiple_chunks = chunks.len() > 1;
         let mut chunk_base = 0usize;
+        // Keep the physical backing through all fences AND writeback, even
+        // across repeated-list chunks, without extending the list's life.
+        let mut backing = crate::title_backing::SubmissionBacking::default();
         for chunk in chunks {
             let chunk_start = std::time::Instant::now();
             lists.clear();
             firsts.clear();
-            let mut batch = Batch::default();
+            let mut batch = Batch { backing, ..Default::default() };
             for list in chunk {
                 list.run_deferred(&mut batch);
                 firsts.push(lists.len());
@@ -1225,6 +1228,7 @@ impl Host {
                 lists.push(list.list.cast().ok());
             }
             batch.flush();
+            backing = batch.backing;
             let prepared = std::time::Instant::now();
             prep_us += (prepared - chunk_start).as_micros() as u64;
             #[cfg(feature = "diagnostics")]
@@ -1398,6 +1402,7 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        drop(backing);
         // The submission has run and the next waits for our lock.
         release_retired();
         self.log_messages();
@@ -2292,6 +2297,7 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len, marked) => {
+                    batch.backing.include(*address, address.saturating_add(*len));
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
                     if !marked {
@@ -2344,6 +2350,7 @@ impl HostList {
 /// GPU).
 #[derive(Default)]
 struct Batch {
+    backing: crate::title_backing::SubmissionBacking,
     refreshes: Vec<ShadowRefresh>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
@@ -2443,8 +2450,14 @@ impl Batch {
         self.pending.clear();
         let mut total = 0;
         use std::collections::hash_map::Entry;
-        for (shadow, mut ranges) in self.refreshes.drain(..) {
+        for (_, ranges) in &mut self.refreshes {
             ranges.merge();
+            for &(from, to) in ranges.slices() {
+                self.backing.include(from, to);
+            }
+        }
+        self.backing.flush();
+        for (shadow, ranges) in self.refreshes.drain(..) {
             for &(from, to) in ranges.slices() {
                 let started = std::time::Instant::now();
                 let copied = shadow.update(from, to - from);

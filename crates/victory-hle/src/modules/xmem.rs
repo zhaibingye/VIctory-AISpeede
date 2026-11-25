@@ -31,7 +31,9 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
-use victory_memory::physical::{Aliases, PageNumbers, PhysicalPage, RamPool, RamReservation};
+use victory_memory::physical::{
+    Aliases, BackingPins, PageNumbers, PhysicalPage, RamPool, RamReservation,
+};
 
 const MIB: usize = 1 << 20;
 
@@ -413,31 +415,42 @@ impl Slice {
     }
 }
 
+impl Physical {
+    /// All views intersecting a half-open interval. Views do not overlap.
+    fn views_in(&self, start: usize, end: usize) -> impl Iterator<Item = (usize, &(usize, Slice))> {
+        use std::ops::Bound::Excluded;
+        let first = self.views.range(..=start).next_back()
+            .filter(|&(&base, &(len, _))| base + len > start);
+        first.into_iter()
+            .chain(self.views.range((Excluded(start), Excluded(end))))
+            .map(|(&base, view)| (base, view))
+    }
+}
+
+/// Resolve title ranges once with the mapping lock. The GPU holds the
+/// returned section leases after the OS views or title handles are removed.
+pub(crate) fn pin_backing(ranges: &[(usize, usize)], pins: &mut BackingPins) {
+    let physical = physical();
+    for &(start, end) in ranges {
+        if start < end {
+            for (_, (_, slice)) in physical.views_in(start, end) {
+                pins.keep(slice.section.first, &slice.section);
+            }
+        }
+    }
+}
+
 /// Every address of a title view showing a page that title memory at
 /// `[at, at + len)` shows, except the page's own address: pushed to `out`
 /// as (page address, other address). The GPU side's change tracking
 /// (`victory_gpu::watch`) marks writes there too.
 pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
-    if len == 0 {
-        return;
-    }
-    let physical = physical();
     let end = at.saturating_add(len);
     if at >= end {
         return;
     }
-    let first = physical
-        .views
-        .range(..=at)
-        .next_back()
-        .filter(|(base, (size, _))| *base + size > at)
-        .map(|(base, _)| *base);
-    use std::ops::Bound::Excluded;
-    let starts = first.into_iter().chain(
-        physical.views.range((Excluded(at), Excluded(end))).map(|(&base, _)| base),
-    );
-    for base in starts {
-        let (size, slice) = &physical.views[&base];
+    let physical = physical();
+    for (base, &(size, ref slice)) in physical.views_in(at, end) {
         let (from, to) = (at.max(base), end.min(base + size));
         for page in (from / PAGE..to.div_ceil(PAGE)).map(|p| p * PAGE) {
             let k = (page - base) / PAGE;
@@ -952,18 +965,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) -> bool {
         return true;
     }
     let end = base + len;
-    // Views do not overlap: the one holding `base`, then those starting
-    // inside (the GPU's page mappings make one view per page).
-    let first = physical
-        .views
-        .range(..=base)
-        .next_back()
-        .filter(|(at, (size, _))| *at + size > base)
-        .map(|(at, _)| *at);
-    let hit: Vec<usize> = first
-        .into_iter()
-        .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
-        .collect();
+    let hit: Vec<usize> = physical.views_in(base, end).map(|(at, _)| at).collect();
     for at in hit {
         let size = physical.views[&at].0;
         // SAFETY: a live view we mapped; the OS must release it before
@@ -1349,6 +1351,37 @@ mod tests {
         unsafe {
             assert_ne!(VirtualFree(a, 0, MEM_RELEASE), 0);
             assert_ne!(VirtualFree(b, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn submitted_physical_backing_survives_cpu_unmap_and_handle_free() {
+        let pages = allocate(1);
+        let backing = Arc::downgrade(&physical().pages[&pages[0]].section);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        assert!(map_alias(b as u64, a as u64, PAGE as u64));
+        let mut pins = BackingPins::default();
+        let (a, b) = (a as usize, b as usize);
+        // The ranges need not start at a page boundary. Aliases retain one lease.
+        pin_backing(&[(a + 1, a + 2), (b, b + PAGE)], &mut pins);
+        assert_eq!(backing.strong_count(), 4); // page handle, two mappings and one pin
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert!(map_alias(a as u64, 0, PAGE as u64));
+        assert!(map_alias(b as u64, 0, PAGE as u64));
+        assert_eq!(backing.strong_count(), 1);
+        drop(pins); // the host submission does this only after fence + copy-back
+        assert_eq!(backing.strong_count(), 0);
+        // SAFETY: our two reservations, now placeholders.
+        unsafe {
+            assert_ne!(VirtualFree(a as *mut c_void, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(b as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 

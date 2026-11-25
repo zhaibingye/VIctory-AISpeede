@@ -58,3 +58,27 @@ fn allocating_past_the_packed_abi_boundary_does_not_consume_ids() {
     assert_eq!(last.number() >> 4, (1 << 21) - 1);
     assert!(ids.allocate(1).is_none());
 }
+
+#[test]
+fn submission_pins_charge_each_allocation_once_even_after_the_views_go_away() {
+    use victory_memory::physical::BackingPins;
+
+    let ram = RamPool::default();
+    let mut ids = PageNumbers::default();
+    let a = ids.allocate(2).unwrap();
+    let b = ids.allocate(1).unwrap();
+    let backing_a = Arc::new(ram.reserve(2 * PAGE_BYTES).unwrap());
+    let backing_b = Arc::new(ram.reserve(PAGE_BYTES).unwrap());
+    let mut pins = BackingPins::default();
+    pins.keep(a, &backing_a);
+    pins.keep(a, &backing_a);
+    pins.keep(b, &backing_b);
+    assert_eq!(Arc::strong_count(&backing_a), 2);
+    assert_eq!(Arc::strong_count(&backing_b), 2);
+
+    drop(backing_a);
+    drop(backing_b);
+    assert_eq!(ram.used(), 3 * PAGE_BYTES);
+    drop(pins);
+    assert_eq!(ram.used(), 0);
+}
