@@ -2774,12 +2774,12 @@ mod tests {
         };
         // SAFETY: an open list, live resources, locations in the host layout.
         unsafe {
-            back.list.ResourceBarrier(&[crate::host::transition(
+            back.recording().ResourceBarrier(&[crate::host::transition(
                 host_image,
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            back.list.CopyTextureRegion(
+            back.recording().CopyTextureRegion(
                 (&raw const out_to).cast(),
                 0,
                 0,

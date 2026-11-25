@@ -256,7 +256,7 @@ impl State {
         };
         // SAFETY: an open list.
         unsafe {
-            list.list
+            list.recording()
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32))
         };
     }
@@ -365,7 +365,7 @@ impl State {
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
-            list.list.OMSetRenderTargets(
+            list.recording().OMSetRenderTargets(
                 rtvs.len() as u32,
                 (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
                 false,
@@ -457,7 +457,7 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
-        let l = &list.list;
+        let l = list.recording();
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
@@ -525,7 +525,7 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
-        let l = &list.list;
+        let l = list.recording();
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
         if list.take_rebind() {
@@ -868,7 +868,7 @@ impl State {
             }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
-            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            unsafe { list.recording().SetDescriptorHeaps(&heaps) };
             self.host_heaps = want;
             self.host_roots = [0; 2];
         }
@@ -925,10 +925,10 @@ impl State {
         unsafe {
             if float {
                 let values = values.map(f32::from_bits);
-                list.list
+                list.recording()
                     .ClearUnorderedAccessViewFloat(gpu, at, &resource, &values, rects);
             } else {
-                list.list
+                list.recording()
                     .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
             }
         }
@@ -967,7 +967,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe { list.recording().Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1044,7 +1044,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
+            && match list.recording().cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
@@ -1306,9 +1306,9 @@ impl State {
                     },
                 };
                 // SAFETY: an open list.
-                unsafe { list.list.ResourceBarrier(&[all]) };
+                unsafe { list.recording().ResourceBarrier(&[all]) };
                 crate::list::ensure_state(list, r as This, COPY_SOURCE);
-                let read = crate::capture::read_back(&host.device, &list.list, t);
+                let read = crate::capture::read_back(&host.device, list.recording(), t);
                 crate::list::ensure_state(list, r as This, UNORDERED);
                 let Some((buffer, f)) = read else { continue };
                 list.keep(&buffer);
@@ -1416,7 +1416,7 @@ impl State {
             self.probe_small(list, false);
             // SAFETY: an open list with everything set.
             unsafe {
-                list.list
+                list.recording()
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1483,7 +1483,7 @@ impl State {
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
-            unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            unsafe { list.recording().IASetVertexBuffers(slot, Some(&[view])) };
         }
         true
     }
@@ -1510,7 +1510,7 @@ impl State {
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
-                list.list
+                list.recording()
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1654,7 +1654,7 @@ impl State {
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
-            list.list.ExecuteIndirect(
+            list.recording().ExecuteIndirect(
                 &signature,
                 max,
                 &records,
@@ -1865,22 +1865,22 @@ const QUAD_STRIP: u32 = 20;
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
-    unsafe { list.list.RSSetViewports(viewports) };
+    unsafe { list.recording().RSSetViewports(viewports) };
 }
 
 pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
     // SAFETY: an open list.
-    unsafe { list.list.RSSetScissorRects(rects) };
+    unsafe { list.recording().RSSetScissorRects(rects) };
 }
 
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     // SAFETY: an open list.
-    unsafe { list.list.OMSetBlendFactor(factor) };
+    unsafe { list.recording().OMSetBlendFactor(factor) };
 }
 
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
-    unsafe { list.list.OMSetStencilRef(reference) };
+    unsafe { list.recording().OMSetStencilRef(reference) };
 }
 
 #[cfg(test)]
@@ -2023,13 +2023,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             let constants = [at, offset];
             // SAFETY: an open list, live objects of ours.
             unsafe {
-                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
-                list.list.SetComputeRootSignature(&root);
-                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(index));
-                list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(1));
-                list.list.SetComputeRoot32BitConstants(2, 2, constants.as_ptr().cast(), 0);
-                list.list.SetPipelineState(&pso);
-                list.list.Dispatch(1, 1, 1);
+                list.recording().SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.recording().SetComputeRootSignature(&root);
+                list.recording().SetComputeRootDescriptorTable(0, heap_host.gpu(index));
+                list.recording().SetComputeRootDescriptorTable(1, heap_host.gpu(1));
+                list.recording().SetComputeRoot32BitConstants(2, 2, constants.as_ptr().cast(), 0);
+                list.recording().SetPipelineState(&pso);
+                list.recording().Dispatch(1, 1, 1);
             }
             list.close();
             for k in 0..16u64 {
@@ -2189,14 +2189,14 @@ void main() { out_value.Store(0, cb.Load(0)); }
     ) {
         // SAFETY: an open list and live objects.
         unsafe {
-            list.list.SetDescriptorHeaps(&[Some(slots.0.clone())]);
-            list.list.SetComputeRootSignature(root);
-            list.list.SetPipelineState(pso);
-            list.list.SetComputeRootDescriptorTable(0, slots.gpu(table));
+            list.recording().SetDescriptorHeaps(&[Some(slots.0.clone())]);
+            list.recording().SetComputeRootSignature(root);
+            list.recording().SetPipelineState(pso);
+            list.recording().SetComputeRootDescriptorTable(0, slots.gpu(table));
             if let Some(out) = out {
-                list.list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                list.recording().SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
             }
-            list.list.Dispatch(groups.0, groups.1, 1);
+            list.recording().Dispatch(groups.0, groups.1, 1);
         }
     }
 
@@ -2372,8 +2372,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         // SAFETY: an open list, the texture in the copy source state.
         unsafe {
-            list.list.CopyTextureRegion(&to(f[0]), 0, 0, 0, &at(&copy.texture, 0), None);
-            list.list.CopyTextureRegion(&to(f[1]), 0, 0, 0, &at(&copy.texture, 1), None);
+            list.recording().CopyTextureRegion(&to(f[0]), 0, 0, 0, &at(&copy.texture, 0), None);
+            list.recording().CopyTextureRegion(&to(f[1]), 0, 0, 0, &at(&copy.texture, 1), None);
         }
         list.close();
         host.execute(&[&list]);
@@ -2407,7 +2407,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let handle = host.dsv(&copy.texture, Some(&dsv));
         // SAFETY: an open list, the texture in the depth write state.
         unsafe {
-            list.list.ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5, 0x11, None)
+            list.recording().ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5, 0x11, None)
         };
         readable(&list, &used(ResourceType::Uav), &planes[0], false);
         let twin = copy.twin.get().and_then(Option::as_ref).expect("a twin");
@@ -2419,13 +2419,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             unsafe { host.device.GetCopyableFootprints(&pd, 0, 1, f[p].Offset, Some(&mut g[p]), None, None, None) };
             if let Some(b) = list.move_texture(plane, 0x800) {
                 // SAFETY: an open list.
-                unsafe { list.list.ResourceBarrier(&[b]) };
+                unsafe { list.recording().ResourceBarrier(&[b]) };
             }
         }
         // SAFETY: an open list, the twin's planes in the copy source state.
         unsafe {
-            list.list.CopyTextureRegion(&to(g[0]), 0, 0, 0, &at(&twin.planes[0].texture, 0), None);
-            list.list.CopyTextureRegion(&to(g[1]), 0, 0, 0, &at(&twin.planes[1].texture, 0), None);
+            list.recording().CopyTextureRegion(&to(g[0]), 0, 0, 0, &at(&twin.planes[0].texture, 0), None);
+            list.recording().CopyTextureRegion(&to(g[1]), 0, 0, 0, &at(&twin.planes[1].texture, 0), None);
         }
         list.close();
         host.execute(&[&list]);

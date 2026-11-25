@@ -338,7 +338,7 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
     let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
     if let Some(to_depth) = list.twin_use(depth, side, writes)
-        && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
+        && twin.copy(list.recording(), depth, to_depth, &mut |t, w| list.move_texture(t, w))
     {
         list.need_rebind();
     }
@@ -348,7 +348,7 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
     let barriers: Vec<_> = twin.planes.iter().filter_map(|p| list.move_texture(p, UNORDERED_ACCESS)).collect();
     if !barriers.is_empty() {
         // SAFETY: an open list and live textures.
-        unsafe { list.list.ResourceBarrier(&barriers) };
+        unsafe { list.recording().ResourceBarrier(&barriers) };
     }
     true
 }
@@ -805,12 +805,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(route(&list, &copy16, copy16.twin.get().unwrap().as_ref().unwrap(), UNORDERED_ACCESS));
         // SAFETY: open list, live heap, root signature, and pipeline.
         unsafe {
-            list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
-            list.list.SetComputeRootSignature(&root);
-            list.list.SetPipelineState(&pso);
-            list.list
+            list.recording().SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.recording().SetComputeRootSignature(&root);
+            list.recording().SetPipelineState(&pso);
+            list.recording()
                 .SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
-            list.list.Dispatch(1, 1, 1);
+            list.recording().Dispatch(1, 1, 1);
         }
         // Transition both depth textures to COPY_SOURCE: `route` copies each
         // twin's unordered writes into its depth texture first.
@@ -854,11 +854,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         // SAFETY: open list; depth textures in COPY_SOURCE, readback buffer writable.
         unsafe {
-            list.list
+            list.recording()
                 .CopyTextureRegion(&placed(fp32), 0, 0, 0, &sub(&copy32.texture, 0), None);
-            list.list
+            list.recording()
                 .CopyTextureRegion(&placed(fp16[0]), 0, 0, 0, &sub(&copy16.texture, 0), None);
-            list.list
+            list.recording()
                 .CopyTextureRegion(&placed(fp16[1]), 0, 0, 0, &sub(&copy16.texture, 1), None);
         }
         list.close();

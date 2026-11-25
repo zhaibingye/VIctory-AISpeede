@@ -649,7 +649,7 @@ mod tests {
         assert_eq!(before, 0x4);
         // SAFETY: open list and live texture.
         unsafe {
-            list.list.ResourceBarrier(&[transition(
+            list.recording().ResourceBarrier(&[transition(
                 host_tex,
                 D3D12_RESOURCE_STATES(0x4),
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -724,7 +724,9 @@ fn unique_run_chunks<'a, T>(runs: &'a [&'a T]) -> Vec<&'a [&'a T]> {
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
-    pub(crate) list: ID3D12GraphicsCommandList,
+    list: ID3D12GraphicsCommandList,
+    /// Closed state and whether a caller could have recorded native work.
+    recording_flags: std::sync::atomic::AtomicU8,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1099,6 +1101,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 list,
+                recording_flags: 0.into(),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -1665,7 +1668,48 @@ impl Host {
     }
 }
 
+const NATIVE_RECORDING: u8 = 1;
+const CLOSED_RECORDING: u8 = 2;
+
 impl HostList {
+    /// Borrow the writable native body. A list that exposes it can no
+    /// longer prove that all its work is present in the title-copy stream.
+    pub(crate) fn recording(&self) -> &ID3D12GraphicsCommandList {
+        if self.recording_flags.load(Ordering::Relaxed) & NATIVE_RECORDING == 0 {
+            self.recording_flags.fetch_or(NATIVE_RECORDING, Ordering::Relaxed);
+        }
+        &self.list
+    }
+
+    /// Admit the complete closed copy list or none of it. Native work,
+    /// deferred uploads/refreshes and fence callbacks need their own
+    /// ordered lowering before this gate can accept them.
+    pub(crate) fn append_closed_copies(
+        &self,
+        copies: &mut Vec<crate::copy_plan::GuestCopy>,
+    ) -> bool {
+        if self.recording_flags.load(Ordering::Acquire) != CLOSED_RECORDING {
+            return false;
+        }
+        if !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        {
+            return false;
+        }
+        let deferred = self.deferred();
+        if !deferred.writes.is_empty()
+            || !deferred.after.is_empty()
+            || !deferred.missed.is_empty()
+            || deferred.copies.iter().any(|step| !matches!(step, Step::Copy(_)))
+        {
+            return false;
+        }
+        copies.extend(deferred.copies.iter().filter_map(|step| {
+            if let Step::Copy(copy) = step { Some(*copy) } else { None }
+        }));
+        true
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -1780,11 +1824,13 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        self.recording_flags.fetch_or(CLOSED_RECORDING, Ordering::Release);
     }
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.recording_flags.store(0, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -3291,7 +3337,7 @@ impl Host {
                 return None;
             };
             p.copy.reset();
-            let list = &p.copy.list;
+            let list = p.copy.recording();
             // One plane, or no compositor to combine several: copy the first.
             let (capture, probe) = if planes.len() == 1 || compositor.is_none() {
                 let (texture, state) = planes[0];
@@ -4205,7 +4251,7 @@ mod present_plane_tests {
                     )
                     .unwrap();
                 let texture = texture.unwrap();
-                list.list
+                list.recording()
                     .ClearRenderTargetView(host.rtv(&texture, None), color, None);
                 texture
             }

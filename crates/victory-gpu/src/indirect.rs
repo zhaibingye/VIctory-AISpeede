@@ -193,7 +193,7 @@ pub(crate) fn bound(
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return false;
     }
-    let l = &list.list;
+    let l = list.recording();
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
@@ -227,7 +227,7 @@ pub(crate) fn bound(
 pub(crate) fn copied(list: &HostList, source: &ID3D12Resource, offset: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
     let (copy, first) = list.arguments(len)?;
     let before = if first { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
-    let l = &list.list;
+    let l = list.recording();
     // SAFETY: an open list and live buffers (the caller's list holds
     // `source`, the list `copy`); the range is inside both.
     unsafe {
@@ -250,7 +250,7 @@ pub(crate) fn copied(list: &HostList, source: &ID3D12Resource, offset: u64, len:
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     // SAFETY: an open list and a live buffer.
     unsafe {
-        list.list.ResourceBarrier(&[transition(
+        list.recording().ResourceBarrier(&[transition(
             buffer,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

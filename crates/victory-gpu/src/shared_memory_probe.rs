@@ -96,7 +96,7 @@ fn gpu_reads_cpu_writes_from_one_committed_page_without_upload_staging() {
         // the copy that reads it. Both buffers cover the four addressed bytes.
         unsafe {
             cpu.0.as_ptr().cast::<u32>().write_volatile(want);
-            list.list.CopyBufferRegion(&readback, 0, &source, 0, 4);
+            list.recording().CopyBufferRegion(&readback, 0, &source, 0, 4);
         }
         list.close();
         host.execute(&[&list]);

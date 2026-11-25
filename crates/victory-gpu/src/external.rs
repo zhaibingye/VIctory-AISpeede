@@ -41,7 +41,7 @@ pub fn record<R>(
 ) -> Option<R> {
     let mut out = None;
     crate::list::with_state(list, |host, state| {
-        out = Some(f(&host.list));
+        out = Some(f(host.recording()));
         state.host_state_lost();
     });
     out

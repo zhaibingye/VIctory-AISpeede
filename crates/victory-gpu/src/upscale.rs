@@ -242,13 +242,13 @@ pub(crate) fn record(
                 ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
                 ..Default::default()
             }), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + step as usize });
-            list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
-            list.list.SetComputeRootSignature(&root);
-            list.list.SetPipelineState(&pipeline);
+            list.recording().SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.recording().SetComputeRootSignature(&root);
+            list.recording().SetPipelineState(&pipeline);
             let sizes = [render[0], render[1], upscale[0], upscale[1]];
-            list.list.SetComputeRoot32BitConstants(0, 4, sizes.as_ptr().cast(), 0);
-            list.list.SetComputeRootDescriptorTable(1, heap.GetGPUDescriptorHandleForHeapStart());
-            list.list.Dispatch(upscale[0].div_ceil(8), upscale[1].div_ceil(8), 1);
+            list.recording().SetComputeRoot32BitConstants(0, 4, sizes.as_ptr().cast(), 0);
+            list.recording().SetComputeRootDescriptorTable(1, heap.GetGPUDescriptorHandleForHeapStart());
+            list.recording().Dispatch(upscale[0].div_ceil(8), upscale[1].div_ceil(8), 1);
         }
         crate::texture::host_written(output);
         state.host_state_lost();
@@ -293,7 +293,7 @@ fn padded_render_is_stretched_without_reading_past_its_edges() {
         std::ptr::null(), 0, 0, allocator, std::ptr::null(), &IUNKNOWN, &mut title_list,
     ), 0);
     let commands = crate::list::host_list(title_list).expect("host command list");
-    let list = &commands.list;
+    let list = commands.recording();
 
     let mut source_va = Box::new([0u8; 65536]);
     let mut target_va = Box::new([0u8; 65536]);

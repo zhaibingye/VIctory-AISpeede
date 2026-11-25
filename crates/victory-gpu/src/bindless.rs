@@ -616,11 +616,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
             // SAFETY: an open list, live objects of ours.
             unsafe {
-                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
-                list.list.SetComputeRootSignature(&root);
-                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
-                list.list.SetPipelineState(&pso);
-                list.list.Dispatch(4, 1, 1);
+                list.recording().SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.recording().SetComputeRootSignature(&root);
+                list.recording().SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+                list.recording().SetPipelineState(&pso);
+                list.recording().Dispatch(4, 1, 1);
             }
             list.defer_heap(&heap_host.viewed);
             list.close();
@@ -693,11 +693,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         let list = host.new_list().unwrap();
         // SAFETY: an open list, live objects of ours.
         unsafe {
-            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
-            list.list.SetComputeRootSignature(&root);
-            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
-            list.list.SetPipelineState(&pso);
-            list.list.Dispatch(4, 1, 1);
+            list.recording().SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.recording().SetComputeRootSignature(&root);
+            list.recording().SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.recording().SetPipelineState(&pso);
+            list.recording().Dispatch(4, 1, 1);
         }
         list.defer_heap(&heap_host.viewed);
         list.close();

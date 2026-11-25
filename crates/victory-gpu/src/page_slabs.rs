@@ -249,6 +249,7 @@ pub(crate) struct PinnedBatch {
 
 #[derive(Debug)]
 pub(crate) enum BatchError {
+    UnloweredList(usize),
     Range(u64, u64),
     NotCaptured(u64),
     Native(Error),
@@ -540,13 +541,13 @@ fn transfer(list: &HostList, pages: &[Transfer<'_>], upload: bool) {
     // SAFETY: borrowed resources remain live through the list; each
     // transfer references one allocated slot and an in-range staging page.
     unsafe {
-        list.list.ResourceBarrier(&to_copy);
+        list.recording().ResourceBarrier(&to_copy);
         for copy in pages {
             if staging.insert(copy.staging.as_raw() as usize) {
                 list.keep(copy.staging);
             }
             if upload {
-                list.list.CopyBufferRegion(
+                list.recording().CopyBufferRegion(
                     copy.page.buffer(),
                     copy.page.offset(),
                     copy.staging,
@@ -554,7 +555,7 @@ fn transfer(list: &HostList, pages: &[Transfer<'_>], upload: bool) {
                     PAGE_BYTES,
                 );
             } else {
-                list.list.CopyBufferRegion(
+                list.recording().CopyBufferRegion(
                     copy.staging,
                     copy.offset,
                     copy.page.buffer(),
@@ -563,7 +564,7 @@ fn transfer(list: &HostList, pages: &[Transfer<'_>], upload: bool) {
                 );
             }
         }
-        list.list.ResourceBarrier(&restore);
+        list.recording().ResourceBarrier(&restore);
     }
 }
 
@@ -730,7 +731,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     // SAFETY: all descriptors, pipeline, table, and output stay valid
     // until the direct-queue fence; both draw dispatches use UAV state.
     unsafe {
-        let cmd = &list.list;
+        let cmd = list.recording();
         cmd.ResourceBarrier(&[transition(
             a.buffer(),
             D3D12_RESOURCE_STATE_COMMON,

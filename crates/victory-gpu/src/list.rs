@@ -395,7 +395,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 )
             };
             // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            unsafe { list.recording().ResourceBarrier(host) };
         }
     }
     0
@@ -409,7 +409,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { list.recording().ResourceBarrier(&[barrier]) };
     }
 }
 
@@ -473,7 +473,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            unsafe { list.recording().CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -602,7 +602,7 @@ extern "system" fn copy_texture_region(
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
-            list.list.CopyTextureRegion(
+            list.recording().CopyTextureRegion(
                 (&raw const to_location).cast(),
                 x,
                 y,
@@ -667,9 +667,9 @@ extern "system" fn resolve(
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = DXGI_FORMAT(format as i32);
             if (a.Width, a.Height) == (b.Width, b.Height) {
-                list.list
+                list.recording()
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
-            } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+            } else if let Ok(list1) = list.recording().cast::<ID3D12GraphicsCommandList1>() {
                 // The console clips a larger source to the destination.
                 let rect = RECT {
                     left: 0,
@@ -736,13 +736,13 @@ extern "system" fn clear_rtv(
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
+                list.recording().ResourceBarrier(&[crate::host::transition(
                     texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
                 )]);
             }
-            list.list.ClearRenderTargetView(rtv, color, rects);
+            list.recording().ClearRenderTargetView(rtv, color, rects);
         }
     }
     #[cfg(not(windows))]
@@ -782,7 +782,7 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
+            list.recording()
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
     }
@@ -909,8 +909,8 @@ fn wait_for_shader_writes(this: This) {
         // `UAV_BARRIER` names no resource (`first` is null).
         let barrier =
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: `list.list` is an open host command list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // SAFETY: `list.recording()` is an open host command list.
+        unsafe { list.recording().ResourceBarrier(&[barrier]) };
     }
     #[cfg(not(windows))]
     let _ = this;
@@ -2036,40 +2036,40 @@ void main(uint3 id : SV_DispatchThreadID) {
         let sync_top = slot::<SyncFn>(list, top_slot * size_of::<*const ()>());
         let sync_bottom = slot::<SyncFn>(list, bottom_slot * size_of::<*const ()>());
 
-        // SAFETY: `hl.list` is an open list and `root`, `pso`, `buf_a`, `buf_b` outlive execution.
+        // SAFETY: `hl.recording()` is an open list and `root`, `pso`, `buf_a`, `buf_b` outlive execution.
         unsafe {
-            hl.list.SetComputeRootSignature(&root);
-            hl.list.SetPipelineState(&pso);
-            hl.list.SetComputeRootUnorderedAccessView(1, gpu_a);
-            hl.list.SetComputeRootUnorderedAccessView(2, gpu_b);
+            hl.recording().SetComputeRootSignature(&root);
+            hl.recording().SetPipelineState(&pso);
+            hl.recording().SetComputeRootUnorderedAccessView(1, gpu_a);
+            hl.recording().SetComputeRootUnorderedAccessView(2, gpu_b);
 
             let p0 = [COUNT, 0u32];
-            hl.list
+            hl.recording()
                 .SetComputeRoot32BitConstants(0, 2, p0.as_ptr().cast(), 0);
-            hl.list.Dispatch(GROUPS, 1, 1);
+            hl.recording().Dispatch(GROUPS, 1, 1);
 
             sync_top(list, 0, 0, 0, 0);
 
             let p1 = [COUNT, 1u32];
-            hl.list
+            hl.recording()
                 .SetComputeRoot32BitConstants(0, 2, p1.as_ptr().cast(), 0);
-            hl.list.Dispatch(GROUPS, 1, 1);
+            hl.recording().Dispatch(GROUPS, 1, 1);
 
             sync_bottom(list, 0x1, 0x2, 0x1000, 64);
 
             let p2 = [COUNT, 2u32];
-            hl.list
+            hl.recording()
                 .SetComputeRoot32BitConstants(0, 2, p2.as_ptr().cast(), 0);
-            hl.list.Dispatch(GROUPS, 1, 1);
+            hl.recording().Dispatch(GROUPS, 1, 1);
 
             // `count == 0` is a no-op; `count > 0` orders pass 3 after pass 2.
             barrier_groups(list, 0, std::ptr::null());
             barrier_groups(list, 1, std::ptr::null());
 
             let p3 = [COUNT, 3u32];
-            hl.list
+            hl.recording()
                 .SetComputeRoot32BitConstants(0, 2, p3.as_ptr().cast(), 0);
-            hl.list.Dispatch(GROUPS, 1, 1);
+            hl.recording().Dispatch(GROUPS, 1, 1);
         }
 
         assert_eq!(

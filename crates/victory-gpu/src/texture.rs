@@ -237,7 +237,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i },
     };
-    let l = &list.list;
+    let l = list.recording();
     // SAFETY: an open list; live resources in the states named.
     unsafe {
         for i in first..n {
@@ -353,7 +353,7 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
             },
         };
         // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        unsafe { list.recording().CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
 }
 

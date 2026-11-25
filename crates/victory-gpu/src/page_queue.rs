@@ -85,6 +85,24 @@ impl Host {
         })
     }
 
+    /// Encoder boundary for a closed queue submission recorded by the
+    /// title list handlers. Reject the whole submission before touching
+    /// backing if any list still contains operations we cannot lower.
+    pub(crate) fn execute_paged_title_copies(
+        &self,
+        heap: &HostHeap,
+        backing: &mut SubmissionBacking,
+        lists: &[&HostList],
+    ) -> std::result::Result<PageStats, BatchError> {
+        let mut copies = Vec::new();
+        for (index, list) in lists.iter().enumerate() {
+            if !list.append_closed_copies(&mut copies) {
+                return Err(BatchError::UnloweredList(index));
+            }
+        }
+        self.execute_paged_copies(heap, backing, &copies)
+    }
+
     /// Run a closed sequence of buffer copies against one capture and
     /// perform a single dirty-page merge after the whole sequence.
     pub(crate) fn execute_paged_copies(
@@ -217,7 +235,7 @@ fn run(
     let declared_dirty = record(&list, roots, batch, backing.pins())?;
     barrier(&list, slabs.values().copied(), true);
     list.close();
-    let command = list.list.cast().map_err(native)?;
+    let command = list.recording().cast().map_err(native)?;
     let rendered = host
         .run_native_group(signal, &[Some(command)])
         .unwrap_or_else(|e| fail(format_args!("native paged render submission: {e}")));
@@ -268,7 +286,7 @@ fn run(
             .collect();
         download(&transfer, &entries);
         transfer.close();
-        let completed = host.run_native_group(signal, &[Some(transfer.list.cast()?)])?;
+        let completed = host.run_native_group(signal, &[Some(transfer.recording().cast()?)])?;
         if host.completed_fence().is_none() {
             return Err(E_FAIL.into());
         }
@@ -332,7 +350,7 @@ fn record_copy(
     // SAFETY: native buffers are owned by the same captured batch; all
     // byte spans are bounded by its guest copy plan.
     unsafe {
-        let cmd = &list.list;
+        let cmd = list.recording();
         cmd.ResourceBarrier(
             &source
                 .values()
@@ -403,7 +421,7 @@ fn barrier<'a>(
         .collect();
     if !barriers.is_empty() {
         // SAFETY: one barrier per live slab retained by the list.
-        unsafe { list.list.ResourceBarrier(&barriers) };
+        unsafe { list.recording().ResourceBarrier(&barriers) };
     }
 }
 
@@ -451,7 +469,7 @@ void main(uint3 thread : SV_DispatchThreadID) {
             // SAFETY: paged queue keeps heap, table, bitmap and slab pins
             // through this dispatch and native readback.
             unsafe {
-                let cmd = &list.list;
+                let cmd = list.recording();
                 cmd.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
                 cmd.SetComputeRootSignature(&root);
                 cmd.SetComputeRootDescriptorTable(0, heap.gpu(0));
@@ -551,5 +569,43 @@ fn paged_buffer_copy_batch_orders_alias_dependencies_and_rejects_partial_work() 
             downloaded: 1,
         }
     );
+    assert_eq!(&section.lock().unwrap()[..6], &[20, 30, 20, 30, 40, 50]);
+}
+
+#[cfg(test)]
+#[test]
+fn paged_title_recording_rejects_mixed_lists_before_alias_copy() {
+    use victory_memory::physical::PageNumbers;
+    const VA: usize = PAGE_BYTES as usize;
+    const ALIAS: usize = 0x83_0000_0000;
+    let host = crate::host::host().expect("D3D12 renderer host (CI selects WARP)");
+    let heap = crate::memory::heap().unwrap();
+    let id = PageNumbers::default().allocate(4).unwrap().offset(3);
+    let (mut backing, section) = crate::title_backing::test_capture(id, &[VA, ALIAS]);
+    let first = host.new_list().unwrap();
+    let second = host.new_list().unwrap();
+    first.defer_copy((ALIAS + 1) as *mut u8, VA as *const u8, 5);
+    second.defer_copy(VA as *mut u8, (ALIAS + 2) as *const u8, 2);
+    first.close();
+    let initial = [10, 20, 30, 40, 50, 60];
+    section.lock().unwrap()[..6].copy_from_slice(&initial);
+    assert!(matches!(
+        host.execute_paged_title_copies(heap, &mut backing, &[&first, &second]),
+        Err(BatchError::UnloweredList(1))
+    ));
+    // The native recorder is exposed; even a no-op native body is not
+    // provably all copies. No early list should be submitted.
+    let _ = second.recording();
+    second.close();
+    assert!(matches!(
+        host.execute_paged_title_copies(heap, &mut backing, &[&first, &second]),
+        Err(BatchError::UnloweredList(1))
+    ));
+    assert_eq!(&section.lock().unwrap()[..6], &initial);
+    second.reset();
+    second.defer_copy(VA as *mut u8, (ALIAS + 2) as *const u8, 2);
+    second.close();
+    let stats = host.execute_paged_title_copies(heap, &mut backing, &[&first, &second]).unwrap();
+    assert_eq!(stats, PageStats { uploaded: 1, downloaded: 1 });
     assert_eq!(&section.lock().unwrap()[..6], &[20, 30, 20, 30, 40, 50]);
 }

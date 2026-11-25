@@ -454,7 +454,7 @@ pub(crate) fn read_indirect(
     };
     let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
     let mut buffer: Option<ID3D12Resource> = None;
-    let l = &list.list;
+    let l = list.recording();
     use crate::host::transition;
     use windows::core::Interface;
     let (arg_state, copy) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -534,12 +534,12 @@ fn dump_one(
     // SAFETY: an open list of ours and a live texture.
     let read = unsafe {
         if state != copy {
-            list.list
+            list.recording()
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
+        let read = read_back(&host.device, list.recording(), texture);
         if state != copy {
-            list.list
+            list.recording()
                 .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
         }
         read

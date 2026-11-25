@@ -628,14 +628,14 @@ void main(uint3 id : SV_DispatchThreadID) {
                 let constants = [address as u32, (address >> 32) as u32, 16 * k as u32];
                 // SAFETY: an open list, live objects of ours.
                 unsafe {
-                    list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
-                    list.list.SetComputeRootSignature(&root);
-                    list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
-                    list.list.SetComputeRootShaderResourceView(1, maps[k].table);
-                    list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
-                    list.list.SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
-                    list.list.SetPipelineState(&pso);
-                    list.list.Dispatch(1, 1, 1);
+                    list.recording().SetDescriptorHeaps(&[Some(views.heap.clone())]);
+                    list.recording().SetComputeRootSignature(&root);
+                    list.recording().SetComputeRootDescriptorTable(0, views.gpu(0));
+                    list.recording().SetComputeRootShaderResourceView(1, maps[k].table);
+                    list.recording().SetComputeRootUnorderedAccessView(2, out_gpu);
+                    list.recording().SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+                    list.recording().SetPipelineState(&pso);
+                    list.recording().Dispatch(1, 1, 1);
                 }
                 list.close();
             }
