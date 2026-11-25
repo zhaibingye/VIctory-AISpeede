@@ -71,3 +71,4 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: cargo test -p victory-shader --features host --locked --lib title_memory_is_read_and_written_
+      - run: cargo test -p victory-shader --features host --locked --lib page_texture_table_proof_requires_static_aligned_offsets

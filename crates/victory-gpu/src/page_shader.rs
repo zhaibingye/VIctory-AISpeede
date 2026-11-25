@@ -140,3 +140,18 @@ fn closed_draw_rejects_unlowered_shader_accesses() {
         Some(UnloweredShader::DescriptorTable),
     );
 }
+
+
+/// Resolve only views explicitly named by a complete texture-only shader
+/// proof. No unbound descriptor is substituted for an unavailable view.
+pub(crate) fn resolve_static_textures(
+    container: &[u8],
+    mut capture: impl FnMut(u8, u32) -> Option<crate::page_texture::LinearTexture>,
+) -> Result<Vec<(victory_shader::emit::StaticTextureSlot, crate::page_texture::LinearTexture)>, UnloweredShader> {
+    let slots = victory_shader::emit::static_texture_slots(container)
+        .ok().flatten().ok_or(UnloweredShader::DescriptorTable)?;
+    slots.into_iter().map(|slot| {
+        let texture = capture(slot.root, slot.index).ok_or(UnloweredShader::DescriptorTable)?;
+        Ok((slot, texture))
+    }).collect()
+}
