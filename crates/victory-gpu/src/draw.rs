@@ -431,16 +431,8 @@ impl State {
         }
         let mut draw = crate::page_draw::ClosedDraw::from_translated(
             pipeline,
-            |slot, dword| match self.graphics.get(slot as usize) {
-                Some(Root::Constants(words)) => words.get(dword as usize).copied().flatten(),
-                _ => None,
-            },
-            |root, index| {
-                let Root::Table(first) = *self.graphics.get(root as usize)? else { return None };
-                let heap = self.heap_of(first)?;
-                let records = heap.table_records(first, index.checked_add(1)?)?;
-                table_view(*records.get(index as usize)?)?.paged_linear_srv()
-            },
+            |slot, dword| self.page_word(false, slot, dword),
+            |root, index| self.page_texture(false, root, index),
             target,
             self.page_depth.clone(),
             self.page_stencil,
@@ -1008,8 +1000,46 @@ impl State {
         }
     }
 
+    fn record_strict_dispatch(&self, list: &HostList, call: crate::page_dispatch::DispatchCall) -> bool {
+        let ready = (!self.page_state_opaque)
+            .then(|| crate::pipeline::host_pipeline(self.pipeline as This)).flatten()
+            .and_then(|pipeline| crate::page_dispatch::ClosedDispatch::capture(
+                pipeline,
+                |slot, dword| self.page_word(true, slot, dword),
+                |root, index| self.page_texture(true, root, index),
+                call,
+            ).ok());
+        if let Some(dispatch) = ready {
+            list.record_page_dispatch(dispatch);
+            true
+        } else {
+            list.mark_unlowered();
+            false
+        }
+    }
+
+    fn page_word(&self, compute: bool, slot: u8, dword: u32) -> Option<u32> {
+        match self.roots_ref(compute).get(slot as usize)? {
+            Root::Constants(words) => words.get(dword as usize).copied().flatten(),
+            _ => None,
+        }
+    }
+
+    fn page_texture(&self, compute: bool, root: u8, index: u32) -> Option<crate::page_texture::LinearTexture> {
+        let Root::Table(first) = *self.roots_ref(compute).get(root as usize)? else { return None };
+        let heap = self.heap_of(first)?;
+        let records = heap.table_records(first, index.checked_add(1)?)?;
+        table_view(*records.get(index as usize)?)?.paged_linear_srv()
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        if cfg!(feature = "paged-title") {
+            if x != 0 && y != 0 && z != 0 {
+                self.record_strict_dispatch(list, crate::page_dispatch::DispatchCall::Direct(x, y, z));
+            }
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1627,15 +1657,22 @@ impl State {
             if max == 0 {
                 return true;
             }
-            if !matches!(kind, 0 | 1) {
-                list.mark_unlowered();
-                return false;
-            }
-            return self.record_strict_draw(list, crate::page_draw::DrawCall::Indirect(
-                crate::page_indirect::IndirectDraw {
-                    indexed: kind == 1, stride, max, arguments, count,
-                },
-            ));
+            use crate::page_indirect::{IndirectArgs, IndirectKind};
+            let kind = match kind {
+                0 => IndirectKind::Draw,
+                1 => IndirectKind::Indexed,
+                2 => IndirectKind::Dispatch,
+                _ => {
+                    list.mark_unlowered();
+                    return false;
+                }
+            };
+            let args = IndirectArgs { kind, stride, max, arguments, count };
+            return if kind == IndirectKind::Dispatch {
+                self.record_strict_dispatch(list, crate::page_dispatch::DispatchCall::Indirect(args))
+            } else {
+                self.record_strict_draw(list, crate::page_draw::DrawCall::Indirect(args))
+            };
         }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]

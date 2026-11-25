@@ -37,6 +37,7 @@ pub(crate) enum PageOp {
     Copy(GuestCopy),
     Input(InputView),
     Draw(std::sync::Arc<crate::page_draw::ClosedDraw>),
+    Dispatch(std::sync::Arc<crate::page_dispatch::ClosedDispatch>),
     Clear(std::sync::Arc<crate::page_draw::ColorClear>),
     ClearDepth(std::sync::Arc<crate::page_draw::DepthClear>),
     Barrier(std::sync::Arc<crate::page_resource::PageBarrier>),
@@ -179,6 +180,7 @@ impl Host {
                 }
                 PageOp::Input(input) => ranges.push(input.range()?),
                 PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
+                PageOp::Dispatch(dispatch) => dispatch.ranges(&mut ranges)?,
                 PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
             }
         }
@@ -204,6 +206,7 @@ impl Host {
                             .map_err(BatchError::Native)?;
                     }
                     PageOp::Input(input) => input.encode(self, list, batch)?,
+                    PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors)?,
                     PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets)?,
                     PageOp::Clear(clear) => clear.encode(self, list, targets)?,
                     PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,

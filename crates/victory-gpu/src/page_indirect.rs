@@ -10,9 +10,17 @@ use crate::host::{Host, HostList};
 use crate::page_slabs::{BatchError, PinnedBatch};
 use crate::page_view::gather_span;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub(crate) enum IndirectKind {
+    Draw = 0,
+    Indexed = 1,
+    Dispatch = 2,
+}
+
 #[derive(Clone, Copy)]
-pub(crate) struct IndirectDraw {
-    pub(crate) indexed: bool,
+pub(crate) struct IndirectArgs {
+    pub(crate) kind: IndirectKind,
     pub(crate) stride: u32,
     pub(crate) max: u32,
     pub(crate) arguments: u64,
@@ -21,9 +29,13 @@ pub(crate) struct IndirectDraw {
 
 type Span = (u64, u64);
 
-impl IndirectDraw {
+impl IndirectArgs {
     fn spans(self) -> Result<(Span, Option<Span>), BatchError> {
-        let width = if self.indexed { 20 } else { 16 };
+        let width = match self.kind {
+            IndirectKind::Draw => 16,
+            IndirectKind::Indexed => 20,
+            IndirectKind::Dispatch => 12,
+        };
         let length = u64::from(self.stride) * u64::from(self.max);
         if self.stride < width || !self.stride.is_multiple_of(4)
             || self.max == 0 || self.max > 65536 || length > u64::from(u32::MAX)
@@ -55,7 +67,7 @@ impl IndirectDraw {
         budget: &mut Option<ID3D12Resource>,
     ) -> Result<Prepared, BatchError> {
         let (arguments, count) = self.spans()?;
-        let kind = u32::from(self.indexed);
+        let kind = self.kind as u32;
         let oom = || BatchError::Native(Error::from(E_OUTOFMEMORY));
         let signature = crate::draw::host_signature(kind, self.stride)
             .ok_or_else(|| BatchError::Native(Error::from(E_FAIL)))?;
@@ -98,8 +110,8 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
-    pub(crate) fn draw(&self, list: &ID3D12GraphicsCommandList) {
-        // SAFETY: the signature requires only draw/indexed draw records;
+    pub(crate) fn execute(&self, list: &ID3D12GraphicsCommandList) {
+        // SAFETY: the signature requires only the typed draw or dispatch records;
         // all buffers are live in the indirect-argument state.
         unsafe {
             list.ExecuteIndirect(&self.signature, self.max, &self.args, 0, self.counter.as_ref(), 0);
@@ -110,7 +122,7 @@ impl Prepared {
 #[cfg(test)]
 #[test]
 fn paged_indirect_checks_stride_and_entire_counted_range() {
-    let mut draw = IndirectDraw { indexed: true, stride: 20, max: 2, arguments: 0x10000, count: Some(0x20000) };
+    let mut draw = IndirectArgs { kind: IndirectKind::Indexed, stride: 20, max: 2, arguments: 0x10000, count: Some(0x20000) };
     assert!(matches!(draw.spans(), Ok(((0x10000, 0x10028), Some((0x20000, 0x20004))))));
     draw.stride = 16;
     assert!(draw.spans().is_err());

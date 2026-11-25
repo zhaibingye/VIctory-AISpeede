@@ -856,7 +856,8 @@ fn root_signature(
                 pStaticSamplers: samplers.as_ptr(),
                 Flags: input
                     | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                    | if cfg!(feature = "paged-title") { D3D12_ROOT_SIGNATURE_FLAG_NONE }
+                    else { D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED },
             },
         },
     };

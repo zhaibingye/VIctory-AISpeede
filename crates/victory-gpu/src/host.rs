@@ -2089,6 +2089,10 @@ impl HostList {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Draw(std::sync::Arc::new(draw))));
     }
 
+    pub(crate) fn record_page_dispatch(&self, dispatch: crate::page_dispatch::ClosedDispatch) {
+        self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Dispatch(std::sync::Arc::new(dispatch))));
+    }
+
     pub(crate) fn record_page_clear(&self, clear: crate::page_draw::ColorClear) {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Clear(std::sync::Arc::new(clear))));
     }

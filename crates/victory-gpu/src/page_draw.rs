@@ -4,12 +4,13 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::Ordering};
 
 use crate::host::{Host, HostList, transition};
 use crate::page_resource::ResourcePlan;
-use crate::page_shader::{RootWords, UnloweredShader};
+use crate::page_shader::{ShaderBindings, UnloweredShader};
+#[cfg(all(test, feature = "diagnostics"))]
+use crate::page_shader::RootWords;
 use crate::page_slabs::{BatchError, PinnedBatch};
 use crate::page_view::InputView;
 use crate::resource::HostTexture;
@@ -17,7 +18,7 @@ use crate::resource::HostTexture;
 pub(crate) enum DrawCall {
     Direct { vertices: u32, instances: u32, first: u32, first_instance: u32 },
     Indexed { indices: u32, instances: u32, first: u32, base: i32, first_instance: u32 },
-    Indirect(crate::page_indirect::IndirectDraw),
+    Indirect(crate::page_indirect::IndirectArgs),
 }
 
 impl DrawCall {
@@ -25,7 +26,7 @@ impl DrawCall {
         match self {
             Self::Direct { .. } => false,
             Self::Indexed { .. } => true,
-            Self::Indirect(draw) => draw.indexed,
+            Self::Indirect(draw) => draw.kind == crate::page_indirect::IndirectKind::Indexed,
         }
     }
 }
@@ -238,10 +239,9 @@ pub(crate) struct ClosedDraw {
     scissor: RECT,
     inputs: Vec<InputView>,
     call: DrawCall,
-    constants: Vec<RootWords>,
+    shader: ShaderBindings,
     blend_factor: [f32; 4],
     sample: Option<crate::page_texture::SampledTexture>,
-    texture_tables: BTreeMap<u8, BTreeMap<u32, crate::page_texture::LinearTexture>>,
 }
 
 impl ClosedDraw {
@@ -261,10 +261,9 @@ impl ClosedDraw {
     ) -> Self {
         Self {
             pipeline, root, target, depth: None, stencil_ref: 0, topology, viewport, scissor, inputs, call,
-            constants: Vec::new(),
+            shader: ShaderBindings::default(),
             blend_factor: [1.0; 4],
             sample: None,
-            texture_tables: BTreeMap::new(),
         }
     }
 
@@ -297,40 +296,12 @@ impl ClosedDraw {
         {
             return Err(UnloweredShader::GraphicsState);
         }
-        let mut constants = Vec::new();
-        let mut texture_tables = BTreeMap::<u8, BTreeMap<u32, _>>::new();
-        for stage in &pipeline.stages {
-            let t = stage.translated();
-            let needs_table = t.host.user_data.iter().any(|u| u.root == victory_shader::RootType::Table);
-            let slots = if needs_table {
-                stage.shader.static_texture_slots().ok_or(UnloweredShader::DescriptorTable)?
-            } else {
-                &[]
-            };
-            if let Some(words) = crate::page_shader::stage_words(
-                &t.host, &t.used, stage.user_data, &values,
-                |root| slots.iter().any(|s| s.root == root),
-            )? {
-                for slot in slots {
-                    if !words.tables.iter().any(|&(_, root)| root == slot.root) {
-                        return Err(UnloweredShader::DescriptorTable);
-                    }
-                    let table = texture_tables.entry(slot.root).or_default();
-                    if let std::collections::btree_map::Entry::Vacant(e) = table.entry(slot.index) {
-                        e.insert(texture(slot.root, slot.index).ok_or(UnloweredShader::DescriptorTable)?);
-                    }
-                }
-                constants.push(words);
-            } else if !slots.is_empty() {
-                return Err(UnloweredShader::DescriptorTable);
-            }
-        }
+        let shader = ShaderBindings::capture(pipeline, values, texture)?;
         Ok(Self {
             pipeline: pipeline.pso.clone(), root: pipeline.root.clone(),
-            target, depth, stencil_ref, topology, viewport, scissor, inputs, call, constants,
+            target, depth, stencil_ref, topology, viewport, scissor, inputs, call, shader,
             blend_factor: [1.0; 4],
             sample: None,
-            texture_tables,
         })
     }
 
@@ -348,11 +319,7 @@ impl ClosedDraw {
         if let Some(sample) = &self.sample {
             ranges.extend(sample.input.rows()?);
         }
-        for table in self.texture_tables.values() {
-            for texture in table.values() {
-                ranges.extend(texture.rows()?);
-            }
-        }
+        self.shader.ranges(ranges)?;
         Ok(())
     }
 
@@ -376,20 +343,7 @@ impl ClosedDraw {
         };
         let sample = self.sample.as_ref()
             .map(|input| input.prepare(host, list, batch, descriptors)).transpose()?;
-        let mut bases = BTreeMap::new();
-        for (&root, table) in &self.texture_tables {
-            let size = table.last_key_value().expect("captured slots exist").0 + 1;
-            let mut views = vec![None; size as usize];
-            for (&index, &texture) in table {
-                views[index as usize] = Some((texture.encode(host, list, batch)?, texture.format));
-            }
-            let first = descriptors.reserve_texture_run(&views).map_err(BatchError::Native)?;
-            bases.insert(root, first);
-        }
-        let words: Vec<_> = self.constants.iter().map(|root| {
-            root.relocated(&bases).map(|words| (root.parameter, words))
-                .ok_or_else(|| BatchError::Native(windows::Win32::Foundation::E_FAIL.into()))
-        }).collect::<Result<_, _>>()?;
+        let words = self.shader.prepare(host, list, batch, descriptors)?;
         for &input in &self.inputs {
             input.encode(host, list, batch)?;
         }
@@ -411,11 +365,7 @@ impl ClosedDraw {
             if before != render_target {
                 cmd.ResourceBarrier(&[transition(texture, before, render_target)]);
             }
-            if !bases.is_empty() {
-                // Directly indexed root signatures require their descriptor
-                // heap to be set before the root signature itself.
-                cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
-            }
+            cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
             cmd.SetGraphicsRootSignature(&self.root);
             cmd.SetPipelineState(&self.pipeline);
             if let Some(sample) = &sample {
@@ -439,7 +389,7 @@ impl ClosedDraw {
                 DrawCall::Indexed { indices, instances, first, base, first_instance } => {
                     cmd.DrawIndexedInstanced(indices, instances, first, base, first_instance);
                 }
-                DrawCall::Indirect(_) => indirect.as_ref().expect("indirect arguments prepared").draw(cmd),
+                DrawCall::Indirect(_) => indirect.as_ref().expect("indirect arguments prepared").execute(cmd),
             }
             if before != render_target {
                 cmd.ResourceBarrier(&[transition(texture, render_target, before)]);
@@ -730,8 +680,8 @@ float4 pixel() : SV_Target0 {
     let call = if indirect {
         title.defer_copy((VA + 64) as *mut u8, (ALIAS + 112) as *const u8, 16);
         title.defer_copy((VA + 96) as *mut u8, (ALIAS + 128) as *const u8, 4);
-        DrawCall::Indirect(crate::page_indirect::IndirectDraw {
-            indexed: false, stride: 16, max: 2,
+        DrawCall::Indirect(crate::page_indirect::IndirectArgs {
+            kind: crate::page_indirect::IndirectKind::Draw, stride: 16, max: 2,
             arguments: (VA + 64) as u64, count: Some((VA + 96) as u64),
         })
     } else {
@@ -752,16 +702,16 @@ float4 pixel() : SV_Target0 {
             format: FORMAT,
         };
         if relocated {
-            draw.texture_tables.entry(7).or_default().insert(3, input);
+            draw.shader.texture_tables.entry(7).or_default().insert(3, input);
             // An unrelocated table would read from the wrong heap slot.
-            draw.constants.push(RootWords {
+            draw.shader.constants.push(RootWords {
                 parameter: 0, words: vec![0; 4], tables: vec![(0, 7)],
             });
         } else {
             draw.sample = Some(SampledTexture { root: 0, input });
         }
     } else {
-        draw.constants.push(RootWords {
+        draw.shader.constants.push(RootWords {
             parameter: 0,
             words: [0.0f32, 1.0, 0.0, 1.0].into_iter().map(f32::to_bits).collect(),
             tables: Vec::new(),

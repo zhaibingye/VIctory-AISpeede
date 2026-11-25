@@ -1,5 +1,13 @@
 //! Shader dependency admission for the closed page renderer. An access
 //! with no lowering is rejected, not filled with the legacy root views.
+use std::collections::BTreeMap;
+
+use crate::host::{Host, HostList};
+use crate::page_queue::PageDescriptors;
+use crate::page_slabs::{BatchError, PinnedBatch};
+use crate::page_texture::LinearTexture;
+use crate::pipeline::host::HostPipeline;
+
 use victory_shader::emit::{HostShader, UserData};
 use victory_shader::{RootType, UsedResource};
 
@@ -189,4 +197,83 @@ fn closed_draw_relocates_table_byte_offsets_without_changing_constants() {
         .unwrap().unwrap();
     assert_eq!(words.relocated(&[(4, 32)].into()), Some(vec![1024, 0, 0x700, 0]));
     assert_eq!(words.relocated(&std::collections::BTreeMap::new()), None);
+}
+
+
+/// One validated shader binding snapshot for either graphics or compute.
+#[derive(Default)]
+pub(crate) struct ShaderBindings {
+    pub(crate) constants: Vec<RootWords>,
+    pub(crate) texture_tables: BTreeMap<u8, BTreeMap<u32, LinearTexture>>,
+}
+
+impl ShaderBindings {
+    pub(crate) fn capture(
+        pipeline: &HostPipeline,
+        values: impl Fn(u8, u32) -> Option<u32>,
+        texture: impl Fn(u8, u32) -> Option<LinearTexture>,
+    ) -> Result<Self, UnloweredShader> {
+        if pipeline.marks.is_some() {
+            return Err(UnloweredShader::DescriptorHeap);
+        }
+        let mut constants = Vec::new();
+        let mut texture_tables = BTreeMap::<u8, BTreeMap<u32, _>>::new();
+        for stage in &pipeline.stages {
+            let t = stage.translated();
+            let needs_table = t.host.user_data.iter().any(|u| u.root == victory_shader::RootType::Table);
+            let slots = if needs_table {
+                stage.shader.static_texture_slots().ok_or(UnloweredShader::DescriptorTable)?
+            } else {
+                &[]
+            };
+            if let Some(words) = stage_words(
+                &t.host, &t.used, stage.user_data, &values,
+                |root| slots.iter().any(|s| s.root == root),
+            )? {
+                for slot in slots {
+                    if !words.tables.iter().any(|&(_, root)| root == slot.root) {
+                        return Err(UnloweredShader::DescriptorTable);
+                    }
+                    let table = texture_tables.entry(slot.root).or_default();
+                    if let std::collections::btree_map::Entry::Vacant(e) = table.entry(slot.index) {
+                        e.insert(texture(slot.root, slot.index).ok_or(UnloweredShader::DescriptorTable)?);
+                    }
+                }
+                constants.push(words);
+            } else if !slots.is_empty() {
+                return Err(UnloweredShader::DescriptorTable);
+            }
+        }
+        Ok(Self { constants, texture_tables })
+    }
+
+    pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
+        for table in self.texture_tables.values() {
+            for texture in table.values() {
+                ranges.extend(texture.rows()?);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare(
+        &self, host: &Host, list: &HostList, batch: &PinnedBatch,
+        descriptors: &mut PageDescriptors<'_>,
+    ) -> Result<Vec<(u32, Vec<u32>)>, BatchError> {
+        let mut bases = BTreeMap::new();
+        for (&root, table) in &self.texture_tables {
+            let size = table.last_key_value().expect("captured slots exist").0 + 1;
+            let mut views = vec![None; size as usize];
+            for (&index, &texture) in table {
+                views[index as usize] = Some((texture.encode(host, list, batch)?, texture.format));
+            }
+            let first = descriptors.reserve_texture_run(&views).map_err(BatchError::Native)?;
+            bases.insert(root, first);
+        }
+        let words: Vec<_> = self.constants.iter().map(|root| {
+            root.relocated(&bases).map(|words| (root.parameter, words))
+                .ok_or_else(|| BatchError::Native(windows::Win32::Foundation::E_FAIL.into()))
+        }).collect::<Result<_, _>>()?;
+        Ok(words)
+    }
 }
