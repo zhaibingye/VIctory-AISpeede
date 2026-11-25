@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Error as DxError;
 
 use crate::PAGE_BYTES;
-use crate::budget::{Charge, Pool};
+use crate::budget::{Charge, NoSpace, Pool};
 use crate::coherence::{Access, Invalid, Need};
 use crate::engine::{Engine, Error as PolicyError};
 use crate::guest::PageId;
@@ -94,8 +94,16 @@ impl Pages {
         self.transfers
     }
 
-    pub fn set_local_budget(&mut self, bytes: u64, unmanaged: u64) -> u64 {
-        self.policy.set_local_budget(bytes, unmanaged)
+    /// Shrink the actual working set, not just future admissions.
+    pub fn set_local_budget(&mut self, bytes: u64, unmanaged: u64) -> Result<(), Error> {
+        self.queue.check()?;
+        self.policy.set_local_budget(bytes, unmanaged);
+        while self.used(Pool::Local) > self.policy.local_limit() {
+            let candidate = self.policy.candidate(self.queue.completed())
+                .ok_or(PolicyError::NotEvictable)?;
+            self.evict(candidate)?;
+        }
+        Ok(())
     }
 
     pub fn commit(&mut self, address: u64) -> Result<PageId, Error> {
@@ -131,8 +139,44 @@ impl Pages {
         if !self.backing.contains_key(&source) || !self.backing.contains_key(&dest) {
             return Err(PolicyError::UnknownPage.into());
         }
-        self.admit(source)?;
+        let capacity = self.policy.local_limit();
+        if capacity < 2 * PAGE_BYTES {
+            return Err(PolicyError::Space(NoSpace {
+                pool: Pool::Local,
+                shortfall: 2 * PAGE_BYTES - capacity,
+            }).into());
+        }
+
+        // Protect the source from being chosen as a victim while the
+        // destination acquires a slot. A currently resident destination
+        // is likewise protected while bringing in the source.
+        let dest_resident = self.policy.pin(dest);
+        let result = (|| {
+            self.admit(source)?;
+            assert!(self.policy.pin(source));
+            let result = self.copy_pinned(source, dest, dest_resident);
+            assert!(self.policy.end_pin(source, Some(self.queue.completed())));
+            result
+        })();
+        if dest_resident {
+            assert!(self.policy.end_pin(dest, Some(self.queue.completed())));
+        }
+        result
+    }
+
+    fn copy_pinned(&mut self, source: PageId, dest: PageId, dest_pinned: bool) -> Result<(), Error> {
         self.admit(dest)?;
+        if !dest_pinned {
+            assert!(self.policy.pin(dest));
+        }
+        let result = self.transfer_page(source, dest);
+        if !dest_pinned {
+            assert!(self.policy.end_pin(dest, Some(self.queue.completed())));
+        }
+        result
+    }
+
+    fn transfer_page(&mut self, source: PageId, dest: PageId) -> Result<(), Error> {
         self.sync_local(source)?;
         let before = self.queue.completed();
         let fence = self.queue.copy(
@@ -159,7 +203,16 @@ impl Pages {
     }
 
     fn admit(&mut self, id: PageId) -> Result<(), Error> {
-        self.policy.admit(id, 0)?;
+        loop {
+            match self.policy.admit(id, 0) {
+                Ok(()) => break,
+                Err(error @ PolicyError::Space(_)) => {
+                    let victim = self.policy.candidate(self.queue.completed()).ok_or(error)?;
+                    self.evict(victim)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         if self.backing[&id].local.is_some() {
             return Ok(());
         }

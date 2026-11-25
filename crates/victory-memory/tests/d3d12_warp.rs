@@ -49,24 +49,50 @@ fn round_trip_preserves_bytes_across_dirty_eviction_and_readmission() {
     assert_eq!(pages.used(Pool::Local), 2 * PAGE_BYTES);
     assert_eq!(pages.transfers(), Transfers { uploaded_pages: 1, downloaded_pages: 0 });
 
-    assert!(matches!(pages.copy_page(b, c), Err(Error::Policy(PolicyError::Space(_)))));
+    // B is GPU-authoritative and is the next source, so A has to go.
+    // It is clean: eviction needs no download or duplicate upload of B.
+    pages.copy_page(b, c).unwrap();
     assert_eq!(pages.used(Pool::Local), 2 * PAGE_BYTES);
-    // B is GPU-authoritative. Evict it before the CPU asks for a read.
-    pages.evict(b).unwrap();
-    assert_eq!(pages.used(Pool::Local), PAGE_BYTES);
-    assert_eq!(pages.read(b).unwrap(), input.as_ref());
-    assert_eq!(pages.transfers().downloaded_pages, 1);
+    assert_eq!(pages.transfers(), Transfers { uploaded_pages: 1, downloaded_pages: 0 });
 
-    pages.evict(a).unwrap();
+    // Shrinking to zero writes back both dirty pages before releasing the
+    // physical buffers. Neither read below should request a new transfer.
+    pages.set_local_budget(0, 0).unwrap();
     assert_eq!(pages.used(Pool::Local), 0);
-    pages.copy_page(b, c).unwrap(); // B is re-uploaded from the writeback, not stale RAM.
+    assert_eq!(pages.transfers(), Transfers { uploaded_pages: 1, downloaded_pages: 2 });
+    assert_eq!(pages.read(b).unwrap(), input.as_ref());
     assert_eq!(pages.read(c).unwrap(), input.as_ref());
+    assert!(matches!(pages.copy_page(b, c), Err(Error::Policy(PolicyError::Space(_)))));
+    assert_eq!(pages.used(Pool::Local), 0);
+    assert_eq!(pages.transfers().downloaded_pages, 2);
+
+    pages.set_local_budget(2 * PAGE_BYTES, 0).unwrap();
+    pages.copy_page(b, c).unwrap();
     assert_eq!(pages.read(c).unwrap(), input.as_ref());
-    assert_eq!(pages.transfers(), Transfers { uploaded_pages: 2, downloaded_pages: 2 });
+    assert_eq!(pages.transfers(), Transfers { uploaded_pages: 2, downloaded_pages: 3 });
 
     let updated = pattern(0xf7);
     pages.write(b, &updated).unwrap();
     pages.copy_page(b, c).unwrap();
     assert_eq!(pages.read(c).unwrap(), updated.as_ref());
-    assert_eq!(pages.transfers(), Transfers { uploaded_pages: 3, downloaded_pages: 3 });
+    assert_eq!(pages.transfers(), Transfers { uploaded_pages: 3, downloaded_pages: 4 });
+}
+
+#[test]
+fn admission_evicts_a_dirty_non_operand_and_preserves_its_bytes() {
+    let mut pages = Pages::new(device(), 2 * PAGE_BYTES, 0).unwrap();
+    let a = pages.commit(0).unwrap();
+    let b = pages.commit(PAGE_BYTES).unwrap();
+    let c = pages.commit(2 * PAGE_BYTES).unwrap();
+    let input = pattern(0x17);
+    pages.write(a, &input).unwrap();
+    pages.copy_page(a, b).unwrap();
+    // Protect A as the source. B has newer GPU contents and has to be
+    // downloaded before C can take its local allocation.
+    pages.copy_page(a, c).unwrap();
+    assert_eq!(pages.used(Pool::Local), 2 * PAGE_BYTES);
+    assert_eq!(pages.transfers(), Transfers { uploaded_pages: 1, downloaded_pages: 1 });
+    assert_eq!(pages.read(b).unwrap(), input.as_ref());
+    assert_eq!(pages.transfers().downloaded_pages, 1);
+    assert_eq!(pages.read(c).unwrap(), input.as_ref());
 }

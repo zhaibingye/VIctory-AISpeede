@@ -40,6 +40,11 @@ impl Engine {
         self.budget.observe_local(dxgi, unmanaged)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn local_limit(&self) -> u64 {
+        self.budget.local_limit()
+    }
+
     pub fn used(&self, pool: Pool) -> u64 { self.budget.used(pool) }
 
     #[cfg(windows)]

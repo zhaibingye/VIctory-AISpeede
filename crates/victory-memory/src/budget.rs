@@ -34,6 +34,11 @@ impl Budget {
         self.local.saturating_sub(self.local_cap)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn local_limit(&self) -> u64 {
+        self.local_cap
+    }
+
     pub fn used(&self, pool: Pool) -> u64 {
         match pool {
             Pool::Ram => self.ram,
