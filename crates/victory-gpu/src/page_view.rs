@@ -131,19 +131,40 @@ pub(crate) fn gather_span(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> Result<(), BatchError> {
-    if start >= end || end > ADDRESS_LIMIT {
-        return Err(BatchError::Range(start, end));
-    }
+    gather_regions(list, batch, [((start, end), 0)], buffer, before, after)
+}
+
+/// Gather multiple pitched regions while transitioning each slab once.
+pub(crate) fn gather_regions(
+    list: &HostList,
+    batch: &PinnedBatch,
+    regions: impl IntoIterator<Item = ((u64, u64), u64)>,
+    buffer: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> Result<(), BatchError> {
     let mut source = BTreeMap::new();
     let mut pieces = Vec::new();
-    let mut va = start;
-    while va < end {
-        let page = batch.pinned_at(va).ok_or(BatchError::NotCaptured(va))?;
-        let offset = va % PAGE_BYTES;
-        let count = (end - va).min(PAGE_BYTES - offset);
-        source.insert(page.slab(), page.buffer());
-        pieces.push((page.buffer(), page.offset() + offset, va - start, count));
-        va += count;
+    // SAFETY: query a live buffer descriptor.
+    let capacity = unsafe { buffer.GetDesc() }.Width;
+    for ((start, end), dst) in regions {
+        if start >= end || end > ADDRESS_LIMIT
+            || dst.checked_add(end - start).is_none_or(|stop| stop > capacity)
+        {
+            return Err(BatchError::Range(start, end));
+        }
+        let mut va = start;
+        while va < end {
+            let page = batch.pinned_at(va).ok_or(BatchError::NotCaptured(va))?;
+            let offset = va % PAGE_BYTES;
+            let count = (end - va).min(PAGE_BYTES - offset);
+            source.insert(page.slab(), page.buffer());
+            pieces.push((page.buffer(), page.offset() + offset, dst + (va - start), count));
+            va += count;
+        }
+    }
+    if pieces.is_empty() {
+        return Err(BatchError::Range(0, 0));
     }
     list.keep(buffer);
     let cmd = list.recording();

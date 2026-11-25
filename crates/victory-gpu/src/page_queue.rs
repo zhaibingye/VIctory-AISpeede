@@ -704,3 +704,57 @@ fn paged_input_views_gather_cross_page_gpu_writes() {
     // SAFETY: the output owns the map and the real queue fence completed.
     assert_eq!(unsafe { std::slice::from_raw_parts(ptr, 8) }, &[8, 9, 3, 4, 8, 9, 3, 4]);
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[test]
+fn paged_linear_texture_uses_ordered_gpu_writes_and_pitched_rows() {
+    use crate::page_texture::LinearTexture;
+    use victory_memory::physical::PageNumbers;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    const PAGE: usize = PAGE_BYTES as usize;
+    const VA: usize = PAGE;
+    let host = crate::host::host().expect("D3D12 renderer host (CI selects WARP)");
+    let heap = crate::memory::heap().unwrap();
+    let id = PageNumbers::default().allocate(7).unwrap().offset(6);
+    let (mut backing, section) = crate::title_backing::test_capture(id, &[VA, VA + PAGE]);
+    {
+        let mut bytes = section.lock().unwrap();
+        bytes[PAGE - 4..].copy_from_slice(&[1, 2, 3, 4]);
+        bytes[..4].copy_from_slice(&[0, 0, 0, 0]);
+        bytes[12..20].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+        bytes[40..44].copy_from_slice(&[5, 6, 7, 8]);
+    }
+    let copy = GuestCopy::new(VA + PAGE, VA + 40, 4).unwrap();
+    let texture = LinearTexture {
+        address: (VA + PAGE - 4) as u64, row_pitch: 16, width: 2, height: 2,
+        format: DXGI_FORMAT_R8G8B8A8_UNORM,
+    };
+    let ranges: Vec<_> = copy.ranges().into_iter().chain(texture.rows().unwrap()).collect();
+    let mut output = None;
+    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins| {
+        let scratch = host.default_buffer(copy.len as u64).unwrap();
+        list.keep(&scratch);
+        let mut dirty = BTreeSet::new();
+        record_copy(list, batch, &scratch, &copy.bind(pins).unwrap(), &mut dirty)
+            .map_err(BatchError::Native)?;
+        let texture = texture.encode(host, list, batch)?;
+        let (readback, footprint) = crate::capture::read_back(&host.device, list.recording(), &texture)
+            .ok_or_else(|| BatchError::Native(E_FAIL.into()))?;
+        list.keep(&readback);
+        output = Some((readback, footprint));
+        Ok(dirty)
+    }).unwrap();
+    assert_eq!(stats, PageStats { uploaded: 1, downloaded: 1 });
+    let (readback, footprint) = output.unwrap();
+    // SAFETY: the queue fence completed; both padded rows are mapped.
+    unsafe {
+        let mut ptr = std::ptr::null_mut();
+        readback.Map(0, None, Some(&mut ptr)).unwrap();
+        let first = ptr.cast::<u8>().add(footprint.Offset as usize);
+        let second = first.add(footprint.Footprint.RowPitch as usize);
+        assert_eq!(std::slice::from_raw_parts(first, 8), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(std::slice::from_raw_parts(second, 8), &[9, 10, 11, 12, 13, 14, 15, 16]);
+        readback.Unmap(0, None);
+    }
+}
