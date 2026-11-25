@@ -28,4 +28,4 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
-      - run: cargo test -p victory-hle --locked --lib modules::xmem::tests::
+      - run: 'cargo test -p victory-hle --locked --lib modules::xmem::tests::'
