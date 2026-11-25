@@ -82,17 +82,19 @@
 //! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner `v0 + v2 - v1`, as the console's hardware does.
-//! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
-//!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
-//!   many slots, those past its own null, so an index past the heap (data
-//!   still wrong; the console would read whatever memory follows its heap)
-//!   reads nothing instead of faulting the device.
+//! * **Heap indices** (added 2026-11-24) are clamped to [`view_heap_limit`]
+//!   − 1 (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least
+//!   that many slots, those past its own null, so an index past the heap
+//!   (data still wrong; the console would read whatever memory follows its
+//!   heap) reads nothing instead of faulting the device. The limit is
+//!   [`HEAP_VIEWS`], or the cap of a host whose view heaps are capped lower
+//!   (NVIDIA: 1,000,000), set before translating ([`set_view_heap_limit`]).
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
 //!   heap itself first looks up the view-stride table (root SRV
 //!   `t`[`VIEW_STRIDES`], which then covers every index below
-//!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
-//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
+//!   the view limit, dynamic slots too); where it holds 0 (no buffer view
+//!   there) the shader reads heap index [`null_buffer_view`] instead (for
 //!   unordered access the index below), which the host keeps a null raw
 //!   buffer SRV (UAV). The index comes from data, and a texture descriptor
 //!   read as a buffer one is a wild address (the texture's shifted 8 bits
@@ -221,12 +223,16 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
+    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, null_buffer_view,
+    set_view_heap_limit, view_heap_limit,
     USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
 /// Byte stride of the host's per-slot view-address record at t1 in memory space.
 pub const VIEW_ADDRESS_BYTES: u32 = 8;
+/// Before the per-view records: the title slot count, then a zero record
+/// used by a translated shader for a slot outside that range.
+pub const VIEW_ADDRESS_PREFIX_RECORDS: u32 = 2;
 /// Word 1 of a view-address entry carrying only native descriptor word 0.
 /// A buffer address uses at most the low 16 bits of word 1.
 pub const VIEW_BASE_ONLY: u32 = 1 << 16;

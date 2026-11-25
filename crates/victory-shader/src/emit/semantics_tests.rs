@@ -367,7 +367,7 @@ fn run(
             1,
             Root::View {
                 srv: true,
-                data: vec![0x1234_5600, 12, 0x89AB_CD00, super::VIEW_BASE_ONLY],
+                data: vec![2, 0, 0, 0, 0x1234_5600, 12, 0x89AB_CD00, super::VIEW_BASE_ONLY],
             },
         ));
     }

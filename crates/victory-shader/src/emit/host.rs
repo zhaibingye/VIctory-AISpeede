@@ -91,6 +91,10 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
     ))
 }
 
+/// The shader-visible view heap size every host takes (resource binding
+/// tiers 1 and 2), as `victory_gpu`'s host has it.
+const PORTABLE_VIEWS: u32 = 1_000_000;
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     /// A software default adapter (a machine without a GPU, as CI) is
@@ -124,6 +128,23 @@ impl Host {
                     "the device supports SM {:#x} only",
                     sm.HighestShaderModel.0
                 ));
+            }
+            // A device that caps its view heaps below `HEAP_VIEWS` (NVIDIA:
+            // 1,000,000) lowers the limit translated shaders clamp to, as
+            // the runtime host does (`victory_gpu`'s `probe_view_limit`), so
+            // heaps made here and shaders translated after agree.
+            // shortcut: shaders translated before the first `Host::new`
+            // keep the limit they were made with.
+            let heap = |count: u32| {
+                device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: count,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+            };
+            if heap(super::HEAP_VIEWS).is_err() && heap(PORTABLE_VIEWS).is_ok() {
+                super::set_view_heap_limit(PORTABLE_VIEWS);
             }
             Ok(Host { device })
         }
@@ -1570,8 +1591,8 @@ pub enum View<'a> {
     NullPair,
     /// The second slot of a [`View::Memory`] or [`View::NullPair`].
     Pair,
-    /// Last in the heap, which then has [`super::HEAP_VIEWS`] slots: the
-    /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
+    /// Last in the heap, which then has [`super::view_heap_limit`] slots: the
+    /// host's null raw buffer SRV at [`super::null_buffer_view`] and UAV
     /// below it.
     NullBuffers,
 }
@@ -1722,7 +1743,7 @@ impl Host {
                 Ok(b)
             };
             let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
+                Some(View::NullBuffers) => super::view_heap_limit() as usize,
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
@@ -2052,7 +2073,7 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
+                        let null = super::null_buffer_view() as usize;
                         let (mut srv_at, mut uav_at) = (at, at);
                         srv_at.ptr += (null - i) * view_size;
                         uav_at.ptr += (null - 1 - i) * view_size;

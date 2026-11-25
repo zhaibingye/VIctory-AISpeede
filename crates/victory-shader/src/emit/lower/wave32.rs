@@ -157,10 +157,8 @@ impl Lower<'_> {
         let index = self.heap_index(site, first, false);
         (self.cur_ir, self.cur) = saved;
         let index = index?;
-        let views = self.s.view_addresses_handle();
-        let stride = self.s.m.i32(crate::emit::VIEW_ADDRESS_BYTES);
-        let record = self.s.m.bin(block, Bin::Mul, index, stride);
         self.cur = block;
+        let (views, record) = self.view_record(index);
         let word = self.raw_dword(views, record);
         self.cur = saved.1;
         self.vals.insert(value, Val::I32(word));

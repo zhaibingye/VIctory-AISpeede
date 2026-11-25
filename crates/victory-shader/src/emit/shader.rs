@@ -22,14 +22,36 @@ pub const VIEW_STRIDES: u8 = 255;
 pub const MEMORY_SPACE: u32 = 2;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
+/// indices"). A host that caps its view heaps lower (NVIDIA: 1,000,000)
+/// lowers the view limit to its cap ([`set_view_heap_limit`]).
 pub const HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
+
+/// The view-heap size shaders clamp their indices below: [`HEAP_VIEWS`], or
+/// a host's lower cap.
+static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(HEAP_VIEWS);
+
+/// Sets the view-heap size translated shaders clamp their indices below,
+/// for a host whose view heaps are capped under [`HEAP_VIEWS`]. Set before
+/// any translation: a translated shader keeps the limit it was made with
+/// (a shader cache keys its entries by [`view_heap_limit`]).
+pub fn set_view_heap_limit(views: u32) {
+    VIEW_LIMIT.store(views.clamp(16, HEAP_VIEWS), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The view-heap size translated shaders clamp their indices below.
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
-/// (`emit`, "Buffer views at computed heap indices").
-pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// (`emit`, "Buffer views at computed heap indices"): two below the view
+/// limit, whose last slot stays null.
+pub fn null_buffer_view() -> u32 {
+    view_heap_limit() - 2
+}
 /// The view-mark table's register: `t2` (a raw root SRV) in
 /// [`MEMORY_SPACE`] (`emit`, "Write marks").
 pub const VIEW_MARKS: u32 = 2;
@@ -541,7 +563,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { view_heap_limit() } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));

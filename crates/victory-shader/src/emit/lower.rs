@@ -4605,14 +4605,12 @@ impl<'a> Lower<'a> {
         ) {
             return Err("a descriptor read only as data");
         }
-        let views = self.s.view_addresses_handle();
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;
             let val = if word < 2 {
                 let index = self.heap_index(site, k as u8, false)?;
                 let c = self.cur;
-                let stride = self.s.m.i32(super::VIEW_ADDRESS_BYTES);
-                let at = self.s.m.bin(c, Bin::Mul, index, stride);
+                let (views, at) = self.view_record(index);
                 let four = self.s.m.i32(4);
                 let hi_at = self.s.m.bin(c, Bin::Add, at, four);
                 let hi = self.raw_dword(views, hi_at);
@@ -4629,6 +4627,22 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Resolve a guest slot into the view-address root SRV. Unlike a
+    /// descriptor heap, a raw root SRV does not bounds-check the loads.
+    fn view_record(&mut self, index: V) -> (V, V) {
+        let c = self.cur;
+        let views = self.s.view_addresses_handle();
+        let zero = self.s.m.i32(0);
+        let count = self.raw_dword(views, zero);
+        let valid = self.s.m.cmp(c, pred::IULT, index, count);
+        let prefix = self.s.m.i32(super::VIEW_ADDRESS_PREFIX_RECORDS);
+        let slot = self.s.m.bin(c, Bin::Add, index, prefix);
+        let empty = self.s.m.i32(super::VIEW_ADDRESS_PREFIX_RECORDS - 1);
+        let record = self.s.m.select(c, valid, slot, empty);
+        let stride = self.s.m.i32(super::VIEW_ADDRESS_BYTES);
+        (views, self.s.m.bin(c, Bin::Mul, record, stride))
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -5176,7 +5190,7 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.m.i32(super::view_heap_limit() - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
@@ -5189,7 +5203,7 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = super::null_buffer_view() - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
     }
