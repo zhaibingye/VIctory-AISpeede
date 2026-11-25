@@ -569,12 +569,39 @@ extern "system" fn copy_texture_region(
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
+        let Some(list) = host_list(this) else { return; };
+        if cfg!(feature = "paged-title") {
+            // In subresource form the ABI initializes only the 32-bit
+            // union member, not the rest of the placed-footprint storage.
+            let subresource_zero = |location: *const CopyLocation| {
+                if location.is_null() {
+                    return None;
+                }
+                // SAFETY: the title supplies a readable copy location.
+                unsafe {
+                    ((*location).kind == 0
+                        && (&raw const (*location).footprint).cast::<u32>().read() == 0)
+                        .then(|| (*location).resource)
+                }
+            };
+            if z != 0 {
+                list.mark_unlowered();
+                return;
+            }
+            // SAFETY: the ABI supplies either a readable six-field box or null.
+            let bounds = unsafe { source_box.as_ref() }.copied();
+            if let Some(copy) = subresource_zero(src).and_then(crate::resource::host_copy)
+                .zip(subresource_zero(dst).and_then(crate::resource::host_copy))
+                .and_then(|(from, to)| crate::page_resource::TextureCopy::capture_region(from, to, x, y, bounds))
+            {
+                list.record_page_texture_copy(copy);
+            } else {
+                list.mark_unlowered();
+            }
+            return;
+        }
         // SAFETY: the title passes both locations (null is tolerated).
-        let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe {
-                src.as_ref()
-            })
-        else {
+        let (Some(&dst), Some(&src)) = (unsafe { dst.as_ref() }, unsafe { src.as_ref() }) else {
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
@@ -680,6 +707,13 @@ extern "system" fn copy_texture_region_x(
     source_box: *const [u32; 6],
     _flags: u32,
 ) {
+    #[cfg(windows)]
+    if cfg!(feature = "paged-title") && _flags != 0 {
+        if let Some(list) = host_list(this) {
+            list.mark_unlowered();
+        }
+        return;
+    }
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
