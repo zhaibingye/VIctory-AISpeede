@@ -484,6 +484,104 @@ impl Structured {
     }
 }
 
+/// Native branch operand and whether the taken edge tests it for nonzero.
+pub(crate) fn wave_branch(inst: &Inst) -> Option<(Value, bool)> {
+    let (reg, nonzero) = match inst.name() {
+        "s_cbranch_execz" => (Reg::S(EXEC), false),
+        "s_cbranch_execnz" => (Reg::S(EXEC), true),
+        "s_cbranch_vccz" => (Reg::S(VCC), false),
+        "s_cbranch_vccnz" => (Reg::S(VCC), true),
+        "s_cbranch_scc0" => (Reg::Scc, false),
+        "s_cbranch_scc1" => (Reg::Scc, true),
+        _ => return None,
+    };
+    Some((inst.read(reg)?, nonzero))
+}
+
+/// All host lanes take the native scalar edge. Vector writes and memory
+/// effects still use their own EXEC bit. The symbolic branch conditions
+/// here identify unreachable incoming words during phi finalisation.
+pub(crate) fn wave32(program: &Program) -> Result<Structured, ShaderError> {
+    for block in &program.blocks {
+        if matches!(block.exit, Exit::Branch { .. })
+            && block.insts.last().and_then(wave_branch).is_none()
+        {
+            return Err(ShaderError::Unsupported {
+                offset: block.offset,
+                what: "an unsupported wave branch",
+            });
+        }
+    }
+    let mut lanes = Lanes::new(program)?;
+    lanes.whole_wave = true;
+    lanes.kills.clear();
+    lanes.masks_in_order();
+    let reach = lanes.paths()?;
+    let initial = program
+        .inputs
+        .iter()
+        .find(|r| r.0 == Reg::S(EXEC))
+        .map(|r| r.1);
+    let mut guards = Vec::with_capacity(program.blocks.len());
+    let mut exits = Vec::with_capacity(program.blocks.len());
+    let mut other = HashMap::new();
+    for (b, block) in program.blocks.iter().enumerate() {
+        let exit = match block.exit {
+            Exit::End => LaneExit::End,
+            Exit::Indirect => LaneExit::Indirect,
+            Exit::Jump(t) => LaneExit::Jump(t),
+            Exit::Branch { taken, not_taken } => {
+                let when = lanes.when[b].unwrap_or(Bool::FALSE);
+                LaneExit::Branch {
+                    when: lanes.b.given(when, reach[b]),
+                    taken,
+                    not_taken,
+                }
+            }
+        };
+        exits.push(exit);
+        let mut row = Vec::with_capacity(block.insts.len());
+        for inst in &block.insts {
+            let scalar = matches!(
+                inst.fields,
+                Fields::Sop { .. } | Fields::Smem { .. } | Fields::Sopp { .. }
+            ) || matches!(
+                inst.name(),
+                "v_readlane_b32" | "v_readfirstlane_b32" | "v_writelane_b32"
+            );
+            row.push(
+                inst.read(Reg::S(EXEC))
+                    .filter(|&v| !scalar && Some(v) != initial)
+                    .map(|v| lanes.b.atom(Atom::Opaque(v), lanes.index[b])),
+            );
+            if let Fields::Valu(f) = &inst.fields
+                && (inst.name() == "v_cndmask_b32" || inst.name().contains("_ci_"))
+                && let Some(&Operand::Scalar { code, .. }) = f.src.get(2)
+                && let Some(word) = inst.read(Reg::S(code))
+            {
+                other.insert(word, lanes.b.atom(Atom::Opaque(word), lanes.born(word)));
+            }
+        }
+        guards.push(row);
+    }
+    if lanes.b.overflow {
+        return Err(TOO_LARGE);
+    }
+    Ok(Structured {
+        bools: lanes.b,
+        exits,
+        guards,
+        reach,
+        masks: HashMap::new(),
+        other,
+        paired_masks: Map::default(),
+        highs: HashMap::new(),
+        active: HashSet::new(),
+        restored: HashMap::new(),
+        discards: HashMap::new(),
+    })
+}
+
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     structure_as(program, true)
@@ -520,6 +618,9 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    whole_wave: bool,
+    /// The wave-wide nonzero test for each distinct per-lane mask function.
+    nonzero: Map<Bool, Bool>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -601,6 +702,8 @@ impl<'a> Lanes<'a> {
         }
         let mut l = Lanes {
             p,
+            whole_wave: false,
+            nonzero: Map::default(),
             order,
             index,
             incoming,
@@ -1007,7 +1110,7 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        if !self.whole_wave && !self.unresolved.contains(&id) {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
@@ -1323,8 +1426,67 @@ impl<'a> Lanes<'a> {
         false
     }
 
+    /// Two identical mask expressions have the same wave-wide zero test.
+    /// Equality of words is the negation of a nonzero XOR. A mixed mask
+    /// and its complement can both be nonzero in the same wave.
+    fn wave_condition(&mut self, inst: &Inst) -> Option<Bool> {
+        let (word, positive) = wave_branch(inst)?;
+        let scalar = inst.read(Reg::Scc) == Some(word);
+        let mut mask = if scalar {
+            self.scc_lane.get(&word).copied()
+        } else {
+            Some(self.mask((word, word)).0)
+        };
+        let equality = scalar
+            && mask.is_some()
+            && self
+                .defs
+                .get(&word)
+                .is_some_and(|&(b, i)| self.p.blocks[b].insts[i].name() == "s_cmp_eq_u32");
+        if equality {
+            mask = mask.map(|m| self.b.not(m));
+        }
+        let born = self.born(word);
+        let test = match mask {
+            None => self.b.atom(Atom::Uniform(word), born),
+            Some(m) if m == Bool::TRUE || m == Bool::FALSE => m,
+            Some(m)
+                if self
+                    .b
+                    .support(m)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_))) =>
+            {
+                m
+            }
+            Some(m) => match self.nonzero.get(&m) {
+                Some(&previous) => previous,
+                None => {
+                    let predicate = self.b.atom(Atom::Uniform(word), born);
+                    let nonzero = if equality {
+                        self.b.not(predicate)
+                    } else {
+                        predicate
+                    };
+                    self.nonzero.insert(m, nonzero);
+                    nonzero
+                }
+            },
+        };
+        Some(if positive != equality {
+            test
+        } else {
+            self.b.not(test)
+        })
+    }
+
     /// The per-lane condition under which a block's closing branch is taken.
     fn branch(&mut self, inst: &Inst) -> Bool {
+        if self.whole_wave {
+            return self
+                .wave_condition(inst)
+                .expect("conditional scalar branch");
+        }
         let exec = self.exec(inst);
         match inst.name() {
             "s_cbranch_execz" => self.b.not(exec),

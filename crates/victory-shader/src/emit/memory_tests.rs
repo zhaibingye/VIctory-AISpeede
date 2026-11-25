@@ -104,6 +104,14 @@ fn program() -> HostShader {
     w.extend(global(12, 9, 1, 0, 6, 0x24)); // global_load_dword v9, v1, s[6:7]
     w.push(S_WAITCNT_ALL);
     w.extend(buffer_store_dword(9, 8, 20));
+    // Slot 2 holds only a native descriptor base. Neither dword is a
+    // buffer pointer when the guest reads this descriptor only as data.
+    w.extend(s_load(1, 28, 4, 0x40));
+    w.push(S_WAITCNT_ALL);
+    w.push(v_mov_b32(5, 28));
+    w.push(v_mov_b32(7, 29));
+    w.extend(buffer_store_dword(5, 8, 24));
+    w.extend(buffer_store_dword(7, 8, 28));
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -244,6 +252,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     // Heap index 1 (the memory's view) has the title address.
     let mut view_addresses = vec![0u32; 2 * 5];
     view_addresses[2..4].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
+    view_addresses[4..6].copy_from_slice(&[0xFEDC_BA98, super::VIEW_BASE_ONLY]);
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -275,7 +284,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
-                            View::RawUav(6),
+                            View::RawUav(8),
                             View::Memory(&memory),
                             View::Pair,
                             View::NullPair,
@@ -288,7 +297,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(
                 out[0],
-                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333],
+                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, 0, 0],
                 "{label}: reads"
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");

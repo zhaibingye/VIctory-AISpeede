@@ -359,11 +359,23 @@ fn run(
         },
         View::RawUav(groups as u32 * 64 * 4),
     ];
+    let mut roots = vec![(0, Root::Constants(ud))];
+    if shader.view_addresses {
+        // The first slot has a buffer address. The second has only a native
+        // base word. An SGPR reading word zero sees both at the same stride.
+        roots.push((
+            1,
+            Root::View {
+                srv: true,
+                data: vec![0x1234_5600, 12, 0x89AB_CD00, super::VIEW_BASE_ONLY],
+            },
+        ));
+    }
     let out = host.dispatch(
         &root,
         &pso,
         &Dispatch {
-            roots: vec![(0, Root::Constants(ud))],
+            roots,
             views: &views,
             samplers: &[],
             groups: [groups as u32, 1, 1],
@@ -381,6 +393,349 @@ fn run(
             }
         })
         .collect())
+}
+
+fn check_wave32(
+    name: &str,
+    body: &[u32],
+    inputs: &[[u32; 4]],
+    expected: impl Fn(usize) -> [u32; 4],
+) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let shader =
+        lower_program(&program(body, false)).unwrap_or_else(|e| panic!("lower {name}: {e}"));
+    if let Ok(mut val) = validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        val.validate(&mut shader.dxil.clone())
+            .expect("validate the shader's DXIL");
+        eprintln!("{name} DXIL validated");
+    }
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device for {name}");
+        return;
+    };
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the feature query writes the matching options structure.
+    let support = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        )
+    };
+    if support.is_err()
+        || !waves.WaveOps.as_bool()
+        || !(waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&32)
+    {
+        eprintln!("Wave32 unavailable for the loop test");
+        return;
+    }
+
+    let out = run(&host, &shader, inputs, false).expect("dispatch the shader");
+    assert_eq!(out.len(), inputs.len());
+    for (t, actual) in out.into_iter().enumerate() {
+        assert_eq!(actual, expected(t), "thread {t}");
+    }
+    eprintln!("{name} readback matched on {} threads", inputs.len());
+}
+
+/// A single loop entry supplies a Wave32 mask, and the latch replaces it
+/// with integer data. Each iteration reads the dword and the lane's bit.
+/// A wave-uniform branch then joins a masked dword with an integer.
+#[test]
+fn wave32_mask_data_at_loop_entry() {
+    let mut body = Vec::from(vop3(0x0C5, 22, [int(0), v(1), 0], NONE)); // s22 = v1 != 0
+    body.extend([
+        sop1(0x03, 20, s(22)),  // s_mov_b32 s20, s22
+        sop1(0x03, 24, int(0)), // s_mov_b32 s24, 0
+        // The loop starts here. Save the previous and current values.
+        sop1(0x03, 22, s(20)), // s_mov_b32 s22, s20
+        vop1(0x01, 5, v(6)),   // v_mov_b32 v5, v6
+        vop1(0x01, 6, s(22)),  // v_mov_b32 v6, s22
+        vop1(0x01, 7, v(8)),   // v_mov_b32 v7, v8
+    ]);
+    body.extend(vop3(0x101, 8, [int(0), int(1), s(20)], NONE)); // v_cndmask_b32 v8, 0, 1, s20
+    body.extend([
+        0xB014_5319,                   // s_movk_i32 s20, 0x5319
+        sop2(0x00, 24, s(24), int(1)), // s_add_u32 s24, s24, 1
+        sopc(0x0A, s(24), int(2)),     // s_cmp_lt_u32 s24, 2
+        0xBF85_FFF6,                   // s_cbranch_scc1 -10
+        // After the loop, one wave takes each arm of a numeric join.
+        vop1(0x02, 26, v(2)),           // v_readfirstlane_b32 s26, v2
+        sopc(0x06, s(26), int(0)),      // s_cmp_eq_u32 s26, 0
+        0xBF85_0002,                    // s_cbranch_scc1 2
+        sop2(0x0E, 28, s(22), int(63)), // s_and_b32 s28, s22, 63
+        0xBF82_0001,                    // s_branch 1
+        sop1(0x03, 28, int(42)),        // s_mov_b32 s28, 42
+        vop1(0x01, 9, s(28)),           // v_mov_b32 v9, s28
+    ]);
+    body.extend(vop3(0x346, 8, [v(9), int(1), v(8)], NONE)); // pack the dword and bit
+    let masks: [u32; 2] = [0x9123_4321, 0x8321_1234];
+    let inputs: [[u32; 4]; 64] =
+        std::array::from_fn(|t| [(masks[t / 32] >> (t % 32)) & 1, (t / 32) as u32, 0, 0]);
+    check_wave32("Wave32 loop", &body, &inputs, |t| {
+        let lane = t % 32;
+        let first = masks[t / 32];
+        let second = 0x5319;
+        let joined = if t < 32 { 42 } else { second & 63 };
+        [
+            first,
+            second,
+            (first >> lane) & 1,
+            (joined << 1) | ((second >> lane) & 1),
+        ]
+    });
+}
+
+/// A compare mask and a scalar phi supply the lane bits on different
+/// edges of a forward join. The scalar phi selects two computed words.
+#[test]
+fn wave32_forward_mask_join_uses_scalar_input() {
+    let mut body = vec![
+        vop1(0x02, 26, v(2)),          // v_readfirstlane_b32 s26, v2
+        vop1(0x02, 27, v(3)),          // v_readfirstlane_b32 s27, v3
+        sopc(0x06, s(26), int(0)),     // s_cmp_eq_u32 s26, 0
+        0xBF85_0007,                   // s_cbranch_scc1 compare
+        sopc(0x06, s(26), int(1)),     // s_cmp_eq_u32 s26, 1
+        0xBF85_0002,                   // s_cbranch_scc1 add_one
+        sop2(0x00, 20, s(27), int(2)), // s_add_u32 s20, s27, 2
+        0xBF82_0001,                   // s_branch scalar_join
+        sop2(0x00, 20, s(27), int(1)), // add_one: s_add_u32 s20, s27, 1
+        vop1(0x01, 7, s(20)),          // scalar_join: v_mov_b32 v7, s20
+        0xBF82_0003,                   // s_branch mask_join
+    ];
+    body.extend(vop3(0x0C5, 20, [int(0), v(1), 0], NONE)); // compare: s20 = v1 != 0
+    body.push(vop1(0x01, 7, int(0)));
+    body.extend(vop3(0x101, 5, [int(0), int(1), s(20)], NONE)); // mask_join: this lane's bit
+    body.extend(vop3(0x365, 6, [193, int(0), 0], NONE)); // v_mbcnt_lo_u32_b32 v6, -1, 0
+
+    let compare_mask: u32 = 0x8AA5_1243;
+    let seeds = [0, 0xA622_B270, 0xF123_4500, 0x62AA_1230];
+    let inputs: [[u32; 4]; 128] = std::array::from_fn(|t| {
+        [
+            (compare_mask >> (t % 32)) & 1,
+            (t / 32) as u32,
+            seeds[t / 32],
+            0,
+        ]
+    });
+    check_wave32("Wave32 forward mask join", &body, &inputs, |t| {
+        let wave = t / 32;
+        let lane = (t % 32) as u32;
+        let value = seeds[wave] + if wave == 1 { 1 } else { 2 };
+        let (mask, word) = if wave == 0 {
+            (compare_mask, 0)
+        } else {
+            (value, value)
+        };
+        [(mask >> lane) & 1, lane, word, 0]
+    });
+}
+
+/// One incoming scalar word passes through an earlier join. A branch
+/// guarantees that the descriptor word on its other edge is never read.
+#[test]
+fn wave32_mask_join_reads_only_the_live_scalar_word() {
+    let mut body = vec![
+        vop1(0x02, 26, v(2)),          // v_readfirstlane_b32 s26, v2
+        vop1(0x02, 27, v(3)),          // v_readfirstlane_b32 s27, v3
+        sopc(0x06, s(26), int(0)),     // s_cmp_eq_u32 s26, 0
+        0xBF85_0003,                   // s_cbranch_scc1 descriptor
+        sop2(0x00, 20, s(27), int(1)), // s_add_u32 s20, s27, 1
+        sop1(0x03, 22, int(1)),        // s_mov_b32 s22, 1
+        0xBF82_0002,                   // s_branch test_valid
+        sop1(0x03, 20, s(8)),          // descriptor: s_mov_b32 s20, s8
+        sop1(0x03, 22, int(0)),        // s_mov_b32 s22, 0
+        sopc(0x06, s(22), int(0)),     // test_valid: s_cmp_eq_u32 s22, 0
+        0xBF85_0002,                   // s_cbranch_scc1 compare
+        vop1(0x01, 7, int(1)),         // v_mov_b32 v7, 1
+        0xBF82_0003,                   // s_branch mask_join
+    ];
+    body.extend(vop3(0x0C5, 20, [int(0), v(1), 0], NONE)); // compare: s20 = v1 != 0
+    body.push(vop1(0x01, 7, int(0)));
+    body.extend(vop3(0x101, 5, [int(0), int(1), s(20)], NONE)); // mask_join: this lane's bit
+    body.extend(vop3(0x365, 6, [193, int(0), 0], NONE)); // v_mbcnt_lo_u32_b32 v6, -1, 0
+
+    let compare_mask: u32 = 0x8421_35A7;
+    let scalar_seed = 0x9122_53E0;
+    let inputs: [[u32; 4]; 64] = std::array::from_fn(|t| {
+        [
+            (compare_mask >> (t % 32)) & 1,
+            (t / 32) as u32,
+            scalar_seed,
+            0,
+        ]
+    });
+    check_wave32("Wave32 live scalar join", &body, &inputs, |t| {
+        let lane = (t % 32) as u32;
+        let (mask, branch) = if t < 32 {
+            (compare_mask, 0)
+        } else {
+            (scalar_seed + 1, 1)
+        };
+        [(mask >> lane) & 1, lane, branch, 0]
+    });
+}
+
+/// Both EXEC arms can run in one wave. Scalar writes take effect in program
+/// order, including the unconditional write following an empty EXEC update.
+#[test]
+fn wave32_scalar_write_order_across_exec_branches() {
+    let mut body = Vec::from(vop3(0x0C5, 20, [int(0), v(1), 0], NONE));
+    body.extend(vop3(0x0C5, 30, [int(0), v(2), 0], NONE));
+    body.extend([
+        sop1(0x3C, 24, s(30)),         // save EXEC, then keep the selected lanes
+        0xBF88_0002,                   // skip the first arm if EXEC is empty
+        0xB014_0531,                   // s_movk_i32 s20, 0x0531
+        vop1(0x01, 7, s(20)),          // keep the first arm's per-lane write
+        sop2(0x14, 126, s(24), s(30)), // EXEC = saved & ~selected
+        sop1(0x03, 29, int(37)),       // runs even if the second arm is empty
+        0xBF88_0001,
+        0xB014_7528,            // s_movk_i32 s20, 0x7528
+        sop1(0x03, 126, s(24)), // restore EXEC
+        vop1(0x01, 5, s(20)),
+        vop1(0x01, 8, s(29)),
+    ]);
+    body.extend(vop3(0x101, 6, [int(0), int(1), s(20)], NONE));
+    let selected = [0u32, u32::MAX, 0x8000_0001, 0xAAAA_5555];
+    let inputs: [[u32; 4]; 128] = std::array::from_fn(|t| {
+        [
+            u32::from(t % 3 == 0),
+            (selected[t / 32] >> (t % 32)) & 1,
+            0,
+            0,
+        ]
+    });
+    check_wave32("Wave32 scalar write order", &body, &inputs, |t| {
+        let mask = selected[t / 32];
+        let lane = t % 32;
+        let last = if mask == u32::MAX { 0x0531 } else { 0x7528 };
+        let first = if mask >> lane & 1 != 0 { 0x0531 } else { 0 };
+        [last, last >> lane & 1, first, 37]
+    });
+}
+
+/// A word taken under a narrowed EXEC still contains bits outside that
+/// subset. If EXEC is empty the branch skips the scalar complement entirely.
+#[test]
+fn wave32_complete_mask_after_a_conditional_complement() {
+    let mut body = Vec::from(vop3(0x0C5, 20, [int(0), v(1), 0], NONE));
+    body.extend(vop3(0x0C5, 30, [int(0), v(2), 0], NONE));
+    body.extend([
+        sop1(0x3C, 24, s(30)),
+        0xBF88_0002,
+        sop1(0x07, 20, s(20)), // s_not_b32 s20, s20
+        vop1(0x01, 7, s(20)),  // observed inside the narrowed EXEC
+        sop1(0x03, 126, s(24)),
+        vop1(0x01, 5, s(20)), // all lanes read the same word
+    ]);
+    body.extend(vop3(0x101, 6, [int(0), int(1), s(20)], NONE));
+    let original = [0x9142_2881u32, 0x5A11_44A2, 0x8080_1010, 0x8081_1200];
+    let selected = [0u32, u32::MAX, 1 << 31, 0x5555_AAAA];
+    let inputs: [[u32; 4]; 128] = std::array::from_fn(|t| {
+        let (w, l) = (t / 32, t % 32);
+        [original[w] >> l & 1, selected[w] >> l & 1, 0, 0]
+    });
+    check_wave32("Wave32 conditional complement", &body, &inputs, |t| {
+        let (w, l) = (t / 32, t % 32);
+        let word = if selected[w] == 0 {
+            original[w]
+        } else {
+            !original[w]
+        };
+        let inside = if selected[w] >> l & 1 == 0 { 0 } else { word };
+        [word, word >> l & 1, inside, 0]
+    });
+}
+
+/// A scalar mask survives its native branch. The same dispatch reads
+/// descriptor word zero from two different heap slots.
+#[test]
+fn wave32_descriptor_words_after_a_conditional_mask_write() {
+    let mut body = Vec::from(vop3(0x0C5, 20, [int(0), v(1), 0], NONE));
+    body.extend(vop3(0x0C5, 30, [int(0), v(2), 0], NONE));
+    body.extend([
+        sop1(0x3C, 24, s(30)),
+        0xBF88_0002,
+        sop1(0x07, 20, s(20)),
+        vop1(0x01, 7, s(20)),
+        sop1(0x03, 126, s(24)),
+        vop1(0x01, 5, s(20)),
+        vop1(0x01, 6, s(8)),
+        vop1(0x01, 8, s(12)),
+    ]);
+    let inputs: [[u32; 4]; 64] =
+        std::array::from_fn(|t| [u32::from(t % 2 == 0), u32::from(t == 63), 0, 0]);
+    check_wave32("Wave32 descriptor words", &body, &inputs, |t| {
+        let word = if t < 32 { 0x5555_5555 } else { 0xAAAA_AAAA };
+        [
+            word,
+            0x1234_5600,
+            if t == 63 { word } else { 0 },
+            0x89AB_CD00,
+        ]
+    });
+}
+
+/// Read the native first active lane (lane zero under empty EXEC), then
+/// permute across the two 16-lane rows with both inactive-source policies.
+#[test]
+fn wave32_lane_reads_use_the_native_exec_word() {
+    let mut body = Vec::from(vop3(0x0C5, 20, [int(0), v(1), 0], NONE));
+    body.extend(vop3(0x0C5, 30, [int(0), v(2), 0], NONE));
+    body.extend([
+        sop1(0x03, 25, 255),
+        0x7654_3210,
+        sop1(0x03, 26, 255),
+        0xFEDC_BA98,
+        sop1(0x3C, 24, s(30)),
+        0xBF88_0001,
+        sop1(0x07, 20, s(20)),
+        vop1(0x02, 21, v(3)),
+    ]);
+    body.extend(vop3(0x378, 7, [v(3), s(25), s(26)], NONE));
+    body.extend(vop3(0x378, 8, [v(3), s(25), s(26)], M { opsel: 2, ..NONE }));
+    body.extend([
+        sop1(0x03, 126, s(24)),
+        vop1(0x01, 5, s(20)),
+        vop1(0x01, 6, s(21)),
+    ]);
+    let selected = [0u32, u32::MAX, 0x8000_8001, 0xAAAA_5555];
+    let inputs: [[u32; 4]; 128] = std::array::from_fn(|t| {
+        [
+            u32::from(t % 2 == 0),
+            selected[t / 32] >> (t % 32) & 1,
+            t as u32 + 100,
+            57,
+        ]
+    });
+    check_wave32("Wave32 lane reads", &body, &inputs, |t| {
+        let mask = selected[t / 32];
+        let lane = t % 32;
+        let first = if mask == 0 {
+            0
+        } else {
+            mask.trailing_zeros() as usize
+        };
+        let on = mask >> lane & 1 != 0;
+        let other = lane ^ 16;
+        let source = if mask >> other & 1 != 0 {
+            Some((t / 32 * 32 + other) as u32 + 100)
+        } else {
+            None
+        };
+        [
+            if mask == 0 { 0x5555_5555 } else { 0xAAAA_AAAA },
+            (t / 32 * 32 + first) as u32 + 100,
+            if on { source.unwrap_or(57) } else { 57 },
+            if on { source.unwrap_or(0) } else { 57 },
+        ]
+    });
 }
 
 // ---- comparing ----
