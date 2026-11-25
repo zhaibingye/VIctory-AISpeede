@@ -209,6 +209,7 @@ pub(crate) fn record(
         };
         // Own the descriptors for this recording, not a rotating heap that
         // reuses a slot while a title command list can still reference it.
+        // SAFETY: The live host device receives a description for a two-entry shader-visible heap.
         let heap: ID3D12DescriptorHeap = match unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,

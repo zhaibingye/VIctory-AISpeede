@@ -956,6 +956,8 @@ impl Host {
             NumTiles: count,
             ..Default::default()
         };
+        // SAFETY: Map one region: all parameter arrays have one entry, and the caller supplies
+        // the live reserved texture and a backing heap sized for this tile range.
         unsafe {
             self.queue.UpdateTileMappings(
                 texture,

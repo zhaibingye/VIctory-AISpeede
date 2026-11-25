@@ -78,6 +78,7 @@ impl Sparse {
             ..Default::default()
         };
         let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: The heap description is initialized; the COM out slot and texture are live.
         unsafe {
             host.device.CreateHeap(&desc, &mut heap)?;
             let heap = heap.ok_or(windows::core::Error::empty())?;
@@ -104,6 +105,7 @@ impl Sparse {
         static SUPPORTED: OnceLock<bool> = OnceLock::new();
         if !*SUPPORTED.get_or_init(|| {
             let mut opt = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            // SAFETY: The feature ID and byte count match the writable options structure.
             unsafe {
                 host.device
                     .CheckFeatureSupport(
@@ -117,6 +119,7 @@ impl Sparse {
         }) {
             return None;
         }
+        // SAFETY: The one initialized description is borrowed for this allocation query.
         let full_committed_bytes = unsafe {
             host.device
                 .GetResourceAllocationInfo(0, &[desc])
@@ -127,6 +130,7 @@ impl Sparse {
         }
         desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
         let mut texture = None;
+        // SAFETY: The descriptor and writable COM out slot are live; no clear value is supplied.
         unsafe {
             host.device
                 .CreateReservedResource(&desc, state, None, &mut texture)
@@ -137,6 +141,7 @@ impl Sparse {
         let mut packed = D3D12_PACKED_MIP_INFO::default();
         let mut num = u32::from(desc.MipLevels);
         let mut locations = vec![D3D12_SUBRESOURCE_TILING::default(); num as usize];
+        // SAFETY: The texture is live and num is initialized to the capacity of locations.
         unsafe {
             host.device.GetResourceTiling(
                 &texture,
@@ -252,6 +257,7 @@ impl Sparse {
         let result = Self::map(texture, first, count);
         if let Err(e) = result {
             if let Some(host) = crate::host::host()
+                // SAFETY: This only queries the live host device for its removal reason.
                 && unsafe { host.device.GetDeviceRemovedReason() }.is_err()
             {
                 crate::host::fail(format_args!(

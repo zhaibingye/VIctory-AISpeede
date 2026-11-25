@@ -270,6 +270,7 @@ pub(crate) fn copy_formats_match(dst: This, src: This) -> bool {
     // A raw footprint or a texture with a different host format cannot
     // carry the stand-in's eight-byte texels.
     let compatible = host_resource(dst).zip(host_resource(src))
+        // SAFETY: Both resource interfaces are live for these read-only description queries.
         .is_some_and(|(a, b)| unsafe { a.GetDesc().Format == b.GetDesc().Format });
     if !compatible {
         static ONCE: std::sync::Once = std::sync::Once::new();

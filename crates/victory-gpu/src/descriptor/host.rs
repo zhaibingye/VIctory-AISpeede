@@ -1265,6 +1265,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 if let Some(sparse) = &copy.sparse {
                     let srv = desc.as_mut()?;
+                    // SAFETY: The COM resource is live for the duration of this description query.
                     let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
                     crate::sparse::resident_srv(sparse, texture, srv, mips)?;
                 }

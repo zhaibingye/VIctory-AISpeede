@@ -477,8 +477,8 @@ impl Heap {
         self.index(first.checked_add(u64::from(count - 1) * 32)?)?;
         let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
         Some((0..count).map(|i| {
-            // SAFETY: the entire interval is inside the bound title heap.
             let at = first + u64::from(i) * 32;
+            // SAFETY: The entire interval is inside the bound title heap; the record may be unaligned.
             let [tag, index, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
             if tag == VIEW_TAG && generation != 0
                 && views.list.get(index as usize).is_some_and(|v| v.1 == generation)
