@@ -16,7 +16,6 @@ use crate::descriptor::{TableRecords, View, table_view};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
 use crate::host::HostList;
@@ -51,21 +50,7 @@ fn fresh_tables_share_by_view_generation_length_and_heap() {
     assert!(!tables.contains_key(&43));
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct VertexView {
-    address: u64,
-    size: u32,
-    stride: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct IndexView {
-    address: u64,
-    size: u32,
-    format: u32,
-}
+pub(crate) use crate::page_view::{IndexView, VertexView};
 
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
@@ -473,11 +458,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
-            *view = D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size,
-                StrideInBytes: v.stride,
-            };
+            *view = v.native(shadow.gpu(v.address));
         }
         // SAFETY: an open list; the views name live host buffers.
         unsafe {
@@ -492,11 +473,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
-            let view = D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size,
-                Format: DXGI_FORMAT(v.format as i32),
-            };
+            let view = v.native(shadow.gpu(v.address));
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }

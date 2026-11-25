@@ -609,3 +609,59 @@ fn paged_title_recording_rejects_mixed_lists_before_alias_copy() {
     assert_eq!(stats, PageStats { uploaded: 1, downloaded: 1 });
     assert_eq!(&section.lock().unwrap()[..6], &[20, 30, 20, 30, 40, 50]);
 }
+
+#[cfg(test)]
+#[test]
+fn paged_input_views_gather_cross_page_gpu_writes() {
+    use crate::page_view::{IndexView, InputView, VertexView};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT;
+    use victory_memory::physical::PageNumbers;
+    const PAGE: usize = PAGE_BYTES as usize;
+    const VA: usize = PAGE;
+    let host = crate::host::host().expect("D3D12 renderer host (CI selects WARP)");
+    let heap = crate::memory::heap().unwrap();
+    let id = PageNumbers::default().allocate(5).unwrap().offset(4);
+    let (mut backing, section) = crate::title_backing::test_capture(id, &[VA, VA + PAGE]);
+    {
+        let mut data = section.lock().unwrap();
+        data[..4].copy_from_slice(&[1, 2, 3, 4]);
+        data[PAGE - 2..].copy_from_slice(&[8, 9]);
+    }
+    let (out, ptr) = host.shared_buffer(8).unwrap();
+    let copy = GuestCopy::new(VA + PAGE, VA + 2, 2).unwrap();
+    let vertex = VertexView { address: (VA + PAGE - 2) as u64, size: 4, stride: 4 };
+    let view = InputView::Vertex(vertex);
+    let index = IndexView {
+        address: vertex.address,
+        size: vertex.size,
+        format: DXGI_FORMAT_R16_UINT.0 as u32,
+    };
+    let indexed = InputView::Index(index);
+    assert_eq!(view.range().unwrap(), indexed.range().unwrap());
+    let [src, dst] = copy.ranges();
+    let ranges = [src, dst, view.range().unwrap()];
+    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins| {
+        let scratch = host.default_buffer(copy.len as u64).unwrap();
+        list.keep(&scratch);
+        let mut dirty = BTreeSet::new();
+        record_copy(list, batch, &scratch, &copy.bind(pins).unwrap(), &mut dirty)
+            .map_err(BatchError::Native)?;
+        let gathered = view.gather(host, list, batch)?;
+        let indexed = indexed.gather(host, list, batch)?;
+        list.keep(&out);
+        // SAFETY: the view is in a read-compatible state and the live
+        // test output promotes to COPY_DEST.
+        unsafe {
+            let native = vertex.native(gathered.GetGPUVirtualAddress());
+            list.recording().IASetVertexBuffers(0, Some(&[native]));
+            list.recording().CopyBufferRegion(&out, 0, &gathered, 0, 4);
+            let native = index.native(indexed.GetGPUVirtualAddress());
+            list.recording().IASetIndexBuffer(Some(&native));
+            list.recording().CopyBufferRegion(&out, 4, &indexed, 0, 4);
+        }
+        Ok(dirty)
+    }).unwrap();
+    assert_eq!(stats, PageStats { uploaded: 1, downloaded: 1 });
+    // SAFETY: the output owns the map and the real queue fence completed.
+    assert_eq!(unsafe { std::slice::from_raw_parts(ptr, 8) }, &[8, 9, 3, 4, 8, 9, 3, 4]);
+}

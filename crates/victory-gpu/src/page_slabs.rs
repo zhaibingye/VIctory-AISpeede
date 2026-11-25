@@ -351,6 +351,10 @@ impl PinnedBatch {
         self.pages.iter().map(|(&id, (va, pin))| (id, *va, pin))
     }
 
+    pub(crate) fn pinned_at(&self, va: u64) -> Option<&PinnedPage> {
+        self.pinned(*self.aliases.get(&(va & !(PAGE_BYTES - 1)))?)
+    }
+
     pub(crate) fn pinned(&self, page: PhysicalPage) -> Option<&PinnedPage> {
         self.pages.get(&page).map(|(_, pin)| pin)
     }

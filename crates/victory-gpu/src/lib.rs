@@ -48,6 +48,9 @@ mod page_queue;
 #[cfg(windows)]
 #[allow(dead_code, reason = "wired into title submissions together with direct/texture coherence at cutover")]
 mod page_slabs;
+#[cfg(windows)]
+#[allow(dead_code, reason = "physical input views are enabled at unified renderer cutover")]
+mod page_view;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

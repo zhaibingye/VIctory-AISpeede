@@ -58,6 +58,7 @@ jobs:
       - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_buffer_copy_gathers_overlapping_physical_aliases
       - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_buffer_copy_batch_orders_alias_dependencies_and_rejects_partial_work
       - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_title_recording_rejects_mixed_lists_before_alias_copy
+      - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_input_views_gather_cross_page_gpu_writes
   shader-pages:
     runs-on: windows-latest
     timeout-minutes: 25
