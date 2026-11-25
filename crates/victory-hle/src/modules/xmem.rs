@@ -31,6 +31,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
+use victory_memory::physical::{Aliases, PageNumbers, PhysicalPage, RamPool, RamReservation};
 
 const MIB: usize = 1 << 20;
 
@@ -366,9 +367,13 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 // is a pagefile-backed section, its pages are 64 KiB slices of it, and a
 // mapping is a view of consecutive slices in place of a host placeholder.
 
-const PAGE: usize = 64 << 10;
+const PAGE: usize = victory_memory::PAGE_BYTES as usize;
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    first: PhysicalPage,
+    _reservation: RamReservation,
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -378,7 +383,9 @@ unsafe impl Sync for Section {}
 impl Drop for Section {
     fn drop(&mut self) {
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        if unsafe { CloseHandle(self.handle) } == 0 {
+            tracing::error!(error = %std::io::Error::last_os_error(), "physical section close failed");
+        }
     }
 }
 
@@ -392,20 +399,17 @@ struct Slice {
 
 #[derive(Default)]
 struct Physical {
-    next_page: usize,
+    numbers: PageNumbers,
+    ram: RamPool,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
-    /// Where each slice (section, page index) is mapped: the addresses of
-    /// its page in every view showing it (the GPU side's change tracking
-    /// follows writes through one view to the others, `aliases`).
-    shown: HashMap<(usize, usize), Vec<usize>>,
+    shown: Aliases,
 }
 
 impl Slice {
-    /// The key of page `k` of the slices from this one on in `shown`.
-    fn key(&self, k: usize) -> (usize, usize) {
-        (Arc::as_ptr(&self.section) as usize, self.index + k)
+    fn page(&self, offset: usize) -> PhysicalPage {
+        self.section.first.offset(self.index + offset)
     }
 }
 
@@ -414,36 +418,46 @@ impl Slice {
 /// as (page address, other address). The GPU side's change tracking
 /// (`victory_gpu::watch`) marks writes there too.
 pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
+    if len == 0 {
+        return;
+    }
     let physical = physical();
     let end = at.saturating_add(len);
+    if at >= end {
+        return;
+    }
     let first = physical
         .views
         .range(..=at)
         .next_back()
         .filter(|(base, (size, _))| *base + size > at)
         .map(|(base, _)| *base);
-    let starts = first.into_iter().chain(physical.views.range(at.saturating_add(1)..end).map(|(b, _)| *b));
-    for base in starts.collect::<Vec<_>>() {
+    use std::ops::Bound::Excluded;
+    let starts = first.into_iter().chain(
+        physical.views.range((Excluded(at), Excluded(end))).map(|(&base, _)| base),
+    );
+    for base in starts {
         let (size, slice) = &physical.views[&base];
         let (from, to) = (at.max(base), end.min(base + size));
         for page in (from / PAGE..to.div_ceil(PAGE)).map(|p| p * PAGE) {
             let k = (page - base) / PAGE;
-            if let Some(addresses) = physical.shown.get(&slice.key(k)) {
-                out.extend(addresses.iter().filter(|&&a| a != page).map(|&a| (page, a)));
-            }
+            out.extend(
+                physical.shown.addresses(slice.page(k)).iter()
+                    .copied()
+                    .filter(|&address| address != page)
+                    .map(|address| (page, address)),
+            );
         }
     }
 }
 
-/// The addresses of title views showing `pages` (page numbers): writes into
-/// them through our own views must be reported there.
-fn shown_at(pages: &[usize]) -> Vec<usize> {
+/// The addresses of title views showing these physical slices: workers can
+/// still report aliases after the original page handles have been released.
+fn shown_at(runs: &[(Slice, usize)]) -> Vec<usize> {
     let physical = physical();
-    pages
-        .iter()
-        .filter_map(|p| physical.pages.get(p))
-        .filter_map(|slice| physical.shown.get(&slice.key(0)))
-        .flatten()
+    runs.iter()
+        .flat_map(|(slice, n)| (0..*n).map(move |k| slice.page(k)))
+        .flat_map(|id| physical.shown.addresses(id))
         .copied()
         .collect()
 }
@@ -456,13 +470,7 @@ fn report_written(shown: &[usize]) {
     }
 }
 
-static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
-    Mutex::new(Physical {
-        // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
-        ..Default::default()
-    })
-});
+static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| Mutex::new(Physical::default()));
 
 fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
@@ -481,6 +489,16 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let n = unsafe { *count };
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
+    };
+    let ram = physical().ram.clone();
+    let reservation = match ram.reserve(size as u64) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            tracing::warn!(n, reserved = ram.used(), shortfall = error.shortfall, "XMem physical backing budget exhausted");
+            // SAFETY: checked non-null; this ABI reports no pages on failure.
+            unsafe { count.write(0) };
+            return 0;
+        }
     };
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
@@ -512,27 +530,32 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
+    let Some(first) = physical.numbers.allocate(n) else {
+        // SAFETY: fresh owned section with no views, and a non-null count.
+        unsafe {
+            CloseHandle(handle);
+            count.write(0);
+        }
+        tracing::warn!(n, "XMem physical page IDs exhausted");
+        return 0;
+    };
+    let section = Arc::new(Section {
+        handle,
+        first,
+        _reservation: reservation,
+    });
     for index in 0..n {
-        let slice = Slice {
+        let number = first.offset(index).number();
+        physical.pages.insert(number, Slice {
             section: section.clone(),
             index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
+        });
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(number) };
     }
     1
 }
-
-/// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
-/// 16: Grand Theft Auto VI keeps them as 21-bit `number >> 4` and rebuilds
-/// them with `<< 4` (128 GiB of pages at most).
-const FRAMES: usize = PAGE >> 12;
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
@@ -552,6 +575,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 struct View {
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    section: Option<Arc<Section>>,
 }
 
 impl View {
@@ -562,7 +586,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -572,7 +596,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
+        let view = View { at, len, section: Some(slice.section.clone()) };
         commit(at.Value as usize, len).then_some(view)
     }
 
@@ -588,7 +612,11 @@ impl Drop for View {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
         // SAFETY: our view.
-        unsafe { UnmapViewOfFile(self.at) };
+        if unsafe { UnmapViewOfFile(self.at) } == 0 {
+            // Keep its section and budget charge if the OS kept our view.
+            tracing::error!(error = %std::io::Error::last_os_error(), "physical worker view unmap failed");
+            std::mem::forget(self.section.take());
+        }
     }
 }
 
@@ -626,7 +654,6 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
-    let shown = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -636,7 +663,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
-    report_written(&shown);
+    report_written(&shown_at(&runs));
     true
 }
 
@@ -647,13 +674,13 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
-    /// Title views showing the pages, told when the window is done.
-    shown: Vec<usize>,
+    /// Stable backing identity, even if the title releases its page numbers.
+    run: (Slice, usize),
 }
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
-        report_written(&self.shown);
+        report_written(&shown_at(std::slice::from_ref(&self.run)));
     }
 }
 
@@ -678,7 +705,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
-        shown: shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[])),
+        run: (slice.clone(), *n),
     })
 }
 
@@ -690,8 +717,16 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    if n != 0 && (base == 0 || !base.is_multiple_of(PAGE)) {
+        return std::ptr::null_mut();
+    }
     let mut physical = physical();
-    unmap(&mut physical, base, n * PAGE);
+    let Some(len) = n.checked_mul(PAGE).filter(|&len| base.checked_add(len).is_some()) else {
+        return std::ptr::null_mut();
+    };
+    if !unmap(&mut physical, base, len) {
+        return std::ptr::null_mut();
+    }
     if pages.is_null() {
         return address;
     }
@@ -758,7 +793,17 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
-    unmap(&mut physical, to, len);
+    if len == 0 {
+        return true;
+    }
+    if to == 0 || ![to, from, len].into_iter().all(|x| x.is_multiple_of(PAGE))
+        || to.checked_add(len).is_none() || from.checked_add(len).is_none()
+    {
+        return false;
+    }
+    if !unmap(&mut physical, to, len) {
+        return false;
+    }
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
@@ -796,7 +841,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -818,16 +863,20 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     if !commit(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+        if unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) } == 0 {
+            tracing::error!(base, len, "failed to roll back an uncommitted physical view");
+            // No usable mapping was published, but the view still holds backing.
+            std::mem::forget(slice);
+        }
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     for k in 0..len / PAGE {
-        let shown = physical.shown.entry(slice.key(k)).or_default();
-        // Pages shown elsewhere already: guarded here too if they are there.
-        victory_gpu::title_memory_aliased(base + k * PAGE, shown);
-        shown.push(base + k * PAGE);
+        let page = slice.page(k);
+        let address = base + k * PAGE;
+        victory_gpu::title_memory_aliased(address, physical.shown.addresses(page));
+        physical.shown.mapped(page, address);
     }
     physical.views.insert(base, (len, slice));
     true
@@ -895,12 +944,12 @@ fn commit_limit_message(
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
-fn unmap(physical: &mut Physical, base: usize, len: usize) {
+fn unmap(physical: &mut Physical, base: usize, len: usize) -> bool {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
     if len == 0 {
-        return;
+        return true;
     }
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
@@ -916,37 +965,34 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
     for at in hit {
-        let Some((size, slice)) = physical.views.remove(&at) else {
-            continue;
-        };
-        for k in 0..size / PAGE {
-            let key = slice.key(k);
-            if let Some(addresses) = physical.shown.get_mut(&key) {
-                addresses.retain(|&a| a != at + k * PAGE);
-                if addresses.is_empty() {
-                    physical.shown.remove(&key);
-                }
-            }
-        }
-        victory_gpu::title_memory_remapped(at, size);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        let size = physical.views[&at].0;
+        // SAFETY: a live view we mapped; the OS must release it before
+        // we retire its identity, aliases, and section lease.
+        let unmapped = unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void },
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
-        if at < base {
-            map(physical, at, base - at, slice.clone());
+        if unmapped == 0 {
+            tracing::warn!(at, size, error = %std::io::Error::last_os_error(), "unmapping physical pages failed");
+            return false;
         }
-        if at + size > end {
-            let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+        let (_, slice) = physical.views.remove(&at).expect("live physical view");
+        for k in 0..size / PAGE {
+            physical.shown.unmapped(slice.page(k), at + k * PAGE);
+        }
+        victory_gpu::title_memory_remapped(at, size);
+        let left = at >= base || map(physical, at, base - at, slice.clone());
+        let right = at + size <= end || map(physical, end, at + size - end, Slice {
+            index: slice.index + (end - at) / PAGE, ..slice
+        });
+        if !left || !right {
+            return false;
         }
     }
+    true
 }
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft
@@ -1265,6 +1311,67 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    #[test]
+    fn physical_backing_survives_page_number_free_until_all_views_close() {
+        let pages = allocate(1);
+        let backing = Arc::downgrade(&physical().pages[&pages[0]].section);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        assert!(map_alias(b as u64, a as u64, PAGE as u64));
+        let mut worker = page_window(&pages, 0, 8).expect("mapped worker view");
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert!(page_window(&pages, 0, 8).is_none());
+
+        worker.bytes().fill(0x6c);
+        drop(worker);
+        // SAFETY: the views remain valid after freeing their page numbers.
+        unsafe {
+            assert_eq!(a.cast::<u8>().read(), 0x6c);
+            assert_eq!(b.cast::<u8>().read(), 0x6c);
+        }
+        let mut others = Vec::new();
+        aliases(a as usize, PAGE, &mut others);
+        assert_eq!(others, [(a as usize, b as usize)]);
+
+        assert!(map_alias(a as u64, 0, PAGE as u64));
+        assert_ne!(backing.strong_count(), 0);
+        assert!(map_alias(b as u64, 0, PAGE as u64));
+        assert_eq!(backing.strong_count(), 0);
+        // SAFETY: each unmapped view is now an owned placeholder.
+        unsafe {
+            assert_ne!(VirtualFree(a, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(b, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn physical_worker_view_keeps_backing_after_handles_are_freed() {
+        let pages = allocate(1);
+        let backing = Arc::downgrade(&physical().pages[&pages[0]].section);
+        let mut worker = page_window(&pages, 0, 1).expect("mapped worker view");
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert_ne!(backing.strong_count(), 0);
+        worker.bytes()[0] = 0x42;
+        drop(worker);
+        assert_eq!(backing.strong_count(), 0);
+    }
+
+    #[test]
+    fn physical_backing_refuses_requests_over_ram_cap() {
+        let mut n = victory_memory::budget::RAM_LIMIT as usize / PAGE + 1;
+        let original = 123usize;
+        let mut pages = vec![original; n];
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 0);
+        assert_eq!(n, 0);
+        assert!(pages.iter().all(|&p| p == original));
     }
 
     #[test]

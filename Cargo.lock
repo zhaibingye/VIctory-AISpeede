@@ -714,6 +714,7 @@ dependencies = [
  "victory-formats",
  "victory-gpu",
  "victory-loader",
+ "victory-memory",
  "victory-pe",
  "windows",
  "windows-core",

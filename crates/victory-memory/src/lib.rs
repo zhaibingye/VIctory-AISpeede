@@ -5,6 +5,7 @@ pub mod budget;
 pub mod coherence;
 pub mod engine;
 pub mod guest;
+pub mod physical;
 pub mod residency;
 
 pub const PAGE_BYTES: u64 = 64 << 10;

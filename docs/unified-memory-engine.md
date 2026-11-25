@@ -68,3 +68,14 @@ Windows 可用 `cargo test -p victory-memory --locked` 运行 WARP 软件设备�
 此夹具独占并同步等待 copy queue，只用于验证迁移语义。不把独立 committed buffer
 当作生产页池，也不把逐次等待带进渲染热路径。下一步将传输接到统一的分块物理后备池、
 主渲染队列与 HLE 映射生命周期，再切换游戏的内存入口。
+
+### XMem 的实际后备接入
+
+`XMemAllocatePhysicalPages` 现在先向 `victory-memory` 的 RAM 池申请整段 section
+容量，再创建 Windows 后备，因为一个剩余视图可能让整个 section 继续存活。标题页号、
+映射和 DirectStorage 的工作视图共用同一份后备；只有最后一个引用释放时才返还容量。
+别名以稳定物理页号识别，不再用宿主指针当身份；OS 确认映射或解除映射后才更新索引。
+
+这是 XMem 物理池的 **10 GiB 容量上限**，不是整个进程工作集：普通虚拟分配、渲染对象、
+驱动以及旧 Shadow Buffer 未纳入本次切换。还需把生产渲染的 GPU 驻留连接到这些页，
+才能统一核算和移除旧副本。
