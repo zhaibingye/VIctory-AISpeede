@@ -16,6 +16,7 @@ use windows::core::{Error, Interface, Result};
 use crate::copy_plan::{GuestCopy, Unbound};
 use crate::descriptor::host::HostHeap;
 use crate::host::{Host, HostList, fail, transition};
+use crate::page_view::InputView;
 use crate::page_slabs::{BatchError, CapturedUploads, PinnedBatch, Transfer, download};
 use crate::title_backing::SubmissionBacking;
 
@@ -29,6 +30,12 @@ pub(crate) struct PageRoots {
 pub(crate) struct PageStats {
     pub(crate) uploaded: usize,
     pub(crate) downloaded: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PageOp {
+    Copy(GuestCopy),
+    Input(InputView),
 }
 
 struct Completion {
@@ -88,19 +95,19 @@ impl Host {
     /// Encoder boundary for a closed queue submission recorded by the
     /// title list handlers. Reject the whole submission before touching
     /// backing if any list still contains operations we cannot lower.
-    pub(crate) fn execute_paged_title_copies(
+    pub(crate) fn execute_paged_title(
         &self,
         heap: &HostHeap,
         backing: &mut SubmissionBacking,
         lists: &[&HostList],
     ) -> std::result::Result<PageStats, BatchError> {
-        let mut copies = Vec::new();
+        let mut ops = Vec::new();
         for (index, list) in lists.iter().enumerate() {
-            if !list.append_closed_copies(&mut copies) {
+            if !list.append_closed_page_ops(&mut ops) {
                 return Err(BatchError::UnloweredList(index));
             }
         }
-        self.execute_paged_copies(heap, backing, &copies)
+        self.execute_paged_ops(heap, backing, &ops)
     }
 
     /// Run a closed sequence of buffer copies against one capture and
@@ -111,33 +118,52 @@ impl Host {
         backing: &mut SubmissionBacking,
         copies: &[GuestCopy],
     ) -> std::result::Result<PageStats, BatchError> {
-        let Some(max_bytes) = copies.iter().map(|copy| copy.len).max() else {
-            return Ok(PageStats {
-                uploaded: 0,
-                downloaded: 0,
-            });
-        };
-        let ranges: Vec<_> = copies.iter().flat_map(|copy| copy.ranges()).collect();
+        let ops: Vec<_> = copies.iter().copied().map(PageOp::Copy).collect();
+        self.execute_paged_ops(heap, backing, &ops)
+    }
+
+    fn execute_paged_ops(
+        &self,
+        heap: &HostHeap,
+        backing: &mut SubmissionBacking,
+        ops: &[PageOp],
+    ) -> std::result::Result<PageStats, BatchError> {
+        if ops.is_empty() {
+            return Ok(PageStats::default());
+        }
+        let mut ranges = Vec::new();
+        let mut max_copy = 0;
+        for &op in ops {
+            match op {
+                PageOp::Copy(copy) => {
+                    ranges.extend(copy.ranges());
+                    max_copy = max_copy.max(copy.len);
+                }
+                PageOp::Input(input) => ranges.push(input.range()?),
+            }
+        }
         self.execute_paged_work(heap, backing, &ranges, |list, _, batch, pins| {
-            let plan = copies
-                .iter()
-                .map(|copy| {
-                    copy.bind(pins).map_err(|miss| match miss {
-                        Unbound::AddressWidth => BatchError::Range(copy.src as u64, copy.dst as u64),
-                        Unbound::Source(va) | Unbound::Destination(va) => {
-                            BatchError::NotCaptured(va as u64)
-                        }
-                    })
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let scratch = self
-                .default_buffer(max_bytes as u64)
-                .ok_or_else(|| BatchError::Native(oom()))?;
-            list.keep(&scratch);
+            let scratch = if max_copy > 0 {
+                let buffer = self.default_buffer(max_copy as u64)
+                    .ok_or_else(|| BatchError::Native(oom()))?;
+                list.keep(&buffer);
+                Some(buffer)
+            } else {
+                None
+            };
             let mut dirty = BTreeSet::new();
-            for pieces in plan {
-                record_copy(list, batch, &scratch, &pieces, &mut dirty)
-                    .map_err(BatchError::Native)?;
+            for &op in ops {
+                match op {
+                    PageOp::Copy(copy) => {
+                        let pieces = copy.bind(pins).map_err(|miss| match miss {
+                            Unbound::AddressWidth => BatchError::Range(copy.src as u64, copy.dst as u64),
+                            Unbound::Source(va) | Unbound::Destination(va) => BatchError::NotCaptured(va as u64),
+                        })?;
+                        record_copy(list, batch, scratch.as_ref().expect("copy reserved scratch"), &pieces, &mut dirty)
+                            .map_err(BatchError::Native)?;
+                    }
+                    PageOp::Input(input) => input.encode(self, list, batch)?,
+                }
             }
             Ok(dirty)
         })
@@ -590,7 +616,7 @@ fn paged_title_recording_rejects_mixed_lists_before_alias_copy() {
     let initial = [10, 20, 30, 40, 50, 60];
     section.lock().unwrap()[..6].copy_from_slice(&initial);
     assert!(matches!(
-        host.execute_paged_title_copies(heap, &mut backing, &[&first, &second]),
+        host.execute_paged_title(heap, &mut backing, &[&first, &second]),
         Err(BatchError::UnloweredList(1))
     ));
     // The native recorder is exposed; even a no-op native body is not
@@ -598,14 +624,24 @@ fn paged_title_recording_rejects_mixed_lists_before_alias_copy() {
     let _ = second.recording();
     second.close();
     assert!(matches!(
-        host.execute_paged_title_copies(heap, &mut backing, &[&first, &second]),
+        host.execute_paged_title(heap, &mut backing, &[&first, &second]),
         Err(BatchError::UnloweredList(1))
     ));
     assert_eq!(&section.lock().unwrap()[..6], &initial);
     second.reset();
-    second.defer_copy(VA as *mut u8, (ALIAS + 2) as *const u8, 2);
+    let vertex = crate::page_view::VertexView { address: VA as u64, size: 4, stride: 4 };
+    second.record_page_input(InputView::Vertex(32, vertex));
     second.close();
-    let stats = host.execute_paged_title_copies(heap, &mut backing, &[&first, &second]).unwrap();
+    assert!(matches!(
+        host.execute_paged_title(heap, &mut backing, &[&first, &second]),
+        Err(BatchError::Range(..))
+    ));
+    assert_eq!(&section.lock().unwrap()[..6], &initial);
+    second.reset();
+    second.defer_copy(VA as *mut u8, (ALIAS + 2) as *const u8, 2);
+    second.record_page_input(InputView::Vertex(0, vertex));
+    second.close();
+    let stats = host.execute_paged_title(heap, &mut backing, &[&first, &second]).unwrap();
     assert_eq!(stats, PageStats { uploaded: 1, downloaded: 1 });
     assert_eq!(&section.lock().unwrap()[..6], &[20, 30, 20, 30, 40, 50]);
 }
@@ -630,7 +666,7 @@ fn paged_input_views_gather_cross_page_gpu_writes() {
     let (out, ptr) = host.shared_buffer(8).unwrap();
     let copy = GuestCopy::new(VA + PAGE, VA + 2, 2).unwrap();
     let vertex = VertexView { address: (VA + PAGE - 2) as u64, size: 4, stride: 4 };
-    let view = InputView::Vertex(vertex);
+    let view = InputView::Vertex(0, vertex);
     let index = IndexView {
         address: vertex.address,
         size: vertex.size,

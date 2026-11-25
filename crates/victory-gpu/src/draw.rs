@@ -51,6 +51,7 @@ fn fresh_tables_share_by_view_generation_length_and_heap() {
 }
 
 pub(crate) use crate::page_view::{IndexView, VertexView};
+use crate::page_view::InputView;
 
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
@@ -458,6 +459,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.record_page_input(InputView::Vertex(slot as u32, v));
             *view = v.native(shadow.gpu(v.address));
         }
         // SAFETY: an open list; the views name live host buffers.
@@ -473,6 +475,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.record_page_input(InputView::Index(v));
             let view = v.native(shadow.gpu(v.address));
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };

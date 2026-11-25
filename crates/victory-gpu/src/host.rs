@@ -908,6 +908,9 @@ enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(crate::copy_plan::GuestCopy),
+    /// Guest-address input binding, preserved in stream order. The
+    /// existing renderer still records its native binding separately.
+    PageInput(crate::page_view::InputView),
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
@@ -1681,12 +1684,12 @@ impl HostList {
         &self.list
     }
 
-    /// Admit the complete closed copy list or none of it. Native work,
+    /// Admit the complete closed page list or none of it. Native work,
     /// deferred uploads/refreshes and fence callbacks need their own
     /// ordered lowering before this gate can accept them.
-    pub(crate) fn append_closed_copies(
+    pub(crate) fn append_closed_page_ops(
         &self,
-        copies: &mut Vec<crate::copy_plan::GuestCopy>,
+        ops: &mut Vec<crate::page_queue::PageOp>,
     ) -> bool {
         if self.recording_flags.load(Ordering::Acquire) != CLOSED_RECORDING {
             return false;
@@ -1700,12 +1703,14 @@ impl HostList {
         if !deferred.writes.is_empty()
             || !deferred.after.is_empty()
             || !deferred.missed.is_empty()
-            || deferred.copies.iter().any(|step| !matches!(step, Step::Copy(_)))
+            || deferred.copies.iter().any(|step| !matches!(step, Step::Copy(_) | Step::PageInput(_)))
         {
             return false;
         }
-        copies.extend(deferred.copies.iter().filter_map(|step| {
-            if let Step::Copy(copy) = step { Some(*copy) } else { None }
+        ops.extend(deferred.copies.iter().filter_map(|step| match step {
+            Step::Copy(copy) => Some(crate::page_queue::PageOp::Copy(*copy)),
+            Step::PageInput(view) => Some(crate::page_queue::PageOp::Input(*view)),
+            _ => None,
         }));
         true
     }
@@ -2076,6 +2081,10 @@ impl HostList {
         }
     }
 
+    pub(crate) fn record_page_input(&self, view: crate::page_view::InputView) {
+        self.deferred().copies.push(Step::PageInput(view));
+    }
+
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
@@ -2317,12 +2326,16 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            if matches!(step, Step::PageInput(_)) {
+                continue;
+            }
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
                 started,
                 match step {
                     Step::Refresh(..) => C::StepRefreshUs,
+                    Step::PageInput(_) => unreachable!("handled before timing"),
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
                     Step::Run(_) | Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
@@ -2332,6 +2345,7 @@ impl HostList {
                 },
             );
             let copied = match step {
+                Step::PageInput(_) => unreachable!("handled before legacy execution"),
                 &Step::Copy(crate::copy_plan::GuestCopy { dst, src, len }) => {
                     #[cfg(feature = "diagnostics")]
                     {

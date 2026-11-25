@@ -51,14 +51,15 @@ impl IndexView {
 
 #[derive(Clone, Copy)]
 pub(crate) enum InputView {
-    Vertex(VertexView),
+    Vertex(u32, VertexView),
     Index(IndexView),
 }
 
 impl InputView {
     pub(crate) fn range(self) -> Result<(u64, u64), BatchError> {
         let (start, size, alignment) = match self {
-            Self::Vertex(view) => (view.address, view.size, 1),
+            Self::Vertex(slot, view) if slot < 32 => (view.address, view.size, 1),
+            Self::Vertex(_, view) => return Err(BatchError::Range(view.address, view.address)),
             Self::Index(view) => {
                 let alignment = match DXGI_FORMAT(view.format as i32) {
                     DXGI_FORMAT_R16_UINT => 2,
@@ -75,6 +76,26 @@ impl InputView {
             return Err(BatchError::Range(start, end));
         }
         Ok((start, end))
+    }
+
+    pub(crate) fn encode(
+        self,
+        host: &Host,
+        list: &HostList,
+        batch: &PinnedBatch,
+    ) -> Result<(), BatchError> {
+        let buffer = self.gather(host, list, batch)?;
+        let native = list.recording();
+        // SAFETY: gather validated the slot/format and prepared a live
+        // contiguous resource in the corresponding read-only state.
+        unsafe {
+            let gpu = buffer.GetGPUVirtualAddress();
+            match self {
+                Self::Vertex(slot, view) => native.IASetVertexBuffers(slot, Some(&[view.native(gpu)])),
+                Self::Index(view) => native.IASetIndexBuffer(Some(&view.native(gpu))),
+            }
+        }
+        Ok(())
     }
 
     /// All slabs are in UAV state at this point. Transitions expose
@@ -106,7 +127,7 @@ impl InputView {
         let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let read = D3D12_RESOURCE_STATE_COPY_SOURCE;
         let binding = match self {
-            Self::Vertex(_) => D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            Self::Vertex(..) => D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
             Self::Index(_) => D3D12_RESOURCE_STATE_INDEX_BUFFER,
         };
         let gather: Vec<_> = source.values().map(|src| transition(src, uav, read)).collect();
