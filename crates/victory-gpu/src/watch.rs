@@ -552,6 +552,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    crate::shadow::in_place_remapped(at as u64, len as u64);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.

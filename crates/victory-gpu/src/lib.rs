@@ -46,6 +46,8 @@ mod primitive;
 pub mod query;
 pub mod queue;
 pub mod resource;
+#[cfg(windows)]
+mod residency;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
@@ -67,6 +69,10 @@ mod texture;
 mod twin;
 #[cfg(windows)]
 mod watch;
+#[cfg(any(windows, test))]
+mod working_set;
+#[cfg(windows)]
+pub use working_set::begin as begin_memory_observation;
 
 #[cfg(windows)]
 pub use host::on_failure;

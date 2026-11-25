@@ -436,6 +436,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // bytes, `Shadow::gpu_writes`).
         let withheld = if pages + regions > 0 { writes.len() as u64 } else { 0 };
         let mut written = 0;
+        // Buffers in place hold the shaders' writes whatever is withheld.
+        for &(k, at) in writes.iter().filter(|_| withheld > 0) {
+            copies[k].landed(at as usize, 1 << 16);
+        }
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
             let n = copies[k].copy_back_page(at as usize);
             tracing::debug!(

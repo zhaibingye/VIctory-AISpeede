@@ -62,6 +62,7 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    memory_adapter: OnceLock<Option<IDXGIAdapter3>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -268,6 +269,7 @@ fn create() -> windows::core::Result<Host> {
             next_cpu_view: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
+            memory_adapter: OnceLock::new(),
             presenter: Mutex::new(Presentation::default()),
         })
     }
@@ -441,19 +443,21 @@ mod tests {
         assert_eq!(second.0 - first.0, 256);
         assert_eq!(second.1 as usize - first.1 as usize, 256);
         assert_eq!(list.scratch.lock().unwrap().chunks[0].capacity, FIRST_SCRATCH_CHUNK);
-        let large = list.scratch(96 << 10).unwrap();
+        list.scratch(96 << 10).unwrap();
         assert_eq!(list.scratch.lock().unwrap().chunks[1].capacity, 128 << 10);
         assert!(list.scratch(u64::MAX).is_none());
         assert!(list.scratch(SCRATCH_CHUNK + 1).is_some());
         list.close();
         host.execute(&[&list]);
         list.reset();
-        assert_eq!(list.scratch(96 << 10).unwrap(), large);
-        assert_eq!(list.scratch.lock().unwrap().chunks.len(), 2);
+        assert!(list.scratch.lock().unwrap().chunks.is_empty());
+        assert!(list.scratch(96 << 10).is_some());
+        assert_eq!(list.scratch.lock().unwrap().chunks.len(), 1);
         list.close();
         host.execute(&[&list]);
         list.reset();
-        assert_eq!(list.scratch(512).unwrap(), first);
+        assert!(list.scratch.lock().unwrap().chunks.is_empty());
+        assert!(list.scratch(512).is_some());
         list.close();
     }
 
@@ -748,6 +752,10 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Where its indirect executions clamp records copied out of title
+    /// memory (`crate::indirect::copied`), its size and whether it was
+    /// used yet (between uses it is in the unordered-access state).
+    arguments: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -869,6 +877,21 @@ unsafe impl Send for Scratch {}
 const SCRATCH_CHUNK: u64 = 4 << 20;
 const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
 
+static IDLE_UPLOAD: Mutex<Vec<ScratchChunk>> = Mutex::new(Vec::new());
+
+fn limit_upload(pool: &mut Vec<ScratchChunk>) -> usize {
+    let limit = crate::working_set::limit(crate::working_set::Cache::ListUpload);
+    let mut bytes = pool.iter().map(|chunk| chunk.capacity as usize).sum::<usize>();
+    while bytes > limit {
+        bytes -= pool.pop().expect("nonempty when over limit").capacity as usize;
+    }
+    bytes
+}
+
+pub(crate) fn trim_idle_upload() -> usize {
+    limit_upload(&mut IDLE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 struct ScratchChunk {
     _buffer: ID3D12Resource,
     mapped: usize,
@@ -896,7 +919,7 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    Texture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::texture::Upload>),
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
     Heap(std::sync::Arc<crate::bindless::Viewed>),
@@ -914,10 +937,13 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    transient_texture_uploads: Vec<std::sync::Arc<crate::texture::Upload>>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// In-place resources need the backing and its budget lease until reset.
+    mapped_shadows: std::collections::HashMap<usize, std::sync::Arc<crate::shadow::Shadow>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1078,6 +1104,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                arguments: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1090,6 +1117,25 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        let adapter = self.memory_adapter.get_or_init(|| {
+            // SAFETY: query the adapter that owns this live device.
+            unsafe {
+                // Don't add a local GPU segment to physical RAM on UMA.
+                let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE::default();
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_ARCHITECTURE,
+                    (&raw mut arch).cast(),
+                    size_of_val(&arch) as u32,
+                ).ok()?;
+                if arch.UMA.as_bool() {
+                    return None;
+                }
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .and_then(|f| f.EnumAdapterByLuid(self.device.GetAdapterLuid()))
+                    .ok()
+            }
+        });
+        crate::working_set::sample(adapter.as_ref());
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1718,10 +1764,6 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
-        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1731,6 +1773,11 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = IDLE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+        pool.append(&mut scratch.chunks);
+        limit_upload(&mut pool);
+        (scratch.current, scratch.used) = (0, 0);
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -2063,14 +2110,24 @@ impl HostList {
         if s.current == s.chunks.len() {
             let next = s.chunks.last().map_or(FIRST_SCRATCH_CHUNK, |c| 2 * c.capacity);
             let capacity = len.next_multiple_of(FIRST_SCRATCH_CHUNK).max(next).min(SCRATCH_CHUNK);
-            let (buffer, data) = host.upload_buffer(capacity)?;
-            name(&buffer, || format!("list scratch {capacity:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let cached = {
+                let mut pool = IDLE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+                pool.iter().position(|c| c.capacity == capacity).map(|i| pool.swap_remove(i))
+            };
+            let chunk = match cached {
+                Some(chunk) => chunk,
+                None => {
+                    let (buffer, data) = host.upload_buffer(capacity)?;
+                    name(&buffer, || format!("list scratch {capacity:#x}"));
+                    // SAFETY: a live buffer.
+                    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                    ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity }
+                }
+            };
             #[cfg(feature = "diagnostics")]
             tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
                 chunk = s.current, requested = len, capacity, "allocated list scratch");
-            s.chunks.push(ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity });
+            s.chunks.push(chunk);
             s.used = 0;
         }
         let chunk = &s.chunks[s.current];
@@ -2078,6 +2135,26 @@ impl HostList {
         let result = (chunk.gpu + at, (chunk.mapped + at as usize) as *mut u8);
         s.used += len;
         Some(result)
+    }
+
+    /// A shader-writable buffer of the list's of at least `len` bytes for
+    /// indirect arguments (`crate::indirect::copied`), and whether this is
+    /// its first use (it is still in the common state). One buffer, reused
+    /// by each execution in turn; a bigger one replaces it when needed (the
+    /// list keeps the old one).
+    pub(crate) fn arguments(&self, len: u64) -> Option<(ID3D12Resource, bool)> {
+        let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        if arguments.as_ref().is_none_or(|a| a.1 < len) {
+            if let Some((old, _, _)) = arguments.take() {
+                self.keep(&old);
+            }
+            let size = len.max(1).checked_next_multiple_of(64 << 10)?;
+            let (buffer, _) = host()?.shared_buffer(size)?;
+            name(&buffer, || format!("list indirect arguments {size:#x}"));
+            *arguments = Some((buffer, size, false));
+        }
+        let (buffer, _, used) = arguments.as_mut()?;
+        Some((buffer.clone(), !std::mem::replace(used, true)))
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -2110,6 +2187,12 @@ impl HostList {
         }
     }
 
+    pub(crate) fn keep_mapped_shadow(&self, copy: &std::sync::Arc<crate::shadow::Shadow>) {
+        self.deferred().mapped_shadows
+            .entry(std::sync::Arc::as_ptr(copy) as usize)
+            .or_insert_with(|| copy.clone());
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -2130,8 +2213,20 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        upload: std::sync::Arc<crate::texture::Upload>,
+    ) {
+        self.deferred().copies.push(Step::Texture(staging, upload));
+    }
+
+    pub(crate) fn keep_upload_until_fence(&self, upload: std::sync::Arc<crate::texture::Upload>) {
+        self.deferred().transient_texture_uploads.push(upload);
+    }
+
+    pub(crate) fn release_fenced_uploads(&self) {
+        self.deferred().transient_texture_uploads.clear();
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -2150,7 +2245,7 @@ impl HostList {
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
                     Step::Run(_) | Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
-                    Step::Texture(_) => C::StepTextureUs,
+                    Step::Texture(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
                     Step::Memory(_) => C::StepMemoryUs,
                 },
@@ -2205,8 +2300,8 @@ impl HostList {
                     shadow.writing(*address, *len, *marked);
                     continue;
                 }
-                Step::Texture(staging) => {
-                    let refreshed = batch.texture_due(staging) && staging.refresh();
+                Step::Texture(staging, upload) => {
+                    let refreshed = batch.texture_due(staging) && staging.refresh(Some(upload)).is_some();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::TextureQueuedTable, staging.upload_payload);
@@ -2593,10 +2688,6 @@ impl Host {
     /// A buffer in the upload heap, mapped for writing.
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
     pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -2607,19 +2698,19 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation.
-        let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
-        };
-        made.ok().and(buffer)
+        // SAFETY: allocation info for one initialized description.
+        let bytes = unsafe { self.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
+        self.managed_gpu(bytes, |heap| {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: live device, initialized descriptors and out slot.
+            unsafe {
+                self.device.CreateCommittedResource(
+                    heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer,
+                )?;
+            }
+            buffer.ok_or_else(windows::core::Error::empty)
+        }).ok()
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {

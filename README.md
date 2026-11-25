@@ -78,7 +78,7 @@ target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf 
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
-This fork defaults to Series S. Pass `--console series-x` to select Series X.
+This fork runs as Series S only. Existing commands that pass `--console series-s` still work. See [memory budgets and diagnostics](docs/series-s-memory.md).
 
 The `translate --cache` step (minutes; again after a change of the shader
 translator) translates every shader the title can ask for into the cache
@@ -132,7 +132,7 @@ victory shader-info [paths...] [--verbose] [--disasm] [--effects]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
+            [-- <title arguments>]
 victory config
 ```
 
@@ -200,7 +200,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 With the Series S profile and no working PC FidelityFX provider, VIctory can
 fill the console upscaler's output with a spatial bilinear pass. It uses the
 title's own render and output sizes; it does not set a resolution or replace
-temporal FidelityFX quality. The Series X dispatch path is unchanged.
+temporal FidelityFX quality.
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.

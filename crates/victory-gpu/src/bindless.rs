@@ -241,6 +241,13 @@ impl Uploads {
     }
 }
 
+// The one-shot list is never executed again after the synchronous submission.
+impl Drop for Uploads {
+    fn drop(&mut self) {
+        self.list().release_fenced_uploads();
+    }
+}
+
 /// Per submission: brings the buffer ranges a heap's views reach up to date
 /// (in the submission's batch of refreshes): the pages the title changed
 /// since their copies took them.

@@ -115,10 +115,6 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     // SAFETY: a live resource.
     let dd = unsafe { depth.GetDesc() };
     let subs = u32::from(dd.MipLevels) * u32::from(dd.DepthOrArraySize).max(1);
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
     let mut planes = Vec::new();
     for &f in formats {
         let desc = D3D12_RESOURCE_DESC {
@@ -128,16 +124,9 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
             Alignment: 0,
             ..dd
         };
-        let mut texture: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation; our out pointer.
-        let made = unsafe {
-            host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture)
-        };
-        if let Err(e) = made {
+        let texture = managed_common(host, &desc).inspect_err(|e| {
             tracing::warn!(error = %e, ?desc, "no writable twin for a depth texture");
-            return None;
-        }
-        let texture = texture?;
+        }).ok()?;
         crate::host::name(&texture, || format!("depth twin {}x{} f{f}", dd.Width, dd.Height));
         planes.push(Arc::new(HostTexture::new(texture, 0, Vec::new())));
     }
@@ -190,10 +179,6 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
 /// state.
 fn scratch_buffer(size: u64) -> Option<ID3D12Resource> {
     let host = host()?;
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: size.max(256),
@@ -205,12 +190,22 @@ fn scratch_buffer(size: u64) -> Option<ID3D12Resource> {
         Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         ..Default::default()
     };
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation.
-    let made = unsafe {
-        host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
-    };
-    made.ok().and(buffer)
+    managed_common(host, &desc).ok()
+}
+
+fn managed_common(host: &crate::host::Host, desc: &D3D12_RESOURCE_DESC) -> windows::core::Result<ID3D12Resource> {
+    // SAFETY: query one initialized description.
+    let bytes = unsafe { host.device.GetResourceAllocationInfo(0, &[*desc]) }.SizeInBytes;
+    host.managed_gpu(bytes, |heap| {
+        let mut resource = None;
+        // SAFETY: initialized descriptions and our out slot.
+        unsafe {
+            host.device.CreateCommittedResource(
+                heap, D3D12_HEAP_FLAG_NONE, desc, D3D12_RESOURCE_STATE_COMMON, None, &mut resource,
+            )?;
+        }
+        resource.ok_or_else(windows::core::Error::empty)
+    })
 }
 
 /// Logs once per (console format, view format, plane) what happened.

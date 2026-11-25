@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::{Console, Unimplemented};
+use crate::Unimplemented;
 
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
@@ -39,7 +39,6 @@ fn check_cpu_features() -> Result<()> {
 #[cfg(windows)]
 struct SeriesSImports<'a> {
     inner: &'a dyn victory_loader::ImportResolver,
-    spatial: bool,
 }
 
 #[cfg(windows)]
@@ -48,7 +47,7 @@ impl victory_loader::ImportResolver for SeriesSImports<'_> {
         use victory_hle::modules::fidelityfx;
         use victory_loader::{Provenance, Resolution};
         let resolved = self.inner.resolve(dll, symbol);
-        if self.spatial && dll.eq_ignore_ascii_case(fidelityfx::LOADER_DLL)
+        if dll.eq_ignore_ascii_case(fidelityfx::LOADER_DLL)
             && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch")
             // Do not displace a working PC FidelityFX provider.
             && let Resolution::Found { address, provenance: Provenance::Title } = resolved
@@ -67,7 +66,6 @@ pub fn run(
     unimplemented: Unimplemented,
     strict: bool,
     execute: bool,
-    console: Console,
 ) -> Result<u32> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -75,6 +73,7 @@ pub fn run(
 
     if execute {
         check_cpu_features()?;
+        victory_hle::begin_memory_observation();
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
@@ -128,11 +127,7 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
-    victory_hle::console::set(match console {
-        Console::SeriesX => victory_hle::console::Console::SeriesX,
-        Console::SeriesS => victory_hle::console::Console::SeriesS,
-    });
-    println!("console        {}", victory_hle::console::current().name());
+    println!("console        {}", victory_hle::console::NAME);
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
@@ -191,7 +186,6 @@ pub fn run(
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     let imports = SeriesSImports {
         inner: &with_dlls,
-        spatial: matches!(console, Console::SeriesS),
     };
     show(&exe_name, image.bind_imports(&imports, policy)?);
     if !execute {
@@ -575,6 +569,6 @@ mod cpu_check_tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool) -> Result<u32> {
     anyhow::bail!("running titles requires Windows")
 }

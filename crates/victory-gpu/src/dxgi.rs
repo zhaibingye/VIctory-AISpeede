@@ -151,16 +151,15 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
     }
     // shortcut: memory sizes are the title's split (GPU-optimal, standard),
     // not measured; revisit once memory is emulated.
-    let (gpu_optimal, standard) = crate::console::current().title_memory();
     let description = AdapterDescription {
         name,
         vendor: AMD,
         device: 0,
         subsystem: 0,
         revision: 0,
-        dedicated_video_memory: gpu_optimal,
+        dedicated_video_memory: 0,
         dedicated_system_memory: 0,
-        shared_system_memory: standard,
+        shared_system_memory: crate::console::TITLE_MEMORY,
         luid: [1, 0],
     };
     // SAFETY: checked non-null; the title passes room for the description.

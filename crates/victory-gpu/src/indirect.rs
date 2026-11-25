@@ -219,6 +219,32 @@ pub(crate) fn bound(
     true
 }
 
+/// The records of an indirect execution, `len` bytes at `offset` in
+/// `source`, copied in `list` into a buffer of the list's, for [`bound`] to
+/// clamp there: `source` is title memory itself (a buffer in place,
+/// `crate::shadow`), which the clamp would change under the title. The
+/// copy and its host address. Leaves both in the unordered-access state.
+pub(crate) fn copied(list: &HostList, source: &ID3D12Resource, offset: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
+    let (copy, first) = list.arguments(len)?;
+    let before = if first { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+    let l = &list.list;
+    // SAFETY: an open list and live buffers (the caller's list holds
+    // `source`, the list `copy`); the range is inside both.
+    unsafe {
+        l.ResourceBarrier(&[
+            transition(source, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(&copy, before, D3D12_RESOURCE_STATE_COPY_DEST),
+        ]);
+        l.CopyBufferRegion(&copy, 0, source, offset, len);
+        l.ResourceBarrier(&[
+            transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        ]);
+        let gpu = copy.GetGPUVirtualAddress();
+        Some((copy, gpu))
+    }
+}
+
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
@@ -288,6 +314,46 @@ mod tests {
             }
             let first = |i: usize| data.add(i * per).read_volatile();
             Some((0..records as usize).map(first).collect())
+        }
+    }
+
+    /// Records copied out of title memory in place are clamped in the copy,
+    /// which the execution reads: the title's bytes stay as written, and a
+    /// second copy in the same list reuses the list's buffer.
+    #[test]
+    fn records_in_place_are_clamped_in_a_copy() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        // Two draws of u32::MAX vertices, 16 bytes each, after 256 bytes
+        // (within the budget twice once clamped).
+        let word = |at: usize| if at % 4 == 1 { 1 } else { u32::MAX };
+        let (source, data) = host.shared_buffer(1 << 16).unwrap();
+        let data = data.cast::<u32>();
+        let list = host.new_list().unwrap();
+        let spec = (0, 16, 2);
+        // SAFETY: our mapped buffer, written before the list runs and read
+        // after it has; live buffers.
+        unsafe {
+            for at in 0..(256 + 32) / 4 {
+                data.add(at).write_volatile(word(at));
+            }
+            let mut copies = Vec::new();
+            for _ in 0..2 {
+                let (copy, gpu) = super::copied(&list, &source, 256, 32).expect("a copy of the list's");
+                assert!(super::bound(&list, &copy, gpu, spec));
+                super::done(&list, &copy);
+                copies.push(copy);
+            }
+            assert_eq!(copies[0], copies[1], "one buffer per list");
+            list.close();
+            host.execute(&[&list]);
+            assert!((0..(256 + 32) / 4).all(|at| data.add(at).read_volatile() == word(at)), "title memory unchanged");
+            let mut mapped = std::ptr::null_mut();
+            copies[0].Map(0, None, Some(&mut mapped)).unwrap();
+            let first = mapped.cast::<u32>().read_volatile();
+            copies[0].Unmap(0, None);
+            assert_eq!(first, 1 << 24, "the copy clamped");
         }
     }
 

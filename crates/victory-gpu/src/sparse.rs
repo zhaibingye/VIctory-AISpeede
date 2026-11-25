@@ -66,22 +66,21 @@ impl Sparse {
     /// Newly added tiles are never reused or removed while the resource lives.
     fn map(texture: &ID3D12Resource, first: u32, count: u32) -> windows::core::Result<()> {
         let host = crate::host::host().ok_or(windows::core::Error::empty())?;
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: u64::from(count) * 65536,
-            Properties: D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_DEFAULT,
-                CreationNodeMask: 1,
-                VisibleNodeMask: 1,
+        let bytes = u64::from(count) * 65536;
+        let heap: ID3D12Heap = host.managed_gpu(bytes, |properties| {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: bytes,
+                Properties: *properties,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
                 ..Default::default()
-            },
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
-            ..Default::default()
-        };
-        let mut heap: Option<ID3D12Heap> = None;
-        // SAFETY: The heap description is initialized; the COM out slot and texture are live.
+            };
+            let mut heap = None;
+            // SAFETY: an initialized heap description and writable out slot.
+            unsafe { host.device.CreateHeap(&desc, &mut heap)? };
+            heap.ok_or_else(windows::core::Error::empty)
+        })?;
+        // SAFETY: the heap and texture are live.
         unsafe {
-            host.device.CreateHeap(&desc, &mut heap)?;
-            let heap = heap.ok_or(windows::core::Error::empty())?;
             // The resource's COM reference count (including descriptor heaps)
             // governs these backing heaps' lifetime, even beyond the title handle.
             let key = windows::core::GUID::from_u128(

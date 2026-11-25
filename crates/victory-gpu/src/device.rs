@@ -334,7 +334,7 @@ extern "system" fn check_feature_support(
             S_OK
         }
         OPTIONS1 => {
-            let lanes = crate::console::current().compute_units() * 64;
+            let lanes = crate::console::COMPUTE_UNITS * 64;
             // SAFETY: checked size and non-null.
             unsafe {
                 data.cast::<[u32; 6]>()

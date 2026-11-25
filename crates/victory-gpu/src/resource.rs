@@ -1326,81 +1326,58 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         value
     });
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
-    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: the host-compatible description layout is checked.
+    let p = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+    // SAFETY: request the allocation size for this single live description.
+    let bytes = unsafe { host.device.GetResourceAllocationInfo(0, &[p]) }.SizeInBytes;
     let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
     castable_formats.retain(|&f| host_has(host, f));
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
-    if !castable_formats.is_empty()
-        && let Ok(device) = host.device.cast::<ID3D12Device10>()
-    {
-        // SAFETY: the description has the host layout (checked size).
-        let p = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
-        // The plain description plus the sampler feedback region (none).
-        let desc1 = D3D12_RESOURCE_DESC1 {
-            Dimension: p.Dimension,
-            Alignment: p.Alignment,
-            Width: p.Width,
-            Height: p.Height,
-            DepthOrArraySize: p.DepthOrArraySize,
-            MipLevels: p.MipLevels,
-            Format: p.Format,
-            SampleDesc: p.SampleDesc,
-            Layout: p.Layout,
-            Flags: p.Flags,
-            SamplerFeedbackMipRegion: Default::default(),
-        };
-        let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
-        // SAFETY: a host description and our out pointer; the list and the
-        // clear value live through the call.
-        let made = unsafe {
-            device.CreateCommittedResource3(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc1,
-                D3D12_BARRIER_LAYOUT_COMMON,
-                clear_value,
-                None::<&ID3D12ProtectedResourceSession>,
-                Some(&formats),
-                &mut texture,
-            )
-        };
-        if let Err(e) = made {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(error = %e, desc = ?d, "the host refuses castable formats: textures of one memory in other formats get their own host texture");
-            });
+    let texture = host.managed_gpu(bytes, |heap| {
+        let mut texture: Option<ID3D12Resource> = None;
+        if !castable_formats.is_empty()
+            && let Ok(device) = host.device.cast::<ID3D12Device10>()
+        {
+            let desc1 = D3D12_RESOURCE_DESC1 {
+                Dimension: p.Dimension, Alignment: p.Alignment, Width: p.Width,
+                Height: p.Height, DepthOrArraySize: p.DepthOrArraySize,
+                MipLevels: p.MipLevels, Format: p.Format, SampleDesc: p.SampleDesc,
+                Layout: p.Layout, Flags: p.Flags, SamplerFeedbackMipRegion: Default::default(),
+            };
+            let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+            // SAFETY: initialized descriptions and our out pointer.
+            let made = unsafe {
+                device.CreateCommittedResource3(
+                    heap, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_BARRIER_LAYOUT_COMMON,
+                    clear_value, None::<&ID3D12ProtectedResourceSession>, Some(&formats), &mut texture,
+                )
+            };
+            if made.is_ok() && let Some(texture) = texture {
+                initial = 0;
+                return Ok(texture);
+            }
             texture = None;
-        } else {
-            // The common layout is the common state.
-            initial = 0;
         }
-    }
-    if texture.is_none() {
-        castable_formats.clear();
-        // SAFETY: the description has the host layout (checked size, same
-        // fields); the out pointer is ours.
-        let made = unsafe {
+        // SAFETY: initialized descriptions, our out pointer.
+        unsafe {
             host.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                std::ptr::from_ref(d).cast(),
-                D3D12_RESOURCE_STATES(initial as i32),
-                clear_value,
-                &mut texture,
-            )
-        };
-        if let Err(e) = made {
+                heap, D3D12_HEAP_FLAG_NONE, &p, D3D12_RESOURCE_STATES(initial as i32),
+                clear_value, &mut texture,
+            )?;
+        }
+        castable_formats.clear();
+        texture.ok_or_else(windows::core::Error::empty)
+    });
+    let texture = match texture {
+        Ok(texture) => texture,
+        Err(e) => {
             if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
                 note_texture_pressure();
             }
             tracing::warn!(error = %e, desc = ?d, "no host texture");
+            return None;
         }
-    }
-    let texture = texture?;
+    };
     crate::host::name(&texture, || {
         // Its address, for the lifetime notes (`life`) of a freed one.
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)

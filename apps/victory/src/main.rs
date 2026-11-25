@@ -112,9 +112,9 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
-        /// The console model the title sees (device type, memory).
-        #[arg(long, value_enum, default_value_t = Console::SeriesS)]
-        console: Console,
+        /// Optional compatibility spelling; only Series S is supported.
+        #[arg(long, value_enum, hide = true)]
+        console: Option<Console>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -132,7 +132,6 @@ enum Unimplemented {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Console {
-    SeriesX,
     SeriesS,
 }
 
@@ -182,10 +181,10 @@ fn main() -> Result<()> {
             unimplemented,
             strict,
             execute,
-            console,
+            console: _,
             title_args: _,
         } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            let code = run::run(&exe, unimplemented, strict, execute)?;
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.
                 std::process::exit(code as i32);
@@ -245,19 +244,15 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod console_args_tests {
-    use super::{Cli, Command, Console, Parser};
-
-    fn console(flags: &[&str]) -> Console {
-        let args = ["victory", "run", "example.exe"].into_iter().chain(flags.iter().copied());
-        let cli = Cli::try_parse_from(args).expect("valid run arguments");
-        let Command::Run { console, .. } = cli.command else { panic!("expected run") };
-        console
-    }
+    use super::{Cli, Parser};
 
     #[test]
-    fn run_defaults_to_series_s_and_retains_both_explicit_modes() {
-        assert!(matches!(console(&["--execute"]), Console::SeriesS));
-        assert!(matches!(console(&["--console", "series-x"]), Console::SeriesX));
-        assert!(matches!(console(&["--console", "series-s"]), Console::SeriesS));
+    fn series_s_is_the_only_console() {
+        let parse = |flags: &[&str]| {
+            Cli::try_parse_from(["victory", "run", "example.exe"].into_iter().chain(flags.iter().copied()))
+        };
+        assert!(parse(&["--execute"]).is_ok());
+        assert!(parse(&["--console", "series-s"]).is_ok());
+        assert!(parse(&["--console", "series-x"]).is_err());
     }
 }

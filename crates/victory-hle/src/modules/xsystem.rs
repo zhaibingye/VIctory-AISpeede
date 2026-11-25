@@ -107,7 +107,7 @@ extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut Anal
         os: OS,
         hosting_os: OS,
         family: text("Xbox"),
-        form: text(victory_gpu::console::current().name()),
+        form: text(victory_gpu::console::NAME),
     };
     // SAFETY: the caller passes room for the struct.
     unsafe { out.write(info) };
@@ -139,7 +139,7 @@ mod device_type {
 
     use std::ffi::c_void;
 
-    use victory_gpu::console::{self, Console};
+    use victory_gpu::console;
 
     use crate::modules::files::host;
     use crate::{HleModule, hle_export};
@@ -158,14 +158,6 @@ mod device_type {
     static OEM: u8 = 0;
     fn oem() -> Key {
         (&raw const OEM).cast_mut().cast()
-    }
-
-    /// What the title's code maps to each model's device type.
-    pub(super) fn console_mode(console: Console) -> u32 {
-        match console {
-            Console::SeriesX => 0x64,
-            Console::SeriesS => 0x60,
-        }
     }
 
     fn is(text: *const u16, expected: &str) -> bool {
@@ -254,9 +246,9 @@ mod device_type {
                 return MORE_DATA;
             }
             data.cast::<u32>()
-                .write_unaligned(console_mode(console::current()));
+                .write_unaligned(console::DEVICE_TYPE);
         }
-        tracing::debug!(console = console::current().name(), "device type read");
+        tracing::debug!(console = console::NAME, "device type read");
         SUCCESS
     }
 
@@ -289,9 +281,7 @@ mod device_type {
         }
 
         #[test]
-        fn titles_read_the_chosen_model() {
-            assert_eq!(console_mode(Console::SeriesX), 0x64);
-            assert_eq!(console_mode(Console::SeriesS), 0x60);
+        fn titles_read_series_s() {
             let mut key = std::ptr::null_mut();
             let path = w(&KEY.to_ascii_lowercase());
             assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
@@ -309,7 +299,7 @@ mod device_type {
             };
             assert_eq!(query(&mut value, &mut size, &mut kind), SUCCESS);
             assert_eq!((kind, size), (DWORD, 4));
-            assert_eq!(value, console_mode(console::current()));
+            assert_eq!(value, 0x60);
             let mut small = 2;
             assert_eq!(query(&mut value, &mut small, &mut kind), MORE_DATA);
             assert_eq!(small, 4);
@@ -395,6 +385,6 @@ mod tests {
         let info = unsafe { info.assume_init() };
         assert_eq!(size_of::<AnalyticsInfo>(), 0x90);
         assert_eq!(info.os.build, 22000);
-        assert_eq!(&info.form[..14], b"Xbox Series X\0");
+        assert_eq!(&info.form[..14], b"Xbox Series S\0");
     }
 }
