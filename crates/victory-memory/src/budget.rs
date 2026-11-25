@@ -59,6 +59,16 @@ impl Budget {
         Ok(Charge { pool, bytes })
     }
 
+    pub(crate) fn resize(&mut self, charge: &mut Charge, bytes: u64) -> Result<(), NoSpace> {
+        if bytes > charge.bytes {
+            let _increase = self.charge(charge.pool, bytes - charge.bytes)?;
+        } else if bytes < charge.bytes {
+            self.release(Charge { pool: charge.pool, bytes: charge.bytes - bytes });
+        }
+        charge.bytes = bytes;
+        Ok(())
+    }
+
     pub fn release(&mut self, charge: Charge) {
         let used = match charge.pool {
             Pool::Ram => &mut self.ram,

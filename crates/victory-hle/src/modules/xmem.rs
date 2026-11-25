@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_COMMITMENT_LIMIT, ERROR_NOT_ENOUGH_MEMORY, GetLastError, HANDLE, INVALID_HANDLE_VALUE, SetLastError,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_DECOMMIT, MEM_EXTENDED_PARAMETER,
@@ -88,11 +88,62 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
-// Serialize the wrapped host OS commit/release with GPU capture. Slots
-// describe ordinary virtual memory, not aliased XMem section views.
-fn virtual_pages() -> MutexGuard<'static, VirtualPages> {
-    static PRIVATE: LazyLock<Mutex<VirtualPages>> = LazyLock::new(Mutex::default);
+#[derive(Default)]
+struct PrivateMemory {
+    pages: VirtualPages,
+    reservation: Option<Reservation>,
+}
+
+impl PrivateMemory {
+    fn use_budget(&mut self, budget: &HostBudget) -> Result<(), victory_memory::budget::NoSpace> {
+        if self.reservation.is_none() {
+            self.reservation = Some(budget.reserve_ram(self.pages.committed_bytes())?);
+        }
+        Ok(())
+    }
+
+    fn reserve_commit(&mut self, base: *const c_void, len: usize, kind: u32) -> bool {
+        let Some(charge) = self.reservation.as_mut() else { return true; };
+        if kind & MEM_COMMIT == 0 || len == 0 { return true; }
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        let original = base as usize;
+        let (allocation, at) = if base.is_null() {
+            (None, 0)
+        } else if kind & MEM_RESERVE != 0 {
+            (None, original & !(PAGE - 1))
+        } else {
+            // SAFETY: a query only, with a local output record.
+            let found = unsafe { VirtualQueryEx(GetCurrentProcess(), base, &mut info, size_of_val(&info)) };
+            if found != 0 && matches!(
+                info.Type, windows_sys::Win32::System::Memory::MEM_MAPPED | windows_sys::Win32::System::Memory::MEM_IMAGE
+            ) { return true; } // section pages are charged by their owner
+            ((found != 0).then_some(info.AllocationBase as usize), original)
+        };
+        let Some(covered) = original.checked_sub(at).and_then(|extra| extra.checked_add(len)) else { return false; };
+        let Some(total) = self.pages.additional_bytes(allocation, at, covered)
+            .and_then(|bytes| self.pages.committed_bytes().checked_add(bytes)) else { return false; };
+        charge.resize(total).is_ok()
+    }
+
+    fn settle(&mut self) {
+        if let Some(charge) = self.reservation.as_mut() {
+            charge.resize(self.pages.committed_bytes())
+                .expect("host private commit bounded by its preflight reservation");
+        }
+    }
+}
+
+// Serialize wrapped host commit/release with GPU capture.
+fn virtual_pages() -> MutexGuard<'static, PrivateMemory> {
+    static PRIVATE: LazyLock<Mutex<PrivateMemory>> = LazyLock::new(Mutex::default);
     PRIVATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Activate when the unified renderer takes ownership, not while legacy
+/// shadows duplicate RAM charges. Existing tracked commits count too.
+#[allow(dead_code, reason = "enabled together with renderer cutover")]
+pub(crate) fn activate_private_ram_budget() -> Result<(), victory_memory::budget::NoSpace> {
+    virtual_pages().use_budget(HostBudget::process())
 }
 
 fn note_private_commit(pages: &mut VirtualPages, at: *mut c_void, bytes: usize, kind: u32) {
@@ -109,32 +160,56 @@ fn note_private_commit(pages: &mut VirtualPages, at: *mut c_void, bytes: usize, 
     }
 }
 
-pub(crate) fn private_virtual_alloc(base: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
-    let mut pages = virtual_pages();
-    // SAFETY: this has the same pointer/flags contract as the title's
-    // VirtualAlloc import. The host validates address alignment and range.
-    let at = unsafe { VirtualAlloc(base, size, kind, protect) };
-    let bytes = if base.is_null() || at.is_null() {
-        size
+fn commit_private(
+    private: &mut PrivateMemory,
+    base: *const c_void, bytes: usize, kind: u32,
+    allocate: impl FnOnce() -> *mut c_void,
+) -> *mut c_void {
+    if !private.reserve_commit(base, bytes, kind) {
+        // SAFETY: sets this thread's Win32 status for the failed allocation.
+        unsafe { SetLastError(ERROR_NOT_ENOUGH_MEMORY) };
+        return std::ptr::null_mut();
+    }
+    let at = allocate();
+    // SAFETY: only reads this thread's Win32 error after a failed call.
+    let error = at.is_null().then(|| unsafe { GetLastError() });
+    let committed = if base.is_null() || at.is_null() {
+        bytes
     } else {
-        (base as usize).saturating_add(size).saturating_sub(at as usize)
+        (base as usize).saturating_add(bytes).saturating_sub(at as usize)
     };
-    note_private_commit(&mut pages, at, bytes, kind);
+    note_private_commit(&mut private.pages, at, committed, kind);
+    private.settle();
+    if let Some(error) = error {
+        // SAFETY: restores the original failed allocation status.
+        unsafe { SetLastError(error) };
+    }
     at
 }
 
-pub(crate) fn private_virtual_free(base: *mut c_void, size: usize, kind: u32) -> BOOL {
-    let mut pages = virtual_pages();
+pub(crate) fn private_virtual_alloc(base: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+    commit_private(&mut virtual_pages(), base, size, kind, || {
+        // SAFETY: title VirtualAlloc ABI; Windows validates all arguments.
+        unsafe { VirtualAlloc(base, size, kind, protect) }
+    })
+}
+
+fn free_private(private: &mut PrivateMemory, base: *mut c_void, size: usize, kind: u32) -> BOOL {
     // SAFETY: unchanged host VirtualFree ABI; only publish success.
     let freed = unsafe { VirtualFree(base, size, kind) };
     if freed != 0 {
         if kind & (MEM_RELEASE | MEM_DECOMMIT) != 0 && size == 0 {
-            pages.released(base as usize);
+            private.pages.released(base as usize);
         } else if kind & (MEM_RELEASE | MEM_DECOMMIT) != 0 {
-            pages.decommitted(base as usize, size);
+            private.pages.decommitted(base as usize, size);
         }
+        private.settle();
     }
     freed
+}
+
+pub(crate) fn private_virtual_free(base: *mut c_void, size: usize, kind: u32) -> BOOL {
+    free_private(&mut virtual_pages(), base, size, kind)
 }
 
 pub extern "system" fn XMemVirtualAlloc(
@@ -191,8 +266,7 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
-    let mut private = virtual_pages();
-    let at = unsafe {
+    let at = commit_private(&mut virtual_pages(), base, size, kind, || unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
@@ -206,14 +280,7 @@ pub extern "system" fn XMemVirtualAlloc(
             },
             constrained.into(),
         )
-    };
-    let bytes = if base.is_null() || at.is_null() {
-        size
-    } else {
-        (base as usize).saturating_add(size).saturating_sub(at as usize)
-    };
-    note_private_commit(&mut private, at, bytes, kind);
-    drop(private);
+    });
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -515,14 +582,14 @@ pub(crate) fn pin_backing(ranges: &[(usize, usize)], pins: &mut BackingPins) {
             let from = base.max(start);
             let to = (base + size).min(end);
             if at < from {
-                remember_private(&private, pins, at, from);
+                remember_private(&private.pages, pins, at, from);
             }
             pins.keep(slice.section.first, &slice.section);
             pins.remember(from, to, Some(slice.page((from - base) / PAGE)));
             at = to;
         }
         if at < end {
-            remember_private(&private, pins, at, end);
+            remember_private(&private.pages, pins, at, end);
         }
     }
 }
@@ -548,7 +615,7 @@ pub(crate) fn read_backing_runs(
             None => {
                 let next = physical.views.range(at..).next()
                     .map_or(limit, |(&base, _)| limit.min(base));
-                private.run_at(at, next)
+                private.pages.run_at(at, next)
             }
         };
         let len = limit - at;
@@ -590,7 +657,7 @@ pub(crate) fn with_writeback_page(
     let current = physical.views.range(..=address).next_back()
         .filter(|&(&base, &(size, _))| address - base < size)
         .map(|(&base, (_, slice))| slice.page((address - base) / PAGE))
-        .or_else(|| private.page(address));
+        .or_else(|| private.pages.page(address));
     if current == expected {
         write(WritebackTarget { address, original_va: true });
         return true;
@@ -1278,6 +1345,42 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    #[test]
+    fn ordinary_ram_budget_tracks_native_4k_commit_and_rolls_back_refusal() {
+        use victory_memory::budget::RAM_LIMIT;
+        const SMALL: usize = 4096;
+        let budget = HostBudget::default();
+        let _section = budget.reserve_ram(RAM_LIMIT - 2 * SMALL as u64).unwrap();
+        let mut p = PrivateMemory::default();
+        let base = commit_private(&mut p, std::ptr::null(), PAGE, MEM_RESERVE, || {
+            // SAFETY: fresh private reservation, committed below.
+            unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) }
+        });
+        assert!(!base.is_null());
+        fn one(p: &mut PrivateMemory, at: *const c_void) -> *mut c_void {
+            commit_private(p, at, SMALL, MEM_COMMIT, || {
+                // SAFETY: one granule in the native reservation.
+                unsafe { VirtualAlloc(at, SMALL, MEM_COMMIT, PAGE_READWRITE) }
+            })
+        }
+        let second = (base as usize + SMALL) as *mut c_void;
+        assert_eq!(one(&mut p, base), base);
+        p.use_budget(&budget).unwrap(); // includes already-committed bytes
+        assert_eq!(budget.used(Pool::Ram), RAM_LIMIT - SMALL as u64);
+        assert_eq!(one(&mut p, base), base); // no double charge
+        assert!(commit_private(&mut p, second, SMALL, MEM_COMMIT, std::ptr::null_mut).is_null());
+        assert_eq!(budget.used(Pool::Ram), RAM_LIMIT - SMALL as u64);
+        assert!(commit_private(&mut p, second, 2 * SMALL, MEM_COMMIT, || {
+            panic!("must not call Windows on over-budget commit")
+        }).is_null());
+        assert_eq!(one(&mut p, second), second);
+        assert_eq!(budget.used(Pool::Ram), RAM_LIMIT);
+        assert_ne!(free_private(&mut p, second, SMALL, MEM_DECOMMIT), 0);
+        assert_eq!(budget.used(Pool::Ram), RAM_LIMIT - SMALL as u64);
+        assert_ne!(free_private(&mut p, base, 0, MEM_RELEASE), 0);
+        assert_eq!(budget.used(Pool::Ram), RAM_LIMIT - 2 * SMALL as u64);
     }
 
     #[test]

@@ -60,6 +60,12 @@ pub struct Reservation {
     charge: Option<Charge>,
 }
 
+impl Reservation {
+    pub fn resize(&mut self, bytes: u64) -> Result<(), NoSpace> {
+        self.budget.lock().resize(self.charge.as_mut().expect("one charge per reservation"), bytes)
+    }
+}
+
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.budget.lock().release(self.charge.take().expect("one charge per reservation"));
