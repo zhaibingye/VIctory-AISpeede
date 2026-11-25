@@ -2476,7 +2476,7 @@ impl Batch {
         for (shadow, ranges) in self.refreshes.drain(..) {
             for &(from, to) in ranges.slices() {
                 let started = std::time::Instant::now();
-                let copied = shadow.update(from, to - from);
+                let copied = shadow.refresh_from_backing(from, to - from, &self.backing);
                 let us = started.elapsed().as_micros() as u64;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::range(from, to - from, us, 0);

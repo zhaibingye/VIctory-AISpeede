@@ -458,6 +458,46 @@ pub(crate) fn pin_backing(ranges: &[(usize, usize)], pins: &mut BackingPins) {
     }
 }
 
+/// Read the same XMem backing the submission captured before preparation.
+/// Live aliases can be read without remapping; changed ranges use a short
+/// private section view. Never read an unrelated replacement page.
+pub(crate) fn read_backing_runs(
+    start: usize, end: usize, pins: &BackingPins,
+    visit: &mut dyn FnMut(usize, Option<usize>, usize, bool),
+) {
+    let physical = physical();
+    let mut at = start;
+    while at < end {
+        let (limit, expected) = pins.run_at(at, end);
+        let current = physical.views.range(..=at).next_back()
+            .filter(|&(&base, &(size, _))| at - base < size);
+        let (limit, current) = match current {
+            Some((&base, &(size, ref slice))) => (
+                limit.min(base + size), Some(slice.page((at - base) / PAGE)),
+            ),
+            None => {
+                let next = physical.views.range(at..).next()
+                    .map_or(limit, |(&base, _)| limit.min(base));
+                (next, None)
+            }
+        };
+        let len = limit - at;
+        if current == expected {
+            visit(at, Some(at), len, true);
+        } else if let Some((section, index)) = expected.and_then(|page| pins.section::<Section>(page)) {
+            let offset = at % PAGE;
+            let pages = (offset + len).div_ceil(PAGE);
+            let view = (pages <= section.pages.saturating_sub(index))
+                .then(|| View::map_section(section, index, pages)).flatten();
+            let source = view.as_ref().map(|view| view.at.Value as usize + offset);
+            visit(at, source, len, false);
+        } else {
+            visit(at, None, len, false);
+        }
+        at = limit;
+    }
+}
+
 /// Verify the destination under the map lock. A byte delta also has a
 /// stable before-image, so it can still reach the pinned original backing
 /// through a temporary view, even when every title alias is gone.
@@ -1488,6 +1528,13 @@ mod tests {
                 byte.write(13);
             }
         }));
+        let mut refresh = [0; 1];
+        read_backing_runs(address + 1, address + 2, &pins, &mut |base, source, len, same| {
+            assert_eq!((base, len, same), (address + 1, 1, false));
+            // SAFETY: the section mapping remains live for this callback.
+            refresh[0] = unsafe { (source.expect("original backing") as *const u8).read() };
+        });
+        assert_eq!(refresh, [13]);
         // SAFETY: the rebound page belongs to this test and is still mapped.
         assert_eq!(unsafe { ptr.cast::<u8>().add(1).read() }, 0);
         assert_eq!(XMemMapPhysicalPages(ptr, 1, std::ptr::null()), ptr);

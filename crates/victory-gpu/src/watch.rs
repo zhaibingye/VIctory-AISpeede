@@ -341,6 +341,13 @@ impl Tracked {
         runs
     }
 
+    /// A refresh took bytes from the captured old mapping, not the
+    /// current VA. Keep just this copy dirty for the next submission.
+    pub(crate) fn refresh_again(&self, from: usize, to: usize) {
+        self.changed.0.lock().unwrap_or_else(|e| e.into_inner())
+            .extend(from / PAGE..to.div_ceil(PAGE));
+    }
+
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
         self.changed

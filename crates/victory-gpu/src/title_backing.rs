@@ -18,11 +18,15 @@ pub struct WritebackTarget {
 pub type WritebackPage =
     fn(usize, usize, &BackingPins, bool, &mut dyn FnMut(WritebackTarget)) -> bool;
 
-static BACKING: OnceLock<(BackingPinner, WritebackPage)> = OnceLock::new();
+/// A visitor receives (title start, source address or unmapped, bytes,
+/// same physical binding). A temporary source is valid only in the visitor.
+pub type ReadRuns = fn(usize, usize, &BackingPins, &mut dyn FnMut(usize, Option<usize>, usize, bool));
+
+static BACKING: OnceLock<(BackingPinner, WritebackPage, ReadRuns)> = OnceLock::new();
 
 /// Installed by the runtime before the title creates its D3D12 device.
-pub fn use_backing(pinner: BackingPinner, writeback: WritebackPage) {
-    let _ = BACKING.set((pinner, writeback));
+pub fn use_backing(pinner: BackingPinner, writeback: WritebackPage, read: ReadRuns) {
+    let _ = BACKING.set((pinner, writeback, read));
 }
 
 #[derive(Default)]
@@ -43,12 +47,22 @@ impl SubmissionBacking {
             return;
         }
         merge(&mut self.pending);
-        if let Some((pin, _)) = BACKING.get() {
+        if let Some((pin, _, _)) = BACKING.get() {
             // Called without a GPU page table/descriptor/shadow registry lock.
             pin(&self.pending, &mut self.pins);
         }
         self.pending.clear();
     }
+    pub(crate) fn read_runs(
+        &self, start: usize, end: usize, mut visit: impl FnMut(usize, Option<usize>, usize, bool),
+    ) {
+        if let Some((_, _, read)) = BACKING.get() {
+            read(start, end, &self.pins, &mut visit);
+        } else {
+            visit(start, Some(start), end - start, true);
+        }
+    }
+
     /// For marked writes without a stable before-image, retain the stale
     /// destination guard. Only a computed byte delta can be redirected.
     pub(crate) fn write_page<T>(&self, address: usize, write: impl FnOnce() -> T) -> Option<T> {
@@ -64,7 +78,7 @@ impl SubmissionBacking {
     fn write_target<T>(
         &self, address: usize, len: usize, redirect: bool, write: impl FnOnce(WritebackTarget) -> T,
     ) -> Option<T> {
-        let Some((_, with_page)) = BACKING.get() else {
+        let Some((_, with_page, _)) = BACKING.get() else {
             return Some(write(WritebackTarget { address, original_va: true }));
         };
         let mut write = Some(write);

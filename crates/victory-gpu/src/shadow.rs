@@ -615,7 +615,14 @@ impl Shadow {
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
+    #[cfg(test)]
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.refresh_from_backing(address, len, &SubmissionBacking::default())
+    }
+
+    pub(crate) fn refresh_from_backing(
+        &self, address: usize, len: usize, backing: &SubmissionBacking,
+    ) -> usize {
         if self.in_place {
             return 0;
         }
@@ -642,19 +649,19 @@ impl Shadow {
             for (a, e) in busy {
                 let (a, e) = (a.max(from), e.min(to));
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, backing);
                 }
                 if e > a.max(at) {
-                    bytes += self.update_busy(a.max(at), e);
+                    bytes += self.update_busy(a.max(at), e, backing);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, backing);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(from, to, backing)
     }
 
     /// [`Shadow::update`] of `[from, to)` where a list submitted earlier
@@ -666,7 +673,7 @@ impl Shadow {
     /// removed). The same bytes go into the snapshot `writing` took, so
     /// copy-back neither takes them for the GPU's nor puts them back over a
     /// later title write.
-    fn update_busy(&self, from: usize, to: usize) -> usize {
+    fn update_busy(&self, from: usize, to: usize, backing: &SubmissionBacking) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -678,7 +685,7 @@ impl Shadow {
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut copied = 0;
         for (a, b) in runs {
-            copied += self.copy(a, b);
+            copied += self.copy(a, b, backing);
             let (a, b) = (a - start, b - start);
             for (at, bytes) in before.0.iter_mut() {
                 let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
@@ -695,7 +702,7 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes: the pages changed since taken, or all of it where the
     /// memory is not tracked.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(&self, from: usize, to: usize, backing: &SubmissionBacking) -> usize {
         if let Some(t) = &self.tracked {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
@@ -703,7 +710,7 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
             // Cut to the range: next to it shaders may be writing the copy.
-            let copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
+            let copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b, backing)).sum();
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -715,7 +722,7 @@ impl Shadow {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        self.copy(from, to, backing);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -726,12 +733,22 @@ impl Shadow {
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
-    fn copy(&self, from: usize, to: usize) -> usize {
+    fn copy(&self, from: usize, to: usize, backing: &SubmissionBacking) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        backing.read_runs(from, to, |address, source, bytes, same| {
+            // SAFETY: the visitor yields pieces within the copy's range.
+            let dest = unsafe { self.data.add(address - start) };
+            if let Some(source) = source {
+                crate::host::copy_mapped(dest, source as *const u8, bytes, false);
+            } else {
+                // SAFETY: the destination piece is in our mapped buffer.
+                unsafe { dest.write_bytes(0, bytes) };
+            }
+            if !same && let Some(tracked) = &self.tracked {
+                tracked.refresh_again(address, address + bytes);
+            }
+        });
         to - from
     }
 }

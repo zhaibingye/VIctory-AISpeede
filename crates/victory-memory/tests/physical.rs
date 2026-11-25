@@ -132,4 +132,8 @@ fn writeback_snapshot_keeps_original_identity_across_partial_overlaps() {
     assert_eq!(pins.expected(2 * PAGE + PAGE / 2), Some(old.offset(1)));
     assert_eq!(pins.expected(3 * PAGE), None);
     assert_eq!(pins.expected(4 * PAGE), None);
+    assert_eq!(pins.run_at(PAGE + 15, 2 * PAGE), (2 * PAGE, Some(old)));
+    assert_eq!(pins.run_at(2 * PAGE + 7, 4 * PAGE), (3 * PAGE, Some(old.offset(1))));
+    assert_eq!(pins.run_at(3 * PAGE, 5 * PAGE), (4 * PAGE, None));
+    assert_eq!(pins.run_at(4 * PAGE, 5 * PAGE), (5 * PAGE, None));
 }

@@ -22,7 +22,7 @@ extern "system" fn create_device(
     #[cfg(windows)]
     {
         victory_gpu::title_backing::use_backing(
-            super::xmem::pin_backing, super::xmem::with_writeback_page,
+            super::xmem::pin_backing, super::xmem::with_writeback_page, super::xmem::read_backing_runs,
         );
         victory_gpu::on_failure(host_gpu_failed);
     }

@@ -181,11 +181,19 @@ impl BackingPins {
         }
     }
 
-    pub fn expected(&self, address: usize) -> Option<PhysicalPage> {
-        let (&start, &(end, first)) = self.mappings.range(..=address).next_back()?;
-        if address >= end {
-            return None;
+    /// End of the current run (clipped to `end`) and the first page at
+    /// `address`. Holes are also returned so a caller can make progress.
+    pub fn run_at(&self, address: usize, end: usize) -> (usize, Option<PhysicalPage>) {
+        if let Some((&start, &(limit, first))) = self.mappings.range(..=address).next_back()
+            && address < limit
+        {
+            return (limit.min(end), first.map(|p| p.offset((address - start) / PAGE_BYTES as usize)));
         }
-        first.map(|p| p.offset((address - start) / PAGE_BYTES as usize))
+        let limit = self.mappings.range(address..).next().map_or(end, |(&next, _)| end.min(next));
+        (limit, None)
+    }
+
+    pub fn expected(&self, address: usize) -> Option<PhysicalPage> {
+        self.run_at(address, usize::MAX).1
     }
 }
