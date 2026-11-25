@@ -35,7 +35,7 @@ impl ResourcePlan {
         )
     }
 
-    fn transition_texture(
+    pub(crate) fn transition_texture(
         &mut self, list: &HostList, copy: &Arc<HostTexture>, wanted: u32,
     ) -> Result<(), BatchError> {
         let writable = 0x4 | 0x8 | 0x10 | 0x400 | 0x1000;

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::host::{Host, HostList};
 use crate::page_queue::PageDescriptors;
 use crate::page_slabs::{BatchError, PinnedBatch};
-use crate::page_texture::LinearTexture;
+use crate::page_texture::TextureInput;
 use crate::pipeline::host::HostPipeline;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -210,7 +210,7 @@ fn closed_draw_relocates_table_byte_offsets_without_changing_constants() {
 #[derive(Default)]
 pub(crate) struct ShaderBindings {
     pub(crate) constants: Vec<RootWords>,
-    pub(crate) texture_tables: BTreeMap<u8, BTreeMap<u32, LinearTexture>>,
+    pub(crate) texture_tables: BTreeMap<u8, BTreeMap<u32, TextureInput>>,
     cbvs: Vec<(u32, ConstantSpan)>,
 }
 
@@ -266,7 +266,7 @@ impl ShaderBindings {
     pub(crate) fn capture(
         pipeline: &HostPipeline,
         values: impl Fn(u8, u32) -> Option<u32>,
-        texture: impl Fn(u8, u32) -> Option<LinearTexture>,
+        texture: impl Fn(u8, u32) -> Option<TextureInput>,
         address: impl Fn(u8) -> Option<u64>,
     ) -> Result<Self, UnloweredShader> {
         if pipeline.marks.is_some() {
@@ -314,22 +314,28 @@ impl ShaderBindings {
         ranges.extend(self.cbvs.iter().map(|(_, span)| span.range()));
         for table in self.texture_tables.values() {
             for texture in table.values() {
-                ranges.extend(texture.rows()?);
+                texture.ranges(ranges)?;
             }
         }
         Ok(())
     }
 
+    pub(crate) fn samples_target(&self, target: &crate::resource::HostTexture) -> bool {
+        self.texture_tables.values().flat_map(|table| table.values())
+            .any(|view| view.aliases_target(target))
+    }
+
     pub(crate) fn prepare(
         &self, host: &Host, list: &HostList, batch: &PinnedBatch,
         descriptors: &mut PageDescriptors<'_>,
+        plan: &mut crate::page_resource::ResourcePlan,
     ) -> Result<PreparedShader, BatchError> {
         let mut bases = BTreeMap::new();
         for (&root, table) in &self.texture_tables {
             let size = table.last_key_value().expect("captured slots exist").0 + 1;
             let mut views = vec![None; size as usize];
-            for (&index, &texture) in table {
-                views[index as usize] = Some((texture.encode(host, list, batch)?, texture.format));
+            for (&index, texture) in table {
+                views[index as usize] = Some(texture.encode(host, list, batch, plan)?);
             }
             let first = descriptors.reserve_texture_run(&views).map_err(BatchError::Native)?;
             bases.insert(root, first);

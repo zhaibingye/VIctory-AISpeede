@@ -6,7 +6,7 @@ use crate::page_indirect::{IndirectArgs, IndirectKind};
 use crate::page_queue::PageDescriptors;
 use crate::page_shader::{ShaderBindings, UnloweredShader};
 use crate::page_slabs::{BatchError, PinnedBatch};
-use crate::page_texture::LinearTexture;
+use crate::page_texture::TextureInput;
 use crate::pipeline::host::HostPipeline;
 
 pub(crate) enum DispatchCall {
@@ -25,7 +25,7 @@ impl ClosedDispatch {
     pub(crate) fn capture(
         pipeline: &HostPipeline,
         constants: impl Fn(u8, u32) -> Option<u32>,
-        texture: impl Fn(u8, u32) -> Option<LinearTexture>,
+        texture: impl Fn(u8, u32) -> Option<TextureInput>,
         address: impl Fn(u8) -> Option<u64>,
         call: DispatchCall,
     ) -> Result<Self, UnloweredShader> {
@@ -61,13 +61,14 @@ impl ClosedDispatch {
     pub(crate) fn encode(
         &self, host: &Host, list: &HostList, batch: &PinnedBatch,
         budget: &mut Option<ID3D12Resource>, descriptors: &mut PageDescriptors<'_>,
+        plan: &mut crate::page_resource::ResourcePlan,
     ) -> Result<(), BatchError> {
         let args = if let DispatchCall::Indirect(args) = self.call {
             Some(args.prepare(host, list, batch, budget)?)
         } else {
             None
         };
-        let words = self.shader.prepare(host, list, batch, descriptors)?;
+        let words = self.shader.prepare(host, list, batch, descriptors, plan)?;
         list.keep(&self.pipeline);
         list.keep(&self.root);
         // SAFETY: the root and pipeline match the captured shader, with

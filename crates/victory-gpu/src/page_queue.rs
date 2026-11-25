@@ -230,7 +230,7 @@ impl Host {
                     PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty)?,
                     PageOp::UploadTexture(upload) => upload.encode(self, list, batch, targets)?,
                     PageOp::Input(input) => input.encode(self, list, batch)?,
-                    PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors)?,
+                    PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors, targets)?,
                     PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets)?,
                     PageOp::Clear(clear) => clear.encode(self, list, targets)?,
                     PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,

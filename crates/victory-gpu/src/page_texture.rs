@@ -10,6 +10,65 @@ use windows::core::Error;
 use crate::host::{Host, HostList, transition};
 use crate::page_slabs::{BatchError, PinnedBatch};
 
+/// One admitted shader view. Linear views source exactly the captured
+/// title pages; native views consume the ordered attachment authority.
+pub(crate) enum TextureInput {
+    Linear(LinearTexture),
+    Native {
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        format: DXGI_FORMAT,
+    },
+}
+
+impl TextureInput {
+    pub(crate) fn native(
+        copy: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT,
+    ) -> Option<Self> {
+        // SAFETY: the resource is retained by the view.
+        let desc = unsafe { copy.texture.GetDesc() };
+        if !matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM)
+            || desc.Format != format || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
+            || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
+            || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+            || desc.Flags.0 & (D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0) != 0
+            || copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
+        {
+            return None;
+        }
+        Some(Self::Native { copy, format })
+    }
+
+    pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
+        if let Self::Linear(input) = self {
+            ranges.extend(input.rows()?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn aliases_target(&self, target: &crate::resource::HostTexture) -> bool {
+        matches!(self, Self::Native { copy, .. } if copy.texture == target.texture)
+    }
+
+    pub(crate) fn encode(
+        &self, host: &Host, list: &HostList, batch: &PinnedBatch,
+        plan: &mut crate::page_resource::ResourcePlan,
+    ) -> Result<(ID3D12Resource, DXGI_FORMAT), BatchError> {
+        match self {
+            Self::Linear(input) => Ok((input.encode(host, list, batch)?, input.format)),
+            Self::Native { copy, format } => {
+                if !plan.authoritative(copy) {
+                    return Err(BatchError::TargetNotInitialized);
+                }
+                let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                plan.transition_texture(list, copy, state.0 as u32)?;
+                list.keep(&copy.texture);
+                Ok((copy.texture.clone(), *format))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct LinearTexture {
     pub(crate) address: u64,

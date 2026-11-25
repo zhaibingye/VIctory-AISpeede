@@ -274,7 +274,7 @@ impl ClosedDraw {
     pub(crate) fn from_translated(
         pipeline: &crate::pipeline::host::HostPipeline,
         values: impl Fn(u8, u32) -> Option<u32>,
-        texture: impl Fn(u8, u32) -> Option<crate::page_texture::LinearTexture>,
+        texture: impl Fn(u8, u32) -> Option<crate::page_texture::TextureInput>,
         address: impl Fn(u8) -> Option<u64>,
         target: ColorTarget,
         depth: Option<DepthTarget>,
@@ -298,6 +298,9 @@ impl ClosedDraw {
             return Err(UnloweredShader::GraphicsState);
         }
         let shader = ShaderBindings::capture(pipeline, values, texture, address)?;
+        if shader.samples_target(&target.copy) {
+            return Err(UnloweredShader::GraphicsState);
+        }
         Ok(Self {
             pipeline: pipeline.pso.clone(), root: pipeline.root.clone(),
             target, depth, stencil_ref, topology, viewport, scissor, inputs, call, shader,
@@ -331,7 +334,7 @@ impl ClosedDraw {
         batch: &PinnedBatch,
         budget: &mut Option<ID3D12Resource>,
         descriptors: &mut crate::page_queue::PageDescriptors<'_>,
-        initialized: &ResourcePlan,
+        initialized: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
         if !self.target.authoritative(initialized)
             || self.depth.as_ref().is_some_and(|d| !d.authoritative(initialized))
@@ -344,7 +347,7 @@ impl ClosedDraw {
         };
         let sample = self.sample.as_ref()
             .map(|input| input.prepare(host, list, batch, descriptors)).transpose()?;
-        let words = self.shader.prepare(host, list, batch, descriptors)?;
+        let words = self.shader.prepare(host, list, batch, descriptors, initialized)?;
         for &input in &self.inputs {
             input.encode(host, list, batch)?;
         }
