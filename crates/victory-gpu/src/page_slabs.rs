@@ -306,6 +306,24 @@ impl PinnedBatch {
         Ok(Self { pages, aliases })
     }
 
+    /// Capture and pin in the same submission object that will own later
+    /// writeback. Duplicate draw/range requests are folded by physical ID.
+    pub(crate) fn capture(
+        host: &Host,
+        slabs: &mut PageSlabs,
+        backing: &mut crate::title_backing::SubmissionBacking,
+        ranges: &[(u64, u64)],
+    ) -> std::result::Result<Self, BatchError> {
+        for &(start, end) in ranges {
+            if start > end || end > ADDRESS_LIMIT {
+                return Err(BatchError::Range(start, end));
+            }
+            backing.include(start as usize, end as usize);
+        }
+        backing.flush();
+        Self::from_capture(host, slabs, backing.pins(), ranges)
+    }
+
     /// The first captured VA is a source handle, not a new physical ID.
     pub(crate) fn pages(&self) -> impl Iterator<Item = (PhysicalPage, u64, &PinnedPage)> {
         self.pages.iter().map(|(&id, (va, pin))| (id, *va, pin))
@@ -347,6 +365,92 @@ impl PinnedBatch {
             let (initialized, written) = access(physical);
             slabs.submitted(pin, signal, initialized, written);
         }
+    }
+}
+
+/// Budgeted CPU-visible before-images. The same allocation supplies GPU
+/// copies and post-fence byte comparison, avoiding a second full CPU copy.
+pub(crate) struct CapturedUploads<'a> {
+    batch: &'a PinnedBatch,
+    staging: ID3D12Resource,
+    mapped: std::ptr::NonNull<u8>,
+    offsets: BTreeMap<PhysicalPage, usize>,
+}
+
+impl<'a> CapturedUploads<'a> {
+    pub(crate) fn stage(
+        host: &Host,
+        batch: &'a PinnedBatch,
+        backing: &crate::title_backing::SubmissionBacking,
+    ) -> std::result::Result<Option<Self>, BatchError> {
+        const PAGE: usize = PAGE_BYTES as usize;
+        if batch.pages.is_empty() {
+            return Ok(None);
+        }
+        let bytes = batch
+            .pages
+            .len()
+            .checked_mul(PAGE)
+            .ok_or_else(|| BatchError::Native(Error::from(E_OUTOFMEMORY)))?;
+        let (staging, data) = host
+            .shared_buffer(bytes as u64)
+            .ok_or_else(|| BatchError::Native(Error::from(E_OUTOFMEMORY)))?;
+        let mapped = std::ptr::NonNull::new(data)
+            .ok_or_else(|| BatchError::Native(Error::from(E_INVALIDARG)))?;
+        let mut offsets = BTreeMap::new();
+        for (i, (id, va, _)) in batch.pages().enumerate() {
+            let offset = i * PAGE;
+            // SAFETY: staging is still exclusively CPU-owned; one slot in
+            // its committed mapping and no other reference to the bytes.
+            let dest = unsafe {
+                let at = mapped.as_ptr().add(offset);
+                at.write_bytes(0, PAGE);
+                std::slice::from_raw_parts_mut(at, PAGE)
+            };
+            if !backing.stage_page(va as usize, id, dest) {
+                return Err(BatchError::NotCaptured(va));
+            }
+            offsets.insert(id, offset);
+        }
+        Ok(Some(Self {
+            batch,
+            staging,
+            mapped,
+            offsets,
+        }))
+    }
+
+    pub(crate) fn record(&self, list: &HostList) {
+        let entries: Vec<_> = self
+            .batch
+            .pages()
+            .map(|(id, _, page)| Transfer {
+                page,
+                staging: &self.staging,
+                offset: self.offsets[&id] as u64,
+            })
+            .collect();
+        upload(list, &entries);
+    }
+
+    /// Called after actual readback completion. A failed merge leaves
+    /// dirty residency pinned for recovery; it must not recycle the slot.
+    pub(crate) fn merge(
+        &self,
+        backing: &crate::title_backing::SubmissionBacking,
+        page: PhysicalPage,
+        gpu: &[u8],
+        scratch: &mut [u8],
+    ) -> bool {
+        let Some((&offset, &(va, _))) = self.offsets.get(&page).zip(self.batch.pages.get(&page))
+        else {
+            return false;
+        };
+        // SAFETY: fully initialized snapshot; our GPU lists only read it.
+        let before = unsafe {
+            std::slice::from_raw_parts(self.mapped.as_ptr().add(offset), PAGE_BYTES as usize)
+        };
+        backing.merge_page(va as usize, page, before, gpu, scratch)
     }
 }
 
