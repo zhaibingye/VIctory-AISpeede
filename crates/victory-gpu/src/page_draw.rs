@@ -43,20 +43,82 @@ impl ColorTarget {
         copy: Arc<HostTexture>,
         desc: Option<D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> Option<Self> {
+        if !copy.host_written.load(Ordering::Acquire) {
+            return None;
+        }
+        Self::capture_candidate(copy, desc)
+    }
+
+    pub(crate) fn capture_candidate(
+        copy: Arc<HostTexture>,
+        desc: Option<D3D12_RENDER_TARGET_VIEW_DESC>,
+    ) -> Option<Self> {
         // SAFETY: the retained COM object is live.
         let tex = unsafe { copy.texture.GetDesc() };
         if copy.sparse.is_some()
-            || !copy.host_written.load(Ordering::Acquire)
             || tex.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
             || tex.SampleDesc.Count != 1
             || tex.DepthOrArraySize != 1
             || tex.MipLevels != 1
             || tex.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0
-            || desc.as_ref().is_some_and(|d| d.ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D)
+            || desc.as_ref().is_some_and(|d| {
+                if d.ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D {
+                    return true;
+                }
+                // SAFETY: the dimension selects this union variant.
+                let view = unsafe { d.Anonymous.Texture2D };
+                view.MipSlice != 0 || view.PlaneSlice != 0
+            })
         {
             return None;
         }
         Some(Self { copy, desc })
+    }
+
+    fn key(&self) -> usize {
+        Arc::as_ptr(&self.copy) as usize
+    }
+
+    fn authoritative(&self, initialized: &TargetWrites) -> bool {
+        self.copy.host_written.load(Ordering::Acquire) || initialized.contains_key(&self.key())
+    }
+}
+
+pub(crate) type TargetWrites = BTreeMap<usize, Arc<HostTexture>>;
+
+pub(crate) struct ColorClear {
+    pub(crate) target: ColorTarget,
+    pub(crate) color: [f32; 4],
+    pub(crate) rects: Vec<RECT>,
+}
+
+impl ColorClear {
+    pub(crate) fn encode(
+        &self, host: &Host, list: &HostList, initialized: &mut TargetWrites,
+    ) -> Result<(), BatchError> {
+        if !self.rects.is_empty() && !self.target.authoritative(initialized) {
+            return Err(BatchError::TargetNotInitialized);
+        }
+        let texture = &self.target.copy.texture;
+        let before = D3D12_RESOURCE_STATES(self.target.copy.state.load(Ordering::Acquire) as i32);
+        let after = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        let rtv = host.rtv(texture, self.target.desc.as_ref());
+        list.keep(texture);
+        // SAFETY: target and native RTV are validated and retained. We
+        // scope transitions to the clear under the submission lock.
+        unsafe {
+            let cmd = list.recording();
+            if before != after {
+                cmd.ResourceBarrier(&[transition(texture, before, after)]);
+            }
+            let rects = (!self.rects.is_empty()).then_some(self.rects.as_slice());
+            cmd.ClearRenderTargetView(rtv, &self.color, rects);
+            if before != after {
+                cmd.ResourceBarrier(&[transition(texture, after, before)]);
+            }
+        }
+        initialized.insert(self.target.key(), self.target.copy.clone());
+        Ok(())
     }
 }
 
@@ -190,7 +252,11 @@ impl ClosedDraw {
         batch: &PinnedBatch,
         budget: &mut Option<ID3D12Resource>,
         descriptors: &mut crate::page_queue::PageDescriptors<'_>,
+        initialized: &TargetWrites,
     ) -> Result<(), BatchError> {
+        if !self.target.authoritative(initialized) {
+            return Err(BatchError::TargetNotInitialized);
+        }
         let indirect = match self.call {
             DrawCall::Indirect(draw) => Some(draw.prepare(host, list, batch, budget)?),
             _ => None,

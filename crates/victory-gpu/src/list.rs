@@ -712,24 +712,43 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
-        else {
+        let Some(list) = host_list(this) else { return };
+        let Some(record) = crate::descriptor::rtv_record(handle) else {
+            if cfg!(feature = "paged-title") { list.mark_unlowered(); }
             return;
         };
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
         ) else {
+            if cfg!(feature = "paged-title") { list.mark_unlowered(); }
             return;
         };
         // SAFETY: the title passes four floats (null is tolerated).
         let Some(color) = (unsafe { color.as_ref() }) else {
+            if cfg!(feature = "paged-title") { list.mark_unlowered(); }
             return;
         };
+        if cfg!(feature = "paged-title") && count > 0 && rects.is_null() {
+            list.mark_unlowered();
+            return;
+        }
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        if cfg!(feature = "paged-title") {
+            let Some(target) = crate::resource::host_copy(record.resource)
+                .and_then(|copy| crate::page_draw::ColorTarget::capture_candidate(copy, record.desc()))
+            else {
+                list.mark_unlowered();
+                return;
+            };
+            list.record_page_clear(crate::page_draw::ColorClear {
+                target, color: *color, rects: rects.unwrap_or_default().to_vec(),
+            });
+            return;
+        }
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(texture, record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.

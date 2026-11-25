@@ -36,6 +36,7 @@ pub(crate) enum PageOp {
     Copy(GuestCopy),
     Input(InputView),
     Draw(std::sync::Arc<crate::page_draw::ClosedDraw>),
+    Clear(std::sync::Arc<crate::page_draw::ColorClear>),
 }
 
 struct Completion {
@@ -120,7 +121,7 @@ impl Host {
         ranges: &[(u64, u64)],
         record: impl FnOnce(&HostList, PageRoots) -> Result<()>,
     ) -> std::result::Result<PageStats, BatchError> {
-        self.execute_paged_work(heap, backing, ranges, |list, roots, _, _, _| {
+        self.execute_paged_work(heap, backing, ranges, |list, roots, _, _, _, _| {
             record(list, roots).map_err(BatchError::Native)?;
             Ok(BTreeSet::new())
         })
@@ -175,9 +176,10 @@ impl Host {
                 }
                 PageOp::Input(input) => ranges.push(input.range()?),
                 PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
+                PageOp::Clear(_) => {},
             }
         }
-        self.execute_paged_work(heap, backing, &ranges, |list, _, batch, pins, descriptors| {
+        self.execute_paged_work(heap, backing, &ranges, |list, _, batch, pins, descriptors, targets| {
             let scratch = if max_copy > 0 {
                 let buffer = self.default_buffer(max_copy as u64)
                     .ok_or_else(|| BatchError::Native(oom()))?;
@@ -199,7 +201,8 @@ impl Host {
                             .map_err(BatchError::Native)?;
                     }
                     PageOp::Input(input) => input.encode(self, list, batch)?,
-                    PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors)?,
+                    PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets)?,
+                    PageOp::Clear(clear) => clear.encode(self, list, targets)?,
                 }
             }
             Ok(dirty)
@@ -217,6 +220,7 @@ impl Host {
             &PinnedBatch,
             &BackingPins,
             &mut PageDescriptors<'_>,
+            &mut crate::page_draw::TargetWrites,
         ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
     ) -> std::result::Result<PageStats, BatchError> {
         let mut signal = self.direct_queue();
@@ -251,6 +255,7 @@ fn run(
         &PinnedBatch,
         &BackingPins,
         &mut PageDescriptors<'_>,
+        &mut crate::page_draw::TargetWrites,
     ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
 ) -> std::result::Result<Completion, BatchError> {
     let native = BatchError::Native;
@@ -298,7 +303,8 @@ fn run(
     };
     let uploaded = uploads.as_ref().map_or(0, |stage| stage.record(&list));
     barrier(&list, slabs.values().copied(), false);
-    let declared_dirty = record(&list, roots, batch, backing.pins(), &mut pairs)?;
+    let mut targets = crate::page_draw::TargetWrites::new();
+    let declared_dirty = record(&list, roots, batch, backing.pins(), &mut pairs, &mut targets)?;
     barrier(&list, slabs.values().copied(), true);
     list.close();
     let command = list.recording().cast().map_err(native)?;
@@ -307,6 +313,11 @@ fn run(
         .unwrap_or_else(|e| fail(format_args!("native paged render submission: {e}")));
     if host.completed_fence().is_none() {
         fail(format_args!("native paged device was removed"));
+    }
+
+    // Publish authority only after the native queue really executed it.
+    for target in targets.into_values() {
+        target.host_written.store(true, std::sync::atomic::Ordering::Release);
     }
 
     // SAFETY: the rendering fence completed; this bitmap is fully
@@ -716,7 +727,7 @@ fn paged_input_views_gather_cross_page_gpu_writes() {
     assert_eq!(view.range().unwrap(), indexed.range().unwrap());
     let [src, dst] = copy.ranges();
     let ranges = [src, dst, view.range().unwrap()];
-    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins, _| {
+    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins, _, _| {
         let scratch = host.default_buffer(copy.len as u64).unwrap();
         list.keep(&scratch);
         let mut dirty = BTreeSet::new();
@@ -769,7 +780,7 @@ fn paged_linear_texture_uses_ordered_gpu_writes_and_pitched_rows() {
     };
     let ranges: Vec<_> = copy.ranges().into_iter().chain(texture.rows().unwrap()).collect();
     let mut output = None;
-    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins, _| {
+    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins, _, _| {
         let scratch = host.default_buffer(copy.len as u64).unwrap();
         list.keep(&scratch);
         let mut dirty = BTreeSet::new();

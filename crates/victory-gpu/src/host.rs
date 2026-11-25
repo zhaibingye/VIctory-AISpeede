@@ -912,6 +912,7 @@ enum Step {
     /// existing renderer still records its native binding separately.
     PageInput(crate::page_view::InputView),
     PageDraw(std::sync::Arc<crate::page_draw::ClosedDraw>),
+    PageClear(std::sync::Arc<crate::page_draw::ColorClear>),
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
@@ -1708,7 +1709,7 @@ impl HostList {
         if !deferred.writes.is_empty()
             || !deferred.after.is_empty()
             || !deferred.missed.is_empty()
-            || deferred.copies.iter().any(|step| !matches!(step, Step::Copy(_) | Step::PageInput(_) | Step::PageDraw(_)))
+            || deferred.copies.iter().any(|step| !matches!(step, Step::Copy(_) | Step::PageInput(_) | Step::PageDraw(_) | Step::PageClear(_)))
         {
             return false;
         }
@@ -1716,6 +1717,7 @@ impl HostList {
             Step::Copy(copy) => Some(crate::page_queue::PageOp::Copy(*copy)),
             Step::PageInput(view) => Some(crate::page_queue::PageOp::Input(*view)),
             Step::PageDraw(draw) => Some(crate::page_queue::PageOp::Draw(draw.clone())),
+            Step::PageClear(clear) => Some(crate::page_queue::PageOp::Clear(clear.clone())),
             _ => None,
         }));
         true
@@ -2092,6 +2094,10 @@ impl HostList {
         self.deferred().copies.push(Step::PageDraw(std::sync::Arc::new(draw)));
     }
 
+    pub(crate) fn record_page_clear(&self, clear: crate::page_draw::ColorClear) {
+        self.deferred().copies.push(Step::PageClear(std::sync::Arc::new(clear)));
+    }
+
     pub(crate) fn record_page_input(&self, view: crate::page_view::InputView) {
         self.deferred().copies.push(Step::PageInput(view));
     }
@@ -2339,7 +2345,7 @@ impl HostList {
         for step in &self.deferred().copies {
             match step {
                 Step::PageInput(_) => continue,
-                Step::PageDraw(_) => fail(format_args!("closed paged draw reached legacy submission")),
+                Step::PageDraw(_) | Step::PageClear(_) => fail(format_args!("paged graphics reached legacy submission")),
                 _ => {}
             }
             let started = std::time::Instant::now();
@@ -2348,7 +2354,7 @@ impl HostList {
                 started,
                 match step {
                     Step::Refresh(..) => C::StepRefreshUs,
-                    Step::PageInput(_) | Step::PageDraw(_) => unreachable!("handled before timing"),
+                    Step::PageInput(_) | Step::PageDraw(_) | Step::PageClear(_) => unreachable!("handled before timing"),
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
                     Step::Run(_) | Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
@@ -2358,7 +2364,7 @@ impl HostList {
                 },
             );
             let copied = match step {
-                Step::PageInput(_) | Step::PageDraw(_) => unreachable!("handled before legacy execution"),
+                Step::PageInput(_) | Step::PageDraw(_) | Step::PageClear(_) => unreachable!("handled before legacy execution"),
                 &Step::Copy(crate::copy_plan::GuestCopy { dst, src, len }) => {
                     #[cfg(feature = "diagnostics")]
                     {

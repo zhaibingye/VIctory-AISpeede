@@ -354,7 +354,7 @@ impl State {
             let desc = record.desc();
             if handles.len() == 1 && depth == 0 {
                 self.page_target = crate::resource::host_copy(record.resource)
-                    .and_then(|copy| crate::page_draw::ColorTarget::capture(copy, desc));
+                    .and_then(|copy| crate::page_draw::ColorTarget::capture_candidate(copy, desc));
             }
             if !cfg!(feature = "paged-title") {
                 rtvs.push(host.rtv(texture, desc.as_ref()));
