@@ -96,3 +96,30 @@ fn admission_evicts_a_dirty_non_operand_and_preserves_its_bytes() {
     assert_eq!(pages.transfers().downloaded_pages, 1);
     assert_eq!(pages.read(c).unwrap(), input.as_ref());
 }
+
+#[test]
+fn slab_capacity_is_bounded_and_reused_until_the_last_slot_leaves() {
+    let mut pages = Pages::new(device(), 4 * PAGE_BYTES, 0).unwrap();
+    let a = pages.commit(0).unwrap();
+    let b = pages.commit(PAGE_BYTES).unwrap();
+    let c = pages.commit(2 * PAGE_BYTES).unwrap();
+    let input = pattern(0x32);
+    pages.write(a, &input).unwrap();
+    pages.copy_page(a, b).unwrap();
+    assert_eq!(pages.local_heap_bytes(), 4 * PAGE_BYTES);
+    assert_eq!(pages.used(Pool::Local), 2 * PAGE_BYTES);
+
+    pages.evict(b).unwrap(); // A still retains the underlying native heap.
+    assert_eq!(pages.local_heap_bytes(), 4 * PAGE_BYTES);
+    pages.copy_page(a, c).unwrap();
+    assert_eq!(pages.local_heap_bytes(), 4 * PAGE_BYTES);
+    assert_eq!(pages.read(c).unwrap(), input.as_ref());
+    // The live pages fit in a nominal two-page cap, but the actual four-page
+    // slab does not. Reclaim before admitting any more buffers.
+    pages.set_local_budget(2 * PAGE_BYTES, 0).unwrap();
+    assert_eq!(pages.local_heap_bytes(), 0);
+    assert_eq!(pages.read(b).unwrap(), input.as_ref());
+    pages.copy_page(a, c).unwrap();
+    assert_eq!(pages.local_heap_bytes(), 2 * PAGE_BYTES);
+    assert_eq!(pages.read(c).unwrap(), input.as_ref());
+}

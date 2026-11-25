@@ -2,6 +2,7 @@
 //! owns its copy queue and resources. It is not yet the game's renderer backend.
 
 mod copy;
+mod slabs;
 
 use std::collections::BTreeMap;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -13,6 +14,7 @@ use crate::coherence::{Access, Invalid, Need};
 use crate::engine::{Engine, Error as PolicyError};
 use crate::guest::PageId;
 use copy::CopyQueue;
+use slabs::{Slabs, Slot};
 
 pub const PAGE_LEN: usize = PAGE_BYTES as usize;
 
@@ -24,6 +26,7 @@ pub enum Error {
     SamePage,
     QueueLost,
     FenceExhausted,
+    UnsupportedLocalPageLayout,
 }
 
 impl From<PolicyError> for Error {
@@ -46,7 +49,7 @@ impl From<DxError> for Error {
 
 struct Backing {
     ram: Box<[u8; PAGE_LEN]>,
-    local: Option<ID3D12Resource>,
+    local: Option<Slot>,
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -60,6 +63,7 @@ pub struct Pages {
     upload: ID3D12Resource,
     readback: ID3D12Resource,
     backing: BTreeMap<PageId, Backing>,
+    local: Slabs,
     policy: Engine,
     _staging_charge: Charge,
     transfers: Transfers,
@@ -80,6 +84,7 @@ impl Pages {
             upload,
             readback,
             backing: BTreeMap::new(),
+            local: Slabs::default(),
             policy,
             _staging_charge: staging_charge,
             transfers: Transfers::default(),
@@ -90,6 +95,11 @@ impl Pages {
         self.policy.used(pool)
     }
 
+    /// Real heap capacity, including unused slots in a partially used slab.
+    pub fn local_heap_bytes(&self) -> u64 {
+        self.local.bytes()
+    }
+
     pub fn transfers(&self) -> Transfers {
         self.transfers
     }
@@ -98,7 +108,7 @@ impl Pages {
     pub fn set_local_budget(&mut self, bytes: u64, unmanaged: u64) -> Result<(), Error> {
         self.queue.check()?;
         self.policy.set_local_budget(bytes, unmanaged);
-        while self.used(Pool::Local) > self.policy.local_limit() {
+        while self.local.bytes() > self.policy.local_limit() {
             let candidate = self.policy.candidate(self.queue.completed())
                 .ok_or(PolicyError::NotEvictable)?;
             self.evict(candidate)?;
@@ -180,8 +190,8 @@ impl Pages {
         self.sync_local(source)?;
         let before = self.queue.completed();
         let fence = self.queue.copy(
-            self.backing[&source].local.as_ref().expect("admitted source"),
-            self.backing[&dest].local.as_ref().expect("admitted destination"),
+            self.local.buffer(self.backing[&source].local.as_ref().expect("admitted source")),
+            self.local.buffer(self.backing[&dest].local.as_ref().expect("admitted destination")),
         )?;
         self.policy.page(source).expect("committed source").gpu_submitted(Access::Read, before, fence)?;
         self.policy.page(dest).expect("committed destination").gpu_submitted(Access::FullOverwrite, before, fence)?;
@@ -197,7 +207,9 @@ impl Pages {
         } else if need != Need::Ready {
             return Err(PolicyError::TransferRequired(need).into());
         }
-        drop(self.backing.get_mut(&id).expect("committed page").local.take());
+        let slot = self.backing.get_mut(&id).expect("committed page").local.take()
+            .expect("resident page owns a slot");
+        self.local.release(slot);
         self.policy.complete_eviction(id, self.queue.completed())?;
         Ok(())
     }
@@ -216,7 +228,7 @@ impl Pages {
         if self.backing[&id].local.is_some() {
             return Ok(());
         }
-        match self.queue.buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON) {
+        match self.local.allocate(&self.queue, self.policy.local_limit()) {
             Ok(local) => self.backing.get_mut(&id).expect("committed page").local = Some(local),
             Err(e) => {
                 self.policy.complete_eviction(id, self.queue.completed())?;
@@ -234,7 +246,7 @@ impl Pages {
             Need::Upload => {
                 let page = &self.backing[&id];
                 copy::write_upload(&self.upload, &page.ram)?;
-                let fence = self.queue.copy(&self.upload, page.local.as_ref().expect("admitted page"))?;
+                let fence = self.queue.copy(&self.upload, self.local.buffer(page.local.as_ref().expect("admitted page")))?;
                 state.upload_submitted(before, fence)?;
                 self.transfers.uploaded_pages += 1;
                 Ok(())
@@ -250,7 +262,7 @@ impl Pages {
             Need::Ready => Ok(()),
             Need::Download => {
                 let page = self.backing.get_mut(&id).expect("committed page");
-                let fence = self.queue.copy(page.local.as_ref().expect("GPU-owned page"), &self.readback)?;
+                let fence = self.queue.copy(self.local.buffer(page.local.as_ref().expect("GPU-owned page")), &self.readback)?;
                 // Never publish Both before the CPU mapping and byte copy succeed.
                 copy::read_back(&self.readback, &mut page.ram)?;
                 state.download_submitted(before, fence)?;

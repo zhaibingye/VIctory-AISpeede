@@ -1,5 +1,5 @@
 use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::DXGI_SAMPLE_DESC};
-use windows::core::Interface;
+use windows::core::{GUID, Interface};
 
 use super::{Error, PAGE_LEN};
 use crate::{PAGE_BYTES, coherence::Fence};
@@ -52,22 +52,60 @@ impl CopyQueue {
                     ..Default::default()
                 },
                 D3D12_HEAP_FLAG_NONE,
-                &D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: PAGE_BYTES,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    ..Default::default()
-                },
+                &page_desc(),
                 state,
                 None,
                 &mut out,
             )?;
         }
         Ok(out.expect("successful D3D12 resource creation"))
+    }
+
+    /// Real shared heap, with persistent, non-overlapping page buffers.
+    pub(super) fn local_slab(&self, pages: usize) -> Result<Vec<ID3D12Resource>, Error> {
+        self.check()?;
+        let mut heap: Option<ID3D12Heap> = None;
+        let size = pages as u64 * PAGE_BYTES;
+        let desc = page_desc();
+        // SAFETY: device is live and the descriptor is initialized.
+        let info = unsafe { self.device.GetResourceAllocationInfo(0, &[desc]) };
+        if info.SizeInBytes != PAGE_BYTES || info.Alignment != PAGE_BYTES {
+            return Err(Error::UnsupportedLocalPageLayout);
+        }
+        // SAFETY: known buffer-only heap, valid size and writable output.
+        unsafe {
+            self.device.CreateHeap(&D3D12_HEAP_DESC {
+                SizeInBytes: size,
+                Properties: D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    CreationNodeMask: 1,
+                    VisibleNodeMask: 1,
+                    ..Default::default()
+                },
+                Alignment: PAGE_BYTES,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+            }, &mut heap)?;
+        }
+        let heap = heap.expect("successful heap creation");
+        let mut buffers = Vec::with_capacity(pages);
+        for index in 0..pages {
+            let mut resource: Option<ID3D12Resource> = None;
+            // SAFETY: disjoint aligned 64 KiB slots within the live heap.
+            unsafe {
+                self.device.CreatePlacedResource(
+                    &heap, index as u64 * PAGE_BYTES, &desc,
+                    D3D12_RESOURCE_STATE_COMMON, None, &mut resource,
+                )?;
+            }
+            let buffer = resource.expect("successful placed buffer creation");
+            // The buffer holds its heap, even if an unrecoverable fence
+            // signal error quarantines resources beyond this allocator.
+            const HEAP: GUID = GUID::from_u128(0xa7ce7b2d_0fe3_48ed_8a0c_e1544d58c1c0);
+            // SAFETY: both COM objects are live, and the heap holds no buffer.
+            unsafe { buffer.SetPrivateDataInterface(&HEAP, &heap)? };
+            buffers.push(buffer);
+        }
+        Ok(buffers)
     }
 
     pub(super) fn copy(&mut self, src: &ID3D12Resource, dst: &ID3D12Resource) -> Result<Fence, Error> {
@@ -110,6 +148,19 @@ impl CopyQueue {
         }
         self.completed = Fence(value);
         Ok(self.completed)
+    }
+}
+
+fn page_desc() -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: PAGE_BYTES,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
     }
 }
 
