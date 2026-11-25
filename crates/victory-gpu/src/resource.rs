@@ -368,7 +368,7 @@ pub(crate) struct PlacedFootprint {
 
 impl PlacedFootprint {
     #[cfg(windows)]
-    pub(crate) fn linear_page_source(self, buffer: This) -> Option<crate::page_texture::LinearTexture> {
+    pub(crate) fn linear_page_view(self, buffer: This) -> Option<crate::page_texture::LinearTexture> {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         let (base, size) = buffer_bytes(buffer)?;
         if base.is_null() || self.depth != 1 {

@@ -92,6 +92,57 @@ impl LinearTexture {
         Ok(texture)
     }
 
+    fn native_footprint(self, host: &Host) -> Result<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64), BatchError> {
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut row_count, mut row_bytes, mut total) = (0, 0, 0);
+        // SAFETY: staging describes the cropped source, not the target,
+        // with one subresource and correctly sized output locations.
+        unsafe {
+            host.device.GetCopyableFootprints(&self.native_desc(), 0, 1, 0,
+                Some(&mut footprint), Some(&mut row_count), Some(&mut row_bytes), Some(&mut total));
+        }
+        if row_count != self.height || row_bytes != u64::from(self.width) * 4
+            || total == u64::MAX || total == 0 || footprint.Footprint.Depth != 1
+        {
+            return Err(BatchError::Native(E_FAIL.into()));
+        }
+        Ok((footprint, total))
+    }
+
+    /// Keep a native texture-to-linear copy on the GPU so subsequent
+    /// commands can observe it before the submission's single CPU merge.
+    pub(crate) fn copy_from(
+        self, host: &Host, list: &HostList, batch: &PinnedBatch, texture: &ID3D12Resource,
+        dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
+    ) -> Result<(), BatchError> {
+        let rows = self.rows()?;
+        let (footprint, total) = self.native_footprint(host)?;
+        let staging = host.default_buffer(total)
+            .ok_or_else(|| BatchError::Native(E_OUTOFMEMORY.into()))?;
+        list.keep(texture);
+        list.keep(&staging);
+        // SAFETY: caller supplies a retained exact native subresource
+        // in COPY_SOURCE. The separate budgeted staging buffer is in
+        // COPY_DEST and sized for the native footprint.
+        unsafe {
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&staging),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            list.recording().CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        let pitch = u64::from(footprint.Footprint.RowPitch);
+        crate::page_view::scatter_regions(list, batch, rows.enumerate().map(|(i, range)| {
+            (range, footprint.Offset + i as u64 * pitch)
+        }), &staging, dirty)
+    }
+
     /// Gather current GPU bytes at the exact point of use. The caller
     /// supplies a matching native subresource zero in COPY_DEST.
     pub(crate) fn copy_to(
@@ -110,19 +161,7 @@ impl LinearTexture {
         {
             return Err(BatchError::Native(E_FAIL.into()));
         }
-        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-        let (mut row_count, mut row_bytes, mut total) = (0, 0, 0);
-        // SAFETY: staging describes the cropped source, not the target,
-        // with one subresource and correctly sized output locations.
-        unsafe {
-            host.device.GetCopyableFootprints(&self.native_desc(), 0, 1, 0,
-                Some(&mut footprint), Some(&mut row_count), Some(&mut row_bytes), Some(&mut total));
-        }
-        if row_count != self.height || row_bytes != u64::from(self.width) * 4
-            || total == u64::MAX || total == 0 || footprint.Footprint.Depth != 1
-        {
-            return Err(BatchError::Native(E_FAIL.into()));
-        }
+        let (footprint, total) = self.native_footprint(host)?;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
         let read = D3D12_RESOURCE_STATE_COPY_SOURCE;
         let staging = host.default_buffer(total)

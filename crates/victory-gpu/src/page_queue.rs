@@ -36,6 +36,7 @@ pub(crate) struct PageStats {
 pub(crate) enum PageOp {
     Copy(GuestCopy),
     CopyTexture(std::sync::Arc<crate::page_resource::TextureCopy>),
+    ReadbackTexture(std::sync::Arc<crate::page_resource::TextureReadback>),
     UploadTexture(std::sync::Arc<crate::page_resource::TextureUpload>),
     Input(InputView),
     Draw(std::sync::Arc<crate::page_draw::ClosedDraw>),
@@ -196,6 +197,7 @@ impl Host {
                     max_copy = max_copy.max(copy.len);
                 }
                 PageOp::Input(input) => ranges.push(input.range()?),
+                PageOp::ReadbackTexture(readback) => readback.ranges(&mut ranges)?,
                 PageOp::UploadTexture(upload) => upload.ranges(&mut ranges)?,
                 PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
                 PageOp::ClearRaw(clear) => ranges.push(clear.range()?),
@@ -225,6 +227,7 @@ impl Host {
                             .map_err(BatchError::Native)?;
                     }
                     PageOp::CopyTexture(copy) => copy.encode(list, targets)?,
+                    PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty)?,
                     PageOp::UploadTexture(upload) => upload.encode(self, list, batch, targets)?,
                     PageOp::Input(input) => input.encode(self, list, batch)?,
                     PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors)?,

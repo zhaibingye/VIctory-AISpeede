@@ -1,8 +1,8 @@
 //! Materialize contiguous fixed-function input views from captured GPU
 //! pages at the point of use, including changes from earlier commands.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use victory_memory::{PAGE_BYTES, gpu_table::ADDRESS_LIMIT};
+use victory_memory::{PAGE_BYTES, gpu_table::ADDRESS_LIMIT, physical::PhysicalPage};
 use windows::Win32::Foundation::E_OUTOFMEMORY;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -143,13 +143,39 @@ pub(crate) fn gather_regions(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> Result<(), BatchError> {
-    let mut source = BTreeMap::new();
+    transfer_regions(list, batch, regions, buffer, before, after, None)
+}
+
+/// Scatter exact row bytes, not footprint padding, back into physical pages.
+pub(crate) fn scatter_regions(
+    list: &HostList,
+    batch: &PinnedBatch,
+    regions: impl IntoIterator<Item = ((u64, u64), u64)>,
+    buffer: &ID3D12Resource,
+    dirty: &mut BTreeSet<PhysicalPage>,
+) -> Result<(), BatchError> {
+    transfer_regions(list, batch, regions, buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_COPY_DEST, Some(dirty))
+}
+
+fn transfer_regions(
+    list: &HostList,
+    batch: &PinnedBatch,
+    regions: impl IntoIterator<Item = ((u64, u64), u64)>,
+    buffer: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+    dirty: Option<&mut BTreeSet<PhysicalPage>>,
+) -> Result<(), BatchError> {
+    let scatter = dirty.is_some();
+    let mut touched = BTreeMap::new();
+    let mut writes = BTreeMap::<PhysicalPage, BTreeMap<u64, u64>>::new();
     let mut pieces = Vec::new();
     // SAFETY: query a live buffer descriptor.
     let capacity = unsafe { buffer.GetDesc() }.Width;
-    for ((start, end), dst) in regions {
+    for ((start, end), staging) in regions {
         if start >= end || end > ADDRESS_LIMIT
-            || dst.checked_add(end - start).is_none_or(|stop| stop > capacity)
+            || staging.checked_add(end - start).is_none_or(|stop| stop > capacity)
         {
             return Err(BatchError::Range(start, end));
         }
@@ -158,8 +184,19 @@ pub(crate) fn gather_regions(
             let page = batch.pinned_at(va).ok_or(BatchError::NotCaptured(va))?;
             let offset = va % PAGE_BYTES;
             let count = (end - va).min(PAGE_BYTES - offset);
-            source.insert(page.slab(), page.buffer());
-            pieces.push((page.buffer(), page.offset() + offset, dst + (va - start), count));
+            if scatter {
+                // A guest footprint may alias itself via different VAs.
+                // Reject overlaps instead of racing copies to the same bytes.
+                let intervals = writes.entry(page.physical()).or_default();
+                if intervals.range(..offset + count).next_back()
+                    .is_some_and(|(_, &end)| end > offset)
+                {
+                    return Err(BatchError::Range(va, va + count));
+                }
+                intervals.insert(offset, offset + count);
+            }
+            touched.insert(page.slab(), page.buffer());
+            pieces.push((page.buffer(), page.offset() + offset, staging + (va - start), count));
             va += count;
         }
     }
@@ -171,20 +208,30 @@ pub(crate) fn gather_regions(
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     let read = D3D12_RESOURCE_STATE_COPY_SOURCE;
     let dest = D3D12_RESOURCE_STATE_COPY_DEST;
-    let mut gather: Vec<_> = source.values().map(|src| transition(src, uav, read)).collect();
-    if before != dest {
-        gather.push(transition(buffer, before, dest));
+    let (page_state, stage_state) = if scatter { (dest, read) } else { (read, dest) };
+    let mut begin: Vec<_> = touched.values().map(|page| transition(page, uav, page_state)).collect();
+    if before != stage_state {
+        begin.push(transition(buffer, before, stage_state));
     }
-    let finish: Vec<_> = source.values().map(|src| transition(src, read, uav))
-        .chain([transition(buffer, dest, after)]).collect();
-    // SAFETY: every source fits a pinned slot; the caller supplies a
-    // separate destination sized to the whole span in the given state.
+    let mut finish: Vec<_> = touched.values().map(|page| transition(page, page_state, uav)).collect();
+    if stage_state != after {
+        finish.push(transition(buffer, stage_state, after));
+    }
+    // SAFETY: every page segment fits a pinned slot, and the staging
+    // buffer is separate and sized to each validated transfer.
     unsafe {
-        cmd.ResourceBarrier(&gather);
-        for (src, from, to, count) in pieces {
-            cmd.CopyBufferRegion(buffer, to, src, from, count);
+        cmd.ResourceBarrier(&begin);
+        for (page, at, staging, count) in pieces {
+            if scatter {
+                cmd.CopyBufferRegion(page, at, buffer, staging, count);
+            } else {
+                cmd.CopyBufferRegion(buffer, staging, page, at, count);
+            }
         }
         cmd.ResourceBarrier(&finish);
+    }
+    if let Some(dirty) = dirty {
+        dirty.extend(writes.into_keys());
     }
     Ok(())
 }

@@ -2101,6 +2101,10 @@ impl HostList {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::ClearDepth(std::sync::Arc::new(clear))));
     }
 
+    pub(crate) fn record_page_texture_readback(&self, readback: crate::page_resource::TextureReadback) {
+        self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::ReadbackTexture(std::sync::Arc::new(readback))));
+    }
+
     pub(crate) fn record_page_texture_upload(&self, upload: crate::page_resource::TextureUpload) {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::UploadTexture(std::sync::Arc::new(upload))));
     }

@@ -156,6 +156,44 @@ impl TextureUpload {
     }
 }
 
+/// A full texture-to-buffer copy ending in pinned writable pages.
+pub(crate) struct TextureReadback {
+    source: Arc<HostTexture>,
+    target: crate::page_texture::LinearTexture,
+}
+
+impl TextureReadback {
+    pub(crate) fn capture(source: Arc<HostTexture>, target: crate::page_texture::LinearTexture) -> Option<Self> {
+        // SAFETY: the retained resource is live.
+        let desc = unsafe { source.texture.GetDesc() };
+        if !single_color(desc) || source.sparse.is_some()
+            || source.twin.get().is_some_and(Option::is_some)
+            || desc.Width != u64::from(target.width) || desc.Height != target.height
+            || desc.Format != target.format
+        {
+            return None;
+        }
+        Some(Self { source, target })
+    }
+
+    pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
+        ranges.extend(self.target.rows()?);
+        Ok(())
+    }
+
+    pub(crate) fn encode(
+        &self, host: &crate::host::Host, list: &HostList, batch: &crate::page_slabs::PinnedBatch,
+        plan: &mut ResourcePlan,
+        dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
+    ) -> Result<(), BatchError> {
+        if !plan.authoritative(&self.source) {
+            return Err(BatchError::TargetNotInitialized);
+        }
+        plan.transition_texture(list, &self.source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)?;
+        self.target.copy_from(host, list, batch, &self.source.texture, dirty)
+    }
+}
+
 /// An ordered copy between exact, native-authoritative color surfaces.
 /// Title-backed uploads, conversion, sparse and twin surfaces are not
 /// interchangeable with this operation.

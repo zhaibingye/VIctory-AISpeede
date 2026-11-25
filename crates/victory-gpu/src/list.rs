@@ -592,7 +592,7 @@ extern "system" fn copy_texture_region(
                 let target = subresource_zero(dst).and_then(crate::resource::host_copy);
                 let upload = if z == 0 {
                     // SAFETY: the initialized footprint variant.
-                    unsafe { (*src).footprint.linear_page_source((*src).resource) }
+                    unsafe { (*src).footprint.linear_page_view((*src).resource) }
                         .zip(target)
                         .and_then(|(from, to)| crate::page_resource::TextureUpload::capture(from, to, (x, y), bounds))
                 } else {
@@ -600,6 +600,24 @@ extern "system" fn copy_texture_region(
                 };
                 if let Some(upload) = upload {
                     list.record_page_texture_upload(upload);
+                } else {
+                    list.mark_unlowered();
+                }
+                return;
+            }
+            // SAFETY: inspect the destination footprint only after checking
+            // its initialized discriminator.
+            if !dst.is_null() && unsafe { (*dst).kind } == FOOTPRINT {
+                let readback = if x == 0 && y == 0 && z == 0 && bounds.is_none() {
+                    // SAFETY: the initialized footprint variant.
+                    let target = unsafe { (*dst).footprint.linear_page_view((*dst).resource) };
+                    subresource_zero(src).and_then(crate::resource::host_copy).zip(target)
+                        .and_then(|(from, to)| crate::page_resource::TextureReadback::capture(from, to))
+                } else {
+                    None
+                };
+                if let Some(readback) = readback {
+                    list.record_page_texture_readback(readback);
                 } else {
                     list.mark_unlowered();
                 }
