@@ -531,7 +531,26 @@ fn renderer_page_slab_roundtrip_uses_direct_queue_fence() {
     let table_bytes = words.len() * 4;
     let (table_resource, table_ptr) = host.upload_buffer(table_bytes as u64).unwrap();
     let (out, out_ptr) = host.shared_buffer(32).unwrap();
-    let (root, pso) = crate::memory::tests::pipeline();
+    const SOURCE: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=unbounded, space=1)), SRV(t0, space=2), UAV(u0), RootConstants(num32BitConstants=3, b0)"
+RWByteAddressBuffer slabs[] : register(u0, space1);
+ByteAddressBuffer table : register(t0, space2);
+RWByteAddressBuffer outbuf : register(u0);
+cbuffer c : register(b0) { uint lo; uint hi; uint at; }
+[RootSignature(RS)]
+[numthreads(4, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint va = lo + id.x * 4;
+    uint block = table.Load(((hi << 4) | (va >> 28)) * 4);
+    uint leaf = (block << 12) | ((va >> 16) & 4095);
+    uint2 binding = table.Load2((4096 + 2 * leaf) * 4);
+    uint view = NonUniformResourceIndex(binding.x + 1);
+    uint offset = va - binding.y;
+    outbuf.Store(at + id.x * 4, slabs[view].Load(offset));
+    if (at == 0) slabs[view].Store(offset, 0x5a5a5a5a);
+}
+"#;
+    let (root, pso) = crate::memory::tests::pipeline(SOURCE);
     // SAFETY: the table is a mapped D3D12 upload buffer of the copied size.
     unsafe { std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), table_ptr, table_bytes) };
     // Later submissions see a different fresh ID at the same address.
@@ -568,13 +587,13 @@ fn renderer_page_slab_roundtrip_uses_direct_queue_fence() {
         ],
     );
     // SAFETY: all descriptors, pipeline, table, and output stay valid
-    // until the direct-queue fence; this draw phase only reads the slab.
+    // until the direct-queue fence; both draw dispatches use UAV state.
     unsafe {
         let cmd = &list.list;
         cmd.ResourceBarrier(&[transition(
             a.buffer(),
             D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         )]);
         cmd.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
         cmd.SetComputeRootSignature(&root);
@@ -586,10 +605,22 @@ fn renderer_page_slab_roundtrip_uses_direct_queue_fence() {
             let args = [va as u32, (va >> 32) as u32, (i * 16) as u32];
             cmd.SetComputeRoot32BitConstants(3, 3, args.as_ptr().cast(), 0);
             cmd.Dispatch(1, 1, 1);
+            if i == 0 {
+                cmd.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            // Borrow the resource without creating a COM ownership edge.
+                            pResource: std::mem::transmute_copy(a.buffer()),
+                        }),
+                    },
+                }]);
+            }
         }
         cmd.ResourceBarrier(&[transition(
             a.buffer(),
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_COMMON,
         )]);
     }
@@ -616,10 +647,12 @@ fn renderer_page_slab_roundtrip_uses_direct_queue_fence() {
         heap.free_pair(pair);
     }
     // SAFETY: the direct queue has completed both writes to mapped output.
-    assert!(
-        unsafe { std::slice::from_raw_parts(out_ptr, 32) }
-            .iter()
-            .all(|&byte| byte == 0x72)
+    let result = unsafe { std::slice::from_raw_parts(out_ptr, 32) };
+    assert_eq!(&result[..16], &[0x72; 16], "first alias read before write");
+    assert_eq!(
+        &result[16..],
+        &[0x5a; 16],
+        "second alias observed the same UAV slot"
     );
     let signal = host.completed_fence().unwrap();
     assert!(signal > before);
@@ -633,7 +666,8 @@ fn renderer_page_slab_roundtrip_uses_direct_queue_fence() {
     // SAFETY: the direct queue has finished the copy into mapped shared memory.
     let content = unsafe { std::slice::from_raw_parts(down, low * 2) };
     assert!(content[..low].iter().all(|&byte| byte == 0x31));
-    assert!(content[low..].iter().all(|&byte| byte == 0x72));
+    assert_eq!(&content[low..low + 16], &[0x5a; 16]);
+    assert!(content[low + 16..].iter().all(|&byte| byte == 0x72));
     // Exhaust the slab without another allocation. Before the actual
     // fence arrives every slot is recording-pinned, dirty or in flight.
     let others = ids.allocate(SLOTS as usize - 2).unwrap();

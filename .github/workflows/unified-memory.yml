@@ -11,6 +11,7 @@ on:
       - 'crates/victory-hle/src/modules/d3d12x.rs'
       - 'crates/victory-gpu/**'
       - 'crates/victory-shader/**'
+      - 'apps/victory/src/translate.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -54,4 +55,4 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
-      - run: cargo test -p victory-shader --features host --locked --lib title_memory_is_read_and_written_at_computed_addresses
+      - run: cargo test -p victory-shader --features host --locked --lib title_memory_is_read_and_written_

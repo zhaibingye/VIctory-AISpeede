@@ -100,8 +100,15 @@ fn full_wave32_groups(native: &NativeProgram) -> bool {
         && matches!(&native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>().is_multiple_of(32))
 }
 
+#[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    let result = lower_mode(parts, false);
+    lower_page_access(parts, false)
+}
+
+/// Uses the writable member of each page pair for loads as well as stores
+/// when the renderer owns pages in native UAV slabs.
+pub(crate) fn lower_page_access(parts: &Parts, raw_page_uav_reads: bool) -> Result<Lowered, ShaderError> {
+    let result = lower_mode(parts, false, raw_page_uav_reads);
     if let Err(ShaderError::Unsupported { what, .. }) = &result
         && matches!(
             *what,
@@ -121,15 +128,16 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
                 ..parts.clone()
             },
             true,
+            raw_page_uav_reads,
         );
     }
     result
 }
 
-fn lower_mode(parts: &Parts, whole_wave: bool) -> Result<Lowered, ShaderError> {
+fn lower_mode(parts: &Parts, whole_wave: bool, raw_page_uav_reads: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, whole_wave).run() {
+        match Lower::new(parts, &bad, whole_wave, raw_page_uav_reads).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -260,6 +268,7 @@ struct Lower<'a> {
     console_lanes: bool,
     /// All lanes execute scalar control together, even under an empty EXEC.
     whole_wave: bool,
+    raw_page_uav_reads: bool,
     /// Native descriptor word zero, materialised at its definition on first use.
     descriptor_bases: HashMap<Value, (Site, u8, usize)>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
@@ -512,7 +521,7 @@ fn smem_dwords(name: &str) -> Option<u32> {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, whole_wave: bool) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, whole_wave: bool, raw_page_uav_reads: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -675,6 +684,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             whole_wave,
+            raw_page_uav_reads,
             descriptor_bases: HashMap::new(),
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
@@ -4662,8 +4672,10 @@ impl<'a> Lower<'a> {
         // Block 0's first entry names the null pair: no copy holds the page.
         let null = self.raw_dword(map, first);
         let miss = self.s.m.cmp(c, pred::EQ, view, null);
-        // Views come in pairs: the raw SRV, then the raw UAV of one copy.
-        let (view, props) = if write {
+        // The paged renderer keeps the whole slab in UAV state. Reading
+        // through its SRV in a shader that can also write the slab would
+        // require incompatible D3D12 states on the same resource.
+        let (view, props) = if write || self.raw_page_uav_reads {
             let one = k(self, 1);
             (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000, 0))
         } else {

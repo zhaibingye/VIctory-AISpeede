@@ -371,6 +371,10 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// Bind raw title-memory loads to each page's UAV descriptor. A paged
+    /// host must keep the corresponding slabs in UAV state during dispatch.
+    /// Does not change dirty/miss tracking or ordinary descriptor loads.
+    pub raw_page_uav_reads: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -496,14 +500,14 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_page_access(&parts(st, res), options.raw_page_uav_reads) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_page_access(&parts(&st, &res), options.raw_page_uav_reads)?
         }
         l => l?,
     };
@@ -1015,7 +1019,7 @@ mod tests {
             (out, features, flags)
         };
 
-        let marks = Options { view_marks: true };
+        let marks = Options { view_marks: true, ..Default::default() };
         for stage in [HwStage::Vs, HwStage::Ms] {
             let (out, sfi0, flags) = translate_stage(stage, marks);
             assert!(

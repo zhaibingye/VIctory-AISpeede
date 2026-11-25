@@ -1587,6 +1587,9 @@ pub enum View<'a> {
     /// its index and a UAV at the next (whose entry is [`View::Pair`]),
     /// read back like the UAVs.
     Memory(&'a [u32]),
+    /// As Memory, but the first descriptor is null to prove that raw
+    /// page reads use only the UAV slot.
+    MemoryUavOnly(&'a [u32]),
     /// Null raw SRV and UAV at this index and the next ([`View::Pair`]).
     NullPair,
     /// The second slot of a [`View::Memory`] or [`View::NullPair`].
@@ -2011,12 +2014,12 @@ impl Host {
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
                     }
-                    View::Memory(_) | View::NullPair => {
+                    View::Memory(_) | View::MemoryUavOnly(_) | View::NullPair => {
                         let n = match *v {
-                            View::Memory(data) => data.len() as u32,
+                            View::Memory(data) | View::MemoryUavOnly(data) => data.len() as u32,
                             _ => 0,
                         };
-                        let b = if let View::Memory(data) = *v {
+                        let b = if let View::Memory(data) | View::MemoryUavOnly(data) = *v {
                             let bytes = u64::from(n) * 4;
                             let b = make(
                                 D3D12_HEAP_TYPE_DEFAULT,
@@ -2060,7 +2063,11 @@ impl Host {
                         };
                         let mut next = at;
                         next.ptr += view_size;
-                        dev.CreateShaderResourceView(b.as_ref(), Some(&srv), at);
+                        let srv_source = match v {
+                            View::MemoryUavOnly(_) => None,
+                            _ => b.as_ref(),
+                        };
+                        dev.CreateShaderResourceView(srv_source, Some(&srv), at);
                         dev.CreateUnorderedAccessView(b.as_ref(), None, Some(&uav), next);
                         if let Some(b) = b {
                             let rb = make(

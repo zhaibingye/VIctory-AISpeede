@@ -59,7 +59,7 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     ]
 }
 
-fn program() -> HostShader {
+fn program(raw_page_uav_reads: bool) -> HostShader {
     let mut w = vec![s_mov_b32(5, 0x80)]; // s[4:5]: the table at s4
     w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
     w.push(v_mov_b32(1, ZERO));
@@ -196,7 +196,7 @@ fn program() -> HostShader {
     let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
     assert_eq!(memory, 16, "include the added global store through s[12:13]");
     let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
+    let l = lower::lower_page_access(&lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -207,7 +207,7 @@ fn program() -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    })
+    }, raw_page_uav_reads)
     .expect("lower");
     assert!(l.memory && l.memory_writes && l.view_addresses);
     assert!(l.root_uavs.is_empty(), "the root UAV is read as title memory");
@@ -244,7 +244,17 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
 
 #[test]
 fn title_memory_is_read_and_written_at_computed_addresses() {
-    let shader = program();
+    title_memory_roundtrip(false);
+}
+
+#[test]
+fn title_memory_is_read_and_written_in_single_uav_state() {
+    title_memory_roundtrip(true);
+}
+
+fn title_memory_roundtrip(raw_page_uav_reads: bool) {
+    let shader = program(raw_page_uav_reads);
+    let memory_view = if raw_page_uav_reads { View::MemoryUavOnly } else { View::Memory };
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -305,11 +315,11 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                         ],
                         views: &[
                             View::RawUav(12),
-                            View::Memory(&memory),
+                            memory_view(&memory),
                             View::Pair,
                             View::NullPair,
                             View::Pair,
-                            View::Memory(&second_page),
+                            memory_view(&second_page),
                             View::Pair,
                         ],
                         samplers: &[],

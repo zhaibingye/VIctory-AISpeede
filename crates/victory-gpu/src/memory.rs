@@ -531,7 +531,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    pub(crate) fn pipeline() -> (
+    pub(crate) fn pipeline(source: &str) -> (
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
         windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
     ) {
@@ -544,8 +544,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: the source and names outlive the call; the errors are text.
         unsafe {
             let made = D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 s!("memory"),
                 None,
                 None,
@@ -599,7 +599,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
-        let (root, pso) = pipeline();
+        let (root, pso) = pipeline(SOURCE);
         let (out, at) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.
         let out_gpu = unsafe { out.GetGPUVirtualAddress() };

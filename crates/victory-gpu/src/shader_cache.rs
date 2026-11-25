@@ -90,7 +90,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     crate::descriptor::host::probe_view_limit();
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
+    let options = victory_shader::emit::Options { view_marks: true, ..Default::default() };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
