@@ -46,6 +46,9 @@ mod memory;
 #[allow(dead_code, reason = "will replace title dispatch after direct and texture views use physical pages")]
 mod page_queue;
 #[cfg(windows)]
+#[allow(dead_code, reason = "closed native draws are admitted at renderer cutover")]
+mod page_draw;
+#[cfg(windows)]
 #[allow(dead_code, reason = "wired into title submissions together with direct/texture coherence at cutover")]
 mod page_slabs;
 #[cfg(windows)]

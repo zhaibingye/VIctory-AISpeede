@@ -32,10 +32,10 @@ pub(crate) struct PageStats {
     pub(crate) downloaded: usize,
 }
 
-#[derive(Clone, Copy)]
 pub(crate) enum PageOp {
     Copy(GuestCopy),
     Input(InputView),
+    Draw(std::sync::Arc<crate::page_draw::ClosedDraw>),
 }
 
 struct Completion {
@@ -133,13 +133,14 @@ impl Host {
         }
         let mut ranges = Vec::new();
         let mut max_copy = 0;
-        for &op in ops {
+        for op in ops {
             match op {
                 PageOp::Copy(copy) => {
                     ranges.extend(copy.ranges());
                     max_copy = max_copy.max(copy.len);
                 }
                 PageOp::Input(input) => ranges.push(input.range()?),
+                PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
             }
         }
         self.execute_paged_work(heap, backing, &ranges, |list, _, batch, pins| {
@@ -152,7 +153,7 @@ impl Host {
                 None
             };
             let mut dirty = BTreeSet::new();
-            for &op in ops {
+            for op in ops {
                 match op {
                     PageOp::Copy(copy) => {
                         let pieces = copy.bind(pins).map_err(|miss| match miss {
@@ -163,6 +164,7 @@ impl Host {
                             .map_err(BatchError::Native)?;
                     }
                     PageOp::Input(input) => input.encode(self, list, batch)?,
+                    PageOp::Draw(draw) => draw.encode(self, list, batch)?,
                 }
             }
             Ok(dirty)
