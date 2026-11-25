@@ -359,7 +359,7 @@ fn paged_title_draw_uses_relocated_texture_table_byte_base() {
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
-fn compile_relocated_pixel(source: &str) -> Vec<u8> {
+fn compile_dxc_stage(source: &str, entry: &str, profile: &str) -> Vec<u8> {
     let dxc = std::env::var_os("VICTORY_PC_DXC").map(std::path::PathBuf::from)
         .or_else(|| {
             let mut paths: Vec<_> = std::fs::read_dir("C:/Program Files (x86)/Windows Kits/10/bin")
@@ -374,7 +374,7 @@ fn compile_relocated_pixel(source: &str) -> Vec<u8> {
     let src = temp.path().join("shader.hlsl");
     let blob = temp.path().join("shader.dxil");
     std::fs::write(&src, source).unwrap();
-    let output = std::process::Command::new(dxc).args(["-T", "ps_6_6", "-E", "pixel", "-Fo"])
+    let output = std::process::Command::new(dxc).args(["-T", profile, "-E", entry, "-Fo"])
         .arg(&blob).arg(&src).output().unwrap();
     assert!(output.status.success(), "DXC: {}", String::from_utf8_lossy(&output.stderr));
     std::fs::read(blob).unwrap()
@@ -417,16 +417,22 @@ float4 pixel() : SV_Target0 { return green; }
         }
         code.unwrap()
     };
-    let vs = compile(s!("vertex"), s!("vs_5_0"));
+    let fxc_vs = (!relocated).then(|| compile(s!("vertex"), s!("vs_5_0")));
+    // Keep both stages in the same shader generation. DXBC and DXIL
+    // stage signatures cannot be linked in one graphics PSO.
+    let dxc_vs = relocated.then(|| compile_dxc_stage(
+        "float4 vertex(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }",
+        "vertex", "vs_6_6",
+    ));
     let fxc_ps = (!relocated).then(|| compile(s!("pixel"), s!("ps_5_0")));
-    let dxc_ps = relocated.then(|| compile_relocated_pixel(r#"
+    let dxc_ps = relocated.then(|| compile_dxc_stage(r#"
 cbuffer Table : register(b0) { uint table_bytes; }
 SamplerState nearest : register(s0);
 float4 pixel() : SV_Target0 {
     Texture2D<float4> colors = ResourceDescriptorHeap[(table_bytes >> 5) + 3];
     return colors.SampleLevel(nearest, float2(0.5, 0.5), 0);
 }
-"#));
+"#, "pixel", "ps_6_6"));
     const FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
     // SAFETY: creation descriptors and shader blobs live through calls.
     let (root, pso, target): (ID3D12RootSignature, ID3D12PipelineState, ID3D12Resource) = unsafe {
@@ -513,8 +519,11 @@ float4 pixel() : SV_Target0 {
         blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
-            VS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: vs.GetBufferPointer(), BytecodeLength: vs.GetBufferSize(),
+            VS: if let Some(vs) = &dxc_vs {
+                D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr().cast(), BytecodeLength: vs.len() }
+            } else {
+                let vs = fxc_vs.as_ref().unwrap();
+                D3D12_SHADER_BYTECODE { pShaderBytecode: vs.GetBufferPointer(), BytecodeLength: vs.GetBufferSize() }
             },
             PS: if let Some(ps) = &dxc_ps {
                 D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr().cast(), BytecodeLength: ps.len() }
