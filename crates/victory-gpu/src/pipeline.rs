@@ -64,7 +64,7 @@ pub(crate) struct Shader {
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     #[cfg(windows)]
-    static_texture_slots: OnceLock<Option<Vec<victory_shader::emit::StaticTextureSlot>>>,
+    static_view_slots: OnceLock<Option<Vec<victory_shader::emit::StaticViewSlot>>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -96,7 +96,7 @@ impl Shader {
             #[cfg(windows)]
             translated: OnceLock::new(),
             #[cfg(windows)]
-            static_texture_slots: OnceLock::new(),
+            static_view_slots: OnceLock::new(),
         }
     }
 }
@@ -110,9 +110,9 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
-    pub(crate) fn static_texture_slots(&self) -> Option<&[victory_shader::emit::StaticTextureSlot]> {
-        self.static_texture_slots
-            .get_or_init(|| victory_shader::emit::static_texture_slots(&self.container).ok().flatten())
+    pub(crate) fn static_view_slots(&self) -> Option<&[victory_shader::emit::StaticViewSlot]> {
+        self.static_view_slots
+            .get_or_init(|| victory_shader::emit::static_view_slots(&self.container).ok().flatten())
             .as_deref()
     }
 

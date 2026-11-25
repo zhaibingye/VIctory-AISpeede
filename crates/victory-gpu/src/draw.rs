@@ -432,7 +432,7 @@ impl State {
         let mut draw = crate::page_draw::ClosedDraw::from_translated(
             pipeline,
             |slot, dword| self.page_word(false, slot, dword),
-            |root, index| self.page_texture(false, root, index),
+            |root, index| self.page_view(false, root, index),
             |slot| self.page_address(false, slot),
             target,
             self.page_depth.clone(),
@@ -1017,7 +1017,7 @@ impl State {
             .and_then(|pipeline| crate::page_dispatch::ClosedDispatch::capture(
                 pipeline,
                 |slot, dword| self.page_word(true, slot, dword),
-                |root, index| self.page_texture(true, root, index),
+                |root, index| self.page_view(true, root, index),
                 |slot| self.page_address(true, slot),
                 call,
             ).ok());
@@ -1044,11 +1044,11 @@ impl State {
         }
     }
 
-    fn page_texture(&self, compute: bool, root: u8, index: u32) -> Option<crate::page_texture::TextureInput> {
+    fn page_view(&self, compute: bool, root: u8, index: u32) -> Option<crate::descriptor::View> {
         let Root::Table(first) = *self.roots_ref(compute).get(root as usize)? else { return None };
         let heap = self.heap_of(first)?;
         let records = heap.table_records(first, index.checked_add(1)?)?;
-        table_view(*records.get(index as usize)?)?.paged_texture_srv()
+        table_view(*records.get(index as usize)?)
     }
 
     /// Runs a dispatch on the host.

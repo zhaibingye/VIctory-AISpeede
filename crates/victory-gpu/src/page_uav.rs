@@ -76,3 +76,59 @@ impl RawClear {
         PageBarrier::Uav.encode(list, resources)
     }
 }
+
+/// A captured descriptor prefix and its independently proven store windows.
+/// Keeping the prefix preserves byte offsets in the translated shader.
+pub(crate) struct BoundedRawUav {
+    start: u64,
+    limit: u64,
+    end: u64,
+    writes: Vec<(u64, u64)>,
+}
+
+impl BoundedRawUav {
+    pub(crate) fn new(start: u64, limit: u64) -> Option<Self> {
+        (start != 0 && start.is_multiple_of(16) && start < limit && limit <= ADDRESS_LIMIT)
+            .then_some(Self { start, limit, end: start, writes: Vec::new() })
+    }
+
+    pub(crate) fn allow_write(&mut self, offset: u32, bytes: u32) -> Option<()> {
+        let start = self.start.checked_add(u64::from(offset))?;
+        let end = start.checked_add(u64::from(bytes))?;
+        if bytes == 0 || !offset.is_multiple_of(4) || !bytes.is_multiple_of(4) || end > self.limit {
+            return None;
+        }
+        self.end = self.end.max(end);
+        self.writes.push((start, end));
+        Some(())
+    }
+
+    pub(crate) fn range(&self) -> (u64, u64) { (self.start, self.end) }
+
+    pub(crate) fn prepare(
+        &self, batch: &PinnedBatch, dirty: &mut BTreeSet<PhysicalPage>,
+    ) -> Result<crate::page_queue::TableDescriptor, BatchError> {
+        let first = batch.pinned_at(self.start).ok_or(BatchError::NotCaptured(self.start))?;
+        let page_base = self.start & !(PAGE_BYTES - 1);
+        let mut at = page_base;
+        while at < self.end {
+            let page = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?;
+            // Native UAVs address one contiguous resource. Reject gaps
+            // and repeated/aliased slots inside a single native view.
+            if page.slab() != first.slab() || page.offset() != first.offset() + at - page_base {
+                return Err(BatchError::Range(self.start, self.end));
+            }
+            at += PAGE_BYTES;
+        }
+        for &(start, end) in &self.writes {
+            let mut at = start & !(PAGE_BYTES - 1);
+            while at < end {
+                dirty.insert(batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?.physical());
+                at += PAGE_BYTES;
+            }
+        }
+        Ok(crate::page_queue::TableDescriptor::RawUav(
+            first.buffer().clone(), first.offset() + self.start % PAGE_BYTES, self.end - self.start,
+        ))
+    }
+}

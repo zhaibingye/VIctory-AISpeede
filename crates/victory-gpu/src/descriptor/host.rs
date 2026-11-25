@@ -901,7 +901,7 @@ pub(crate) fn raw_uav_desc(first: u64, elements: u32) -> D3D12_UNORDERED_ACCESS_
     }
 }
 
-pub(crate) fn paged_raw_clear(view: &View, values: [u32; 4]) -> Option<crate::page_uav::RawClear> {
+pub(crate) fn paged_raw_range(view: &View) -> Option<(u64, u64)> {
     let View::Unordered(resource, 0, Some(words)) = view else { return None };
     let desc = uav_desc(words);
     if desc.Format != DXGI_FORMAT_R32_TYPELESS || desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
@@ -909,7 +909,7 @@ pub(crate) fn paged_raw_clear(view: &View, values: [u32; 4]) -> Option<crate::pa
     }
     // SAFETY: the dimension selects Buffer.
     let raw = unsafe { desc.Anonymous.Buffer };
-    if raw.Flags != D3D12_BUFFER_UAV_FLAG_RAW || raw.StructureByteStride != 0 {
+    if raw.Flags != D3D12_BUFFER_UAV_FLAG_RAW || raw.StructureByteStride != 0 || raw.CounterOffsetInBytes != 0 {
         return None;
     }
     let (base, size) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
@@ -917,11 +917,13 @@ pub(crate) fn paged_raw_clear(view: &View, values: [u32; 4]) -> Option<crate::pa
     let len = u64::from(raw.NumElements) * 4;
     let stop = offset.checked_add(len)?;
     if stop > size { return None; }
-    let clear = crate::page_uav::RawClear {
-        start: (base as u64).checked_add(offset)?,
-        end: (base as u64).checked_add(stop)?,
-        values,
-    };
+    if base.is_null() { return None; }
+    Some(((base as u64).checked_add(offset)?, (base as u64).checked_add(stop)?))
+}
+
+pub(crate) fn paged_raw_clear(view: &View, values: [u32; 4]) -> Option<crate::page_uav::RawClear> {
+    let (start, end) = paged_raw_range(view)?;
+    let clear = crate::page_uav::RawClear { start, end, values };
     clear.range().ok()?;
     Some(clear)
 }

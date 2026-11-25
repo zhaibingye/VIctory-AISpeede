@@ -1,11 +1,16 @@
 //! Shader dependency admission for the closed page renderer. An access
 //! with no lowering is rejected, not filled with the legacy root views.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::host::{Host, HostList};
 use crate::page_queue::PageDescriptors;
 use crate::page_slabs::{BatchError, PinnedBatch};
+use crate::descriptor::View;
 use crate::page_texture::TextureInput;
+use crate::page_uav::BoundedRawUav;
+use crate::page_queue::TableDescriptor;
+use victory_shader::emit::StaticViewAccess;
+use victory_memory::{PAGE_BYTES, physical::PhysicalPage};
 use crate::pipeline::host::HostPipeline;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -37,7 +42,7 @@ pub(crate) fn constants_only(
     block: Option<(u32, u32)>,
     values: impl Fn(u8, u32) -> Option<u32>,
 ) -> Result<Option<RootWords>, UnloweredShader> {
-    stage_words(shader, used, block, values, |_| false, |_| false)
+    stage_words(shader, used, block, values, |_| false, |_| false, |_| false)
 }
 
 pub(crate) fn stage_words(
@@ -46,6 +51,7 @@ pub(crate) fn stage_words(
     block: Option<(u32, u32)>,
     values: impl Fn(u8, u32) -> Option<u32>,
     tables: impl Fn(u8) -> bool,
+    uavs: impl Fn(u8) -> bool,
     cbvs: impl Fn(u8) -> bool,
 ) -> Result<Option<RootWords>, UnloweredShader> {
     if shader.memory || shader.memory_writes || shader.view_addresses {
@@ -63,8 +69,9 @@ pub(crate) fn stage_words(
         if u.root == RootType::Descriptor && u.kind == victory_shader::ResourceType::Cbv && cbvs(u.slot) {
             continue;
         }
-        if u.root != RootType::Table || u.kind != victory_shader::ResourceType::Srv
-            || !tables(u.slot)
+        if u.root != RootType::Table || !tables(u.slot)
+            || !(u.kind == victory_shader::ResourceType::Srv
+                || u.kind == victory_shader::ResourceType::Uav && uavs(u.slot))
         {
             return Err(UnloweredShader::DescriptorTable);
         }
@@ -210,8 +217,13 @@ fn closed_draw_relocates_table_byte_offsets_without_changing_constants() {
 #[derive(Default)]
 pub(crate) struct ShaderBindings {
     pub(crate) constants: Vec<RootWords>,
-    pub(crate) texture_tables: BTreeMap<u8, BTreeMap<u32, TextureInput>>,
+    tables: BTreeMap<u8, BTreeMap<u32, ClosedView>>,
     cbvs: Vec<(u32, ConstantSpan)>,
+}
+
+enum ClosedView {
+    Texture(TextureInput),
+    Raw(BoundedRawUav),
 }
 
 #[derive(Clone, Copy)]
@@ -266,7 +278,7 @@ impl ShaderBindings {
     pub(crate) fn capture(
         pipeline: &HostPipeline,
         values: impl Fn(u8, u32) -> Option<u32>,
-        texture: impl Fn(u8, u32) -> Option<TextureInput>,
+        view: impl Fn(u8, u32) -> Option<View>,
         address: impl Fn(u8) -> Option<u64>,
     ) -> Result<Self, UnloweredShader> {
         if pipeline.marks.is_some() {
@@ -274,7 +286,7 @@ impl ShaderBindings {
         }
         let mut constants = Vec::new();
         let mut cbvs = Vec::new();
-        let mut texture_tables = BTreeMap::<u8, BTreeMap<u32, _>>::new();
+        let mut tables = BTreeMap::<u8, BTreeMap<u32, _>>::new();
         for stage in &pipeline.stages {
             let t = stage.translated();
             for &(slot, param) in &stage.root_cbvs {
@@ -284,22 +296,46 @@ impl ShaderBindings {
             }
             let needs_table = t.host.user_data.iter().any(|u| u.root == victory_shader::RootType::Table);
             let slots = if needs_table {
-                stage.shader.static_texture_slots().ok_or(UnloweredShader::DescriptorTable)?
+                stage.shader.static_view_slots().ok_or(UnloweredShader::DescriptorTable)?
             } else {
                 &[]
             };
             if let Some(words) = stage_words(
                 &t.host, &t.used, stage.user_data, &values,
-                |root| slots.iter().any(|s| s.root == root),
+                |root| slots.iter().any(|s| s.slot.root == root),
+                |root| pipeline.compute && slots.iter().any(|s| {
+                    s.slot.root == root && matches!(s.access, StaticViewAccess::RawWrite { .. })
+                }),
                 |slot| stage.root_cbvs.iter().any(|&(bound, _)| bound == slot),
             )? {
-                for slot in slots {
+                for proof in slots {
+                    let slot = proof.slot;
+                    let reject = UnloweredShader::DescriptorTable;
                     if !words.tables.iter().any(|&(_, root)| root == slot.root) {
-                        return Err(UnloweredShader::DescriptorTable);
+                        return Err(reject);
                     }
-                    let table = texture_tables.entry(slot.root).or_default();
+                    let table = tables.entry(slot.root).or_default();
                     if let std::collections::btree_map::Entry::Vacant(e) = table.entry(slot.index) {
-                        e.insert(texture(slot.root, slot.index).ok_or(UnloweredShader::DescriptorTable)?);
+                        let actual = view(slot.root, slot.index).ok_or(UnloweredShader::DescriptorTable)?;
+                        let bound = match proof.access {
+                            StaticViewAccess::TextureRead => ClosedView::Texture(
+                                actual.paged_texture_srv().ok_or(UnloweredShader::DescriptorTable)?),
+                            StaticViewAccess::RawWrite { .. } if pipeline.compute => {
+                                let (start, end) = crate::descriptor::host::paged_raw_range(&actual)
+                                    .ok_or(UnloweredShader::DescriptorTable)?;
+                                ClosedView::Raw(BoundedRawUav::new(start, end)
+                                    .ok_or(UnloweredShader::DescriptorTable)?)
+                            }
+                            _ => return Err(reject),
+                        };
+                        e.insert(bound);
+                    }
+                    match (table.get_mut(&slot.index), proof.access) {
+                        (Some(ClosedView::Texture(_)), StaticViewAccess::TextureRead) => {},
+                        (Some(ClosedView::Raw(raw)), StaticViewAccess::RawWrite { offset, bytes }) => {
+                            raw.allow_write(offset, bytes).ok_or(UnloweredShader::DescriptorTable)?;
+                        }
+                        _ => return Err(reject),
                     }
                 }
                 constants.push(words);
@@ -307,38 +343,75 @@ impl ShaderBindings {
                 return Err(UnloweredShader::DescriptorTable);
             }
         }
-        Ok(Self { constants, texture_tables, cbvs })
+        Ok(Self { constants, tables, cbvs })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
         ranges.extend(self.cbvs.iter().map(|(_, span)| span.range()));
-        for table in self.texture_tables.values() {
-            for texture in table.values() {
-                texture.ranges(ranges)?;
+        for table in self.tables.values() {
+            for view in table.values() {
+                match view {
+                    ClosedView::Texture(texture) => texture.ranges(ranges)?,
+                    ClosedView::Raw(raw) => ranges.push(raw.range()),
+                }
             }
         }
         Ok(())
     }
 
     pub(crate) fn samples_target(&self, target: &crate::resource::HostTexture) -> bool {
-        self.texture_tables.values().flat_map(|table| table.values())
-            .any(|view| view.aliases_target(target))
+        self.tables.values().flat_map(|table| table.values())
+            .any(|view| matches!(view, ClosedView::Texture(tex) if tex.aliases_target(target)))
+    }
+
+    pub(crate) fn writes_raw(&self) -> bool {
+        self.tables.values().flat_map(|table| table.values())
+            .any(|view| matches!(view, ClosedView::Raw(_)))
     }
 
     pub(crate) fn prepare(
         &self, host: &Host, list: &HostList, batch: &PinnedBatch,
         descriptors: &mut PageDescriptors<'_>,
         plan: &mut crate::page_resource::ResourcePlan,
+        dirty: &mut BTreeSet<PhysicalPage>,
     ) -> Result<PreparedShader, BatchError> {
         let mut bases = BTreeMap::new();
-        for (&root, table) in &self.texture_tables {
+        let mut shader_dirty = BTreeSet::new();
+        for (&root, table) in &self.tables {
             let size = table.last_key_value().expect("captured slots exist").0 + 1;
-            let mut views = vec![None; size as usize];
-            for (&index, texture) in table {
-                views[index as usize] = Some(texture.encode(host, list, batch, plan)?);
+            let mut views: Vec<_> = (0..size).map(|_| None).collect();
+            for (&index, view) in table {
+                views[index as usize] = Some(match view {
+                    ClosedView::Texture(texture) => {
+                        let (resource, format) = texture.encode(host, list, batch, plan)?;
+                        TableDescriptor::Texture(resource, format)
+                    }
+                    ClosedView::Raw(raw) => raw.prepare(batch, &mut shader_dirty)?,
+                });
             }
-            let first = descriptors.reserve_texture_run(&views).map_err(BatchError::Native)?;
+            let first = descriptors.reserve_table_run(&views).map_err(BatchError::Native)?;
             bases.insert(root, first);
+        }
+        if !shader_dirty.is_empty() {
+            // Staged readers are snapshots. A shader reading and writing
+            // the same physical pages needs a single directly shared view.
+            let mut reads: Vec<_> = self.cbvs.iter().map(|(_, span)| span.range()).collect();
+            for view in self.tables.values().flat_map(|table| table.values()) {
+                if let ClosedView::Texture(tex) = view {
+                    tex.ranges(&mut reads)?;
+                }
+            }
+            for (start, end) in reads {
+                let mut at = start & !(PAGE_BYTES - 1);
+                while at < end {
+                    let page = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?;
+                    if shader_dirty.contains(&page.physical()) {
+                        return Err(BatchError::Range(start, end));
+                    }
+                    at += PAGE_BYTES;
+                }
+            }
+            dirty.extend(shader_dirty);
         }
         let words: Vec<_> = self.constants.iter().map(|root| {
             root.relocated(&bases).map(|words| (root.parameter, words))

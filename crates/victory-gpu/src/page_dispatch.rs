@@ -6,7 +6,7 @@ use crate::page_indirect::{IndirectArgs, IndirectKind};
 use crate::page_queue::PageDescriptors;
 use crate::page_shader::{ShaderBindings, UnloweredShader};
 use crate::page_slabs::{BatchError, PinnedBatch};
-use crate::page_texture::TextureInput;
+use crate::descriptor::View;
 use crate::pipeline::host::HostPipeline;
 
 pub(crate) enum DispatchCall {
@@ -25,7 +25,7 @@ impl ClosedDispatch {
     pub(crate) fn capture(
         pipeline: &HostPipeline,
         constants: impl Fn(u8, u32) -> Option<u32>,
-        texture: impl Fn(u8, u32) -> Option<TextureInput>,
+        view: impl Fn(u8, u32) -> Option<View>,
         address: impl Fn(u8) -> Option<u64>,
         call: DispatchCall,
     ) -> Result<Self, UnloweredShader> {
@@ -45,7 +45,7 @@ impl ClosedDispatch {
         Ok(Self {
             pipeline: pipeline.pso.clone(),
             root: pipeline.root.clone(),
-            shader: ShaderBindings::capture(pipeline, constants, texture, address)?,
+            shader: ShaderBindings::capture(pipeline, constants, view, address)?,
             call,
         })
     }
@@ -62,13 +62,17 @@ impl ClosedDispatch {
         &self, host: &Host, list: &HostList, batch: &PinnedBatch,
         budget: &mut Option<ID3D12Resource>, descriptors: &mut PageDescriptors<'_>,
         plan: &mut crate::page_resource::ResourcePlan,
+        dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
     ) -> Result<(), BatchError> {
         let args = if let DispatchCall::Indirect(args) = self.call {
             Some(args.prepare(host, list, batch, budget)?)
         } else {
             None
         };
-        let words = self.shader.prepare(host, list, batch, descriptors, plan)?;
+        let words = self.shader.prepare(host, list, batch, descriptors, plan, dirty)?;
+        if self.shader.writes_raw() {
+            crate::page_resource::PageBarrier::Uav.encode(list, plan)?;
+        }
         list.keep(&self.pipeline);
         list.keep(&self.root);
         // SAFETY: the root and pipeline match the captured shader, with

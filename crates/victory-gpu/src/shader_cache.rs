@@ -79,6 +79,7 @@ fn key(translator: &str, encoding: &[u8], limit: u32, views: u32) -> [u8; 32] {
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
     h.update(&views.to_le_bytes());
+    h.update(&[u8::from(cfg!(feature = "paged-title"))]);
     *h.finalize().as_bytes()
 }
 
@@ -88,9 +89,11 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // The translation depends on it (a view index clamped below a capped
     // heap's end), and so does the cache key.
     crate::descriptor::host::probe_view_limit();
-    // Writes through views mark their pages: copy-backs compare only those
-    // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true, ..Default::default() };
+    // The legacy queue uses shader-generated view marks; the title page
+    // queue only admits views with an independent physical-page proof.
+    let options = victory_shader::emit::Options {
+        view_marks: !cfg!(feature = "paged-title"), ..Default::default()
+    };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),

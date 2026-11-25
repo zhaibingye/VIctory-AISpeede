@@ -62,6 +62,11 @@ pub(crate) struct PageDescriptors<'a> {
     raw_uavs: Vec<u32>,
 }
 
+pub(crate) enum TableDescriptor {
+    Texture(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT),
+    RawUav(ID3D12Resource, u64, u64),
+}
+
 impl PageDescriptors<'_> {
     fn reserve(&mut self, slab: Option<&ID3D12Resource>, bytes: u64) -> Result<u32> {
         let slot = self.heap.pair().ok_or_else(oom)?;
@@ -79,20 +84,29 @@ impl PageDescriptors<'_> {
         Ok(slot)
     }
 
-    pub(crate) fn reserve_texture_run(
+    pub(crate) fn reserve_table_run(
         &mut self,
-        views: &[Option<(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>],
+        views: &[Option<TableDescriptor>],
     ) -> Result<u32> {
         let n = u32::try_from(views.len()).map_err(|_| oom())?;
         let first = self.heap.dynamic(n).ok_or_else(oom)?;
         for (offset, view) in views.iter().enumerate() {
             use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
             let slot = first + offset as u32;
-            let (resource, format) = view.as_ref().map_or(
-                (None, DXGI_FORMAT_R8G8B8A8_UNORM), |(tex, f)| (Some(tex), *f),
-            );
-            self.heap.paged_texture_at(slot, resource, format);
-            self.textures.push((slot, format));
+            match view {
+                Some(TableDescriptor::RawUav(buffer, at, len)) => {
+                    self.heap.raw_view_at(slot, Some(buffer), *at, *len, true);
+                    self.raw_uavs.push(slot);
+                }
+                _ => {
+                    let (resource, format) = match view {
+                        Some(TableDescriptor::Texture(tex, format)) => (Some(tex), *format),
+                        _ => (None, DXGI_FORMAT_R8G8B8A8_UNORM),
+                    };
+                    self.heap.paged_texture_at(slot, resource, format);
+                    self.textures.push((slot, format));
+                }
+            }
         }
         Ok(first)
     }
@@ -230,8 +244,8 @@ impl Host {
                     PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty)?,
                     PageOp::UploadTexture(upload) => upload.encode(self, list, batch, targets)?,
                     PageOp::Input(input) => input.encode(self, list, batch)?,
-                    PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors, targets)?,
-                    PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets)?,
+                    PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
+                    PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
                     PageOp::Clear(clear) => clear.encode(self, list, targets)?,
                     PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,
                     PageOp::Barrier(barrier) => barrier.encode(list, targets)?,
