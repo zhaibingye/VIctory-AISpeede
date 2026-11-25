@@ -3,12 +3,20 @@
 
 use std::sync::OnceLock;
 
-use victory_memory::physical::{BackingPins, PhysicalPage};
+use victory_memory::physical::BackingPins;
 
 type Range = (usize, usize);
 pub type BackingPinner = fn(&[Range], &mut BackingPins);
 
-pub type WritebackPage = fn(usize, Option<PhysicalPage>, &mut dyn FnMut()) -> bool;
+#[derive(Clone, Copy)]
+pub struct WritebackTarget {
+    pub address: usize,
+    /// True only if the title VA still maps the captured page.
+    pub original_va: bool,
+}
+
+pub type WritebackPage =
+    fn(usize, usize, &BackingPins, bool, &mut dyn FnMut(WritebackTarget)) -> bool;
 
 static BACKING: OnceLock<(BackingPinner, WritebackPage)> = OnceLock::new();
 
@@ -41,16 +49,28 @@ impl SubmissionBacking {
         }
         self.pending.clear();
     }
-    /// Run the read/merge/write on one 64 KiB page without a concurrent
-    /// XMem remap. A stale destination is left alone.
+    /// For marked writes without a stable before-image, retain the stale
+    /// destination guard. Only a computed byte delta can be redirected.
     pub(crate) fn write_page<T>(&self, address: usize, write: impl FnOnce() -> T) -> Option<T> {
+        self.write_target(address, 1, false, |_| write())
+    }
+
+    pub(crate) fn write_delta<T>(
+        &self, address: usize, len: usize, write: impl FnOnce(WritebackTarget) -> T,
+    ) -> Option<T> {
+        self.write_target(address, len, true, write)
+    }
+
+    fn write_target<T>(
+        &self, address: usize, len: usize, redirect: bool, write: impl FnOnce(WritebackTarget) -> T,
+    ) -> Option<T> {
         let Some((_, with_page)) = BACKING.get() else {
-            return Some(write());
+            return Some(write(WritebackTarget { address, original_va: true }));
         };
         let mut write = Some(write);
         let mut result = None;
-        with_page(address, self.pins.expected(address), &mut || {
-            result = write.take().map(|write| write());
+        with_page(address, len, &self.pins, redirect, &mut |target| {
+            result = write.take().map(|write| write(target));
         });
         result
     }

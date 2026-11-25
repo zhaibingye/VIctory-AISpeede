@@ -514,14 +514,16 @@ impl Shadow {
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 if host != old {
                     let address = start + at;
-                    backing.write_page(address, || {
-                        if crate::host::read_into(address as *const u8, title) {
+                    backing.write_delta(address, n, |target| {
+                        if crate::host::read_into(target.address as *const u8, title) {
                             if merge_writeback(title, host, old) {
-                                let _writing = crate::watch::writing(address, n);
-                                crate::host::write_mapped(address as *mut u8, title.as_ptr(), n);
+                                let _writing = target.original_va.then(|| crate::watch::writing(address, n));
+                                crate::host::write_mapped(target.address as *mut u8, title.as_ptr(), n);
                                 written += n;
                             }
-                            synced.push(address / PAGE);
+                            if target.original_va {
+                                synced.push(address / PAGE);
+                            }
                         }
                     });
                 }

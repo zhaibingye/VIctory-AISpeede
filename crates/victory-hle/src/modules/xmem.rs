@@ -375,6 +375,7 @@ const PAGE: usize = victory_memory::PAGE_BYTES as usize;
 struct Section {
     handle: HANDLE,
     first: PhysicalPage,
+    pages: usize,
     _reservation: Reservation,
 }
 
@@ -457,19 +458,51 @@ pub(crate) fn pin_backing(ranges: &[(usize, usize)], pins: &mut BackingPins) {
     }
 }
 
-/// Verify the page identity and perform the write under the same map lock.
-/// This protects against a remap between validation and the CPU copy.
+/// Verify the destination under the map lock. A byte delta also has a
+/// stable before-image, so it can still reach the pinned original backing
+/// through a temporary view, even when every title alias is gone.
 pub(crate) fn with_writeback_page(
-    address: usize, expected: Option<PhysicalPage>, write: &mut dyn FnMut(),
+    address: usize,
+    len: usize,
+    pins: &BackingPins,
+    redirect: bool,
+    write: &mut dyn FnMut(victory_gpu::title_backing::WritebackTarget),
 ) -> bool {
+    use victory_gpu::title_backing::WritebackTarget;
+
+    let offset = address % PAGE;
+    if len == 0 || len > PAGE - offset {
+        return false;
+    }
     let physical = physical();
+    let expected = pins.expected(address);
     let current = physical.views.range(..=address).next_back()
         .filter(|&(&base, &(size, _))| address - base < size)
         .map(|(&base, (_, slice))| slice.page((address - base) / PAGE));
-    if current != expected {
+    if current == expected {
+        write(WritebackTarget { address, original_va: true });
+        return true;
+    }
+    if !redirect {
         return false;
     }
-    write();
+    let Some(page) = expected else { return false };
+    let Some((section, index)) = pins.section::<Section>(page) else { return false };
+    if index >= section.pages {
+        return false;
+    }
+    let Some(view) = View::map_section(section, index, 1) else {
+        return false;
+    };
+    // Writes through this temporary view do not fault at the title's VAs.
+    // Notify its current aliases without ever touching the replacement VA.
+    let _writers: Vec<_> = physical.shown.addresses(page).iter().map(|&alias| {
+        victory_gpu::kernel_will_write(alias + offset, len)
+    }).collect();
+    write(WritebackTarget {
+        address: view.at.Value as usize + offset,
+        original_va: false,
+    });
     true
 }
 
@@ -589,6 +622,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let section = Arc::new(Section {
         handle,
         first,
+        pages: n,
         _reservation: reservation,
     });
     for index in 0..n {
@@ -627,12 +661,16 @@ struct View {
 impl View {
     /// Maps `n` slices from `slice` on.
     fn map(slice: &Slice, n: usize) -> Option<View> {
+        Self::map_section(slice.section.clone(), slice.index, n)
+    }
+
+    fn map_section(section: Arc<Section>, index: usize, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
-        let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+        let (offset, len) = ((index * PAGE) as u64, n * PAGE);
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.handle,
+                section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -642,7 +680,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len, section: Some(slice.section.clone()) };
+        let view = View { at, len, section: Some(section) };
         commit(at.Value as usize, len).then_some(view)
     }
 
@@ -1419,33 +1457,60 @@ mod tests {
     }
 
     #[test]
-    fn submitted_writeback_rejects_same_address_rebound_to_a_different_page() {
+    fn submitted_byte_writeback_reaches_the_original_backing_after_remap() {
         let pages = allocate(2);
         let ptr = XMemVirtualAlloc(
             std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
         );
         assert!(!ptr.is_null());
-        assert_eq!(XMemMapPhysicalPages(ptr, 1, pages.as_ptr()), ptr);
+        assert_eq!(XMemMapPhysicalPages(ptr, 1, pages[1..].as_ptr()), ptr);
         let address = ptr as usize;
         let mut pins = BackingPins::default();
         pin_backing(&[(address + 1, address + 2)], &mut pins);
         let expected = pins.expected(address + 1);
         assert!(expected.is_some());
-        let write = &mut || {
+        let write = &mut |target: victory_gpu::title_backing::WritebackTarget| {
             // SAFETY: this closure is allowed only for the captured writable address.
-            unsafe { ptr.cast::<u8>().add(1).write(7) };
+            unsafe { (target.address as *mut u8).write(7) };
         };
-        assert!(with_writeback_page(address + 1, expected, write));
-        assert_eq!(XMemMapPhysicalPages(ptr, 1, pages[1..].as_ptr()), ptr);
+        assert!(with_writeback_page(address + 1, 1, &pins, false, write));
+        assert_eq!(XMemMapPhysicalPages(ptr, 1, pages.as_ptr()), ptr);
         pin_backing(&[(address, address + PAGE)], &mut pins);
         assert_eq!(pins.expected(address + 1), expected);
-        assert!(!with_writeback_page(address + 1, expected, write));
-        assert!(!with_writeback_page(address + 1, None, write));
+        assert!(!with_writeback_page(address + 1, 1, &pins, false, write));
+        assert!(!with_writeback_page(address + 1, 1, &BackingPins::default(), true, write));
+        assert!(with_writeback_page(address + 1, 1, &pins, true, &mut |target| {
+            assert!(!target.original_va);
+            // SAFETY: the callback has a view of the original page, not the rebound address.
+            unsafe {
+                let byte = target.address as *mut u8;
+                assert_eq!(byte.read(), 7);
+                byte.write(13);
+            }
+        }));
         // SAFETY: the rebound page belongs to this test and is still mapped.
         assert_eq!(unsafe { ptr.cast::<u8>().add(1).read() }, 0);
         assert_eq!(XMemMapPhysicalPages(ptr, 1, std::ptr::null()), ptr);
-        assert!(!with_writeback_page(address + 1, expected, write));
+        assert!(!with_writeback_page(address + 1, 1, &pins, false, write));
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        // No original handles or views remain; the submission still owns
+        // the section. The byte delta must land there, not in the placeholder.
+        let mut called = false;
+        assert!(with_writeback_page(address + 1, 1, &pins, true, &mut |target| {
+            assert!(!target.original_va);
+            // SAFETY: the callback owns a writable byte in the original section.
+            unsafe {
+                let byte = target.address as *mut u8;
+                assert_eq!(byte.read(), 13);
+                byte.write(29);
+            }
+            called = true;
+        }));
+        assert!(called);
+        assert!(with_writeback_page(address + 1, 1, &pins, true, &mut |target| {
+            // SAFETY: original physical page is still backed by the pin.
+            assert_eq!(unsafe { (target.address as *const u8).read() }, 29);
+        }));
         // SAFETY: the one unmapped page is again our placeholder.
         assert_ne!(unsafe { VirtualFree(ptr, 0, MEM_RELEASE) }, 0);
     }

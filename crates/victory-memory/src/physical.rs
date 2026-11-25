@@ -1,5 +1,6 @@
 //! Physical allocations and alias identity, independent of host address.
 
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -67,7 +68,7 @@ impl Drop for Reservation {
 
 /// Physical page identity in the title's ABI: a 21-bit index packed as a
 /// number of 4 KiB frames. Monotonic across allocations, regardless of VA.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PhysicalPage(usize);
 
 const FRAMES: usize = PAGE_BYTES as usize / 4096;
@@ -77,6 +78,10 @@ const END: usize = (1 << 21) * FRAMES;
 impl PhysicalPage {
     pub fn number(self) -> usize {
         self.0
+    }
+
+    pub fn offset_from(self, section: Self) -> Option<usize> {
+        self.0.checked_sub(section.0).map(|distance| distance / FRAMES)
     }
 
     /// Caller keeps the index within the allocated extent.
@@ -136,7 +141,7 @@ impl Aliases {
 /// ranges can name one allocation; there is only one retained reference to it.
 #[derive(Default)]
 pub struct BackingPins {
-    sections: HashMap<PhysicalPage, Arc<dyn Send + Sync>>,
+    sections: BTreeMap<PhysicalPage, Arc<dyn Any + Send + Sync>>,
     // Aligned half-open VA runs from the first observation in this
     // submission. None describes a run without XMem backing.
     mappings: BTreeMap<usize, (usize, Option<PhysicalPage>)>,
@@ -146,6 +151,13 @@ impl BackingPins {
     /// `section` identifies the first physical page of this allocation.
     pub fn keep<T: Send + Sync + 'static>(&mut self, section: PhysicalPage, backing: &Arc<T>) {
         self.sections.entry(section).or_insert_with(|| backing.clone());
+    }
+
+    /// Recover the pinned section for an identity previously captured by
+    /// this submission. The caller checks the offset against the extent.
+    pub fn section<T: Any + Send + Sync>(&self, page: PhysicalPage) -> Option<(Arc<T>, usize)> {
+        let (&first, section) = self.sections.range(..=page).next_back()?;
+        Some((section.clone().downcast::<T>().ok()?, page.offset_from(first)?))
     }
 
     /// Capture only previously unseen addresses. If a queue chunk sees a
