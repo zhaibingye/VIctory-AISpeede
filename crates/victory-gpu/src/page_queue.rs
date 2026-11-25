@@ -85,20 +85,43 @@ impl Host {
         })
     }
 
-    pub(crate) fn execute_paged_copy(
+    /// Run a closed sequence of buffer copies against one capture and
+    /// perform a single dirty-page merge after the whole sequence.
+    pub(crate) fn execute_paged_copies(
         &self,
         heap: &HostHeap,
         backing: &mut SubmissionBacking,
-        copy: GuestCopy,
+        copies: &[GuestCopy],
     ) -> std::result::Result<PageStats, BatchError> {
-        self.execute_paged_work(heap, backing, &copy.ranges(), |list, _, batch, pins| {
-            let pieces = copy.bind(pins).map_err(|miss| match miss {
-                Unbound::AddressWidth => BatchError::Range(copy.src as u64, copy.dst as u64),
-                Unbound::Source(va) | Unbound::Destination(va) => {
-                    BatchError::NotCaptured(va as u64)
-                }
-            })?;
-            record_copy(self, list, batch, copy.len, &pieces).map_err(BatchError::Native)
+        let Some(max_bytes) = copies.iter().map(|copy| copy.len).max() else {
+            return Ok(PageStats {
+                uploaded: 0,
+                downloaded: 0,
+            });
+        };
+        let ranges: Vec<_> = copies.iter().flat_map(|copy| copy.ranges()).collect();
+        self.execute_paged_work(heap, backing, &ranges, |list, _, batch, pins| {
+            let plan = copies
+                .iter()
+                .map(|copy| {
+                    copy.bind(pins).map_err(|miss| match miss {
+                        Unbound::AddressWidth => BatchError::Range(copy.src as u64, copy.dst as u64),
+                        Unbound::Source(va) | Unbound::Destination(va) => {
+                            BatchError::NotCaptured(va as u64)
+                        }
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let scratch = self
+                .default_buffer(max_bytes as u64)
+                .ok_or_else(|| BatchError::Native(oom()))?;
+            list.keep(&scratch);
+            let mut dirty = BTreeSet::new();
+            for pieces in plan {
+                record_copy(list, batch, &scratch, &pieces, &mut dirty)
+                    .map_err(BatchError::Native)?;
+            }
+            Ok(dirty)
         })
     }
 
@@ -289,13 +312,12 @@ fn run(
 /// A D3D12 buffer cannot be COPY_SOURCE and COPY_DEST simultaneously,
 /// and otherwise an earlier write could corrupt a later alias read.
 fn record_copy(
-    host: &Host,
     list: &HostList,
     batch: &PinnedBatch,
-    bytes: usize,
+    scratch: &ID3D12Resource,
     pieces: &[crate::copy_plan::CopyPiece],
-) -> Result<BTreeSet<PhysicalPage>> {
-    let scratch = host.default_buffer(bytes as u64).ok_or_else(oom)?;
+    dirty: &mut BTreeSet<PhysicalPage>,
+) -> Result<()> {
     let mut source = BTreeMap::new();
     let mut dest = BTreeMap::new();
     for piece in pieces {
@@ -304,11 +326,9 @@ fn record_copy(
         let d = batch.pinned(piece.dst).ok_or_else(|| Error::from(E_FAIL))?;
         dest.insert(d.slab(), d.buffer());
     }
-    list.keep(&scratch);
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     let copy_src = D3D12_RESOURCE_STATE_COPY_SOURCE;
     let copy_dst = D3D12_RESOURCE_STATE_COPY_DEST;
-    let mut dirty = BTreeSet::new();
     // SAFETY: native buffers are owned by the same captured batch; all
     // byte spans are bounded by its guest copy plan.
     unsafe {
@@ -323,7 +343,7 @@ fn record_copy(
         for piece in pieces {
             let s = batch.pinned(piece.src).expect("validated source");
             cmd.CopyBufferRegion(
-                &scratch,
+                scratch,
                 offset,
                 s.buffer(),
                 s.offset() + u64::from(piece.src_offset),
@@ -339,7 +359,7 @@ fn record_copy(
         let scatter: Vec<_> = dest
             .values()
             .map(|d| transition(d, uav, copy_dst))
-            .chain([transition(&scratch, copy_dst, copy_src)])
+            .chain([transition(scratch, copy_dst, copy_src)])
             .collect();
         cmd.ResourceBarrier(&scatter);
         offset = 0;
@@ -348,7 +368,7 @@ fn record_copy(
             cmd.CopyBufferRegion(
                 d.buffer(),
                 d.offset() + u64::from(piece.dst_offset),
-                &scratch,
+                scratch,
                 offset,
                 u64::from(piece.count),
             );
@@ -359,10 +379,11 @@ fn record_copy(
             &dest
                 .values()
                 .map(|d| transition(d, copy_dst, uav))
+                .chain([transition(scratch, copy_src, copy_dst)])
                 .collect::<Vec<_>>(),
         );
     }
-    Ok(dirty)
+    Ok(())
 }
 
 fn barrier<'a>(
@@ -489,7 +510,7 @@ fn paged_buffer_copy_gathers_overlapping_physical_aliases() {
     let (mut backing, section) = crate::title_backing::test_capture(id, &[VA, ALIAS]);
     section.lock().unwrap()[..6].copy_from_slice(&[10, 20, 30, 40, 50, 60]);
     let copy = GuestCopy::new(ALIAS + 1, VA, 5).unwrap();
-    let stats = host.execute_paged_copy(heap, &mut backing, copy).unwrap();
+    let stats = host.execute_paged_copies(heap, &mut backing, &[copy]).unwrap();
     assert_eq!(
         stats,
         PageStats {
@@ -498,4 +519,37 @@ fn paged_buffer_copy_gathers_overlapping_physical_aliases() {
         }
     );
     assert_eq!(&section.lock().unwrap()[..6], &[10, 10, 20, 30, 40, 50]);
+}
+
+#[cfg(test)]
+#[test]
+fn paged_buffer_copy_batch_orders_alias_dependencies_and_rejects_partial_work() {
+    use victory_memory::physical::PageNumbers;
+    const VA: usize = PAGE_BYTES as usize;
+    const ALIAS: usize = 0x82_0000_0000;
+    let host = crate::host::host().expect("D3D12 renderer host (CI selects WARP)");
+    let heap = crate::memory::heap().unwrap();
+    let id = PageNumbers::default().allocate(3).unwrap().offset(2);
+    let (mut backing, section) = crate::title_backing::test_capture(id, &[VA, ALIAS]);
+    let initial = [10, 20, 30, 40, 50, 60];
+    section.lock().unwrap()[..6].copy_from_slice(&initial);
+    let first = GuestCopy::new(ALIAS + 1, VA, 5).unwrap();
+    let missing = GuestCopy::new(VA, VA + PAGE_BYTES as usize, 2).unwrap();
+    assert!(matches!(
+        host.execute_paged_copies(heap, &mut backing, &[first, missing]),
+        Err(BatchError::NotCaptured(_))
+    ));
+    assert_eq!(&section.lock().unwrap()[..6], &initial);
+    let second = GuestCopy::new(VA, ALIAS + 2, 2).unwrap();
+    let stats = host
+        .execute_paged_copies(heap, &mut backing, &[first, second])
+        .unwrap();
+    assert_eq!(
+        stats,
+        PageStats {
+            uploaded: 1,
+            downloaded: 1,
+        }
+    );
+    assert_eq!(&section.lock().unwrap()[..6], &[20, 30, 20, 30, 40, 50]);
 }
