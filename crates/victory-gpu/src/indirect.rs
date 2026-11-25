@@ -187,7 +187,17 @@ pub(crate) fn bound(
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
+    list.budget().is_some_and(|budget| bound_with_budget(list, buffer, gpu, (kind, stride, records), budget))
+}
+
+pub(crate) fn bound_with_budget(
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+    budget: u64,
+) -> bool {
+    let Some(c) = clamp() else {
         return false;
     };
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {

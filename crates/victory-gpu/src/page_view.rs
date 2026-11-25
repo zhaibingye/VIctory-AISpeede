@@ -107,44 +107,63 @@ impl InputView {
         list: &HostList,
         batch: &PinnedBatch,
     ) -> Result<ID3D12Resource, BatchError> {
-        let (start, end) = self.range()?;
-        let mut source = BTreeMap::new();
-        let mut pieces = Vec::new();
-        let mut va = start;
-        while va < end {
-            let page = batch.pinned_at(va).ok_or(BatchError::NotCaptured(va))?;
-            let offset = va % PAGE_BYTES;
-            let count = (end - va).min(PAGE_BYTES - offset);
-            source.insert(page.slab(), page.buffer());
-            pieces.push((page.buffer(), page.offset() + offset, va - start, count));
-            va += count;
-        }
+        let span = self.range()?;
         let buffer = host
-            .default_buffer(end - start)
+            .default_buffer(span.1 - span.0)
             .ok_or_else(|| BatchError::Native(Error::from(E_OUTOFMEMORY)))?;
-        list.keep(&buffer);
-        let cmd = list.recording();
-        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        let read = D3D12_RESOURCE_STATE_COPY_SOURCE;
         let binding = match self {
             Self::Vertex(..) => D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
             Self::Index(_) => D3D12_RESOURCE_STATE_INDEX_BUFFER,
         };
-        let gather: Vec<_> = source.values().map(|src| transition(src, uav, read)).collect();
-        let finish: Vec<_> = source
-            .values()
-            .map(|src| transition(src, read, uav))
-            .chain([transition(&buffer, D3D12_RESOURCE_STATE_COPY_DEST, binding | read)])
-            .collect();
-        // SAFETY: all sources are pinned and each piece is within one
-        // slot. The separate destination fits the span and stays live.
-        unsafe {
-            cmd.ResourceBarrier(&gather);
-            for (src, from, to, count) in pieces {
-                cmd.CopyBufferRegion(&buffer, to, src, from, count);
-            }
-            cmd.ResourceBarrier(&finish);
-        }
+        gather_span(list, batch, span, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+            binding | D3D12_RESOURCE_STATE_COPY_SOURCE)?;
         Ok(buffer)
     }
+}
+
+/// Copy a checked admitted guest span to a separate, sufficiently sized
+/// native buffer. The destination is retained until the list's fence.
+pub(crate) fn gather_span(
+    list: &HostList,
+    batch: &PinnedBatch,
+    (start, end): (u64, u64),
+    buffer: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> Result<(), BatchError> {
+    if start >= end || end > ADDRESS_LIMIT {
+        return Err(BatchError::Range(start, end));
+    }
+    let mut source = BTreeMap::new();
+    let mut pieces = Vec::new();
+    let mut va = start;
+    while va < end {
+        let page = batch.pinned_at(va).ok_or(BatchError::NotCaptured(va))?;
+        let offset = va % PAGE_BYTES;
+        let count = (end - va).min(PAGE_BYTES - offset);
+        source.insert(page.slab(), page.buffer());
+        pieces.push((page.buffer(), page.offset() + offset, va - start, count));
+        va += count;
+    }
+    list.keep(buffer);
+    let cmd = list.recording();
+    let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    let read = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+    let mut gather: Vec<_> = source.values().map(|src| transition(src, uav, read)).collect();
+    if before != dest {
+        gather.push(transition(buffer, before, dest));
+    }
+    let finish: Vec<_> = source.values().map(|src| transition(src, read, uav))
+        .chain([transition(buffer, dest, after)]).collect();
+    // SAFETY: every source fits a pinned slot; the caller supplies a
+    // separate destination sized to the whole span in the given state.
+    unsafe {
+        cmd.ResourceBarrier(&gather);
+        for (src, from, to, count) in pieces {
+            cmd.CopyBufferRegion(buffer, to, src, from, count);
+        }
+        cmd.ResourceBarrier(&finish);
+    }
+    Ok(())
 }

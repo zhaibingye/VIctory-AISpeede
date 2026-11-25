@@ -15,6 +15,17 @@ use crate::resource::HostTexture;
 pub(crate) enum DrawCall {
     Direct { vertices: u32, instances: u32, first: u32, first_instance: u32 },
     Indexed { indices: u32, instances: u32, first: u32, base: i32, first_instance: u32 },
+    Indirect(crate::page_indirect::IndirectDraw),
+}
+
+impl DrawCall {
+    pub(crate) fn indexed(&self) -> bool {
+        match self {
+            Self::Direct { .. } => false,
+            Self::Indexed { .. } => true,
+            Self::Indirect(draw) => draw.indexed,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -131,6 +142,9 @@ impl ClosedDraw {
         for input in &self.inputs {
             ranges.push(input.range()?);
         }
+        if let DrawCall::Indirect(draw) = self.call {
+            draw.ranges(ranges)?;
+        }
         Ok(())
     }
 
@@ -139,7 +153,12 @@ impl ClosedDraw {
         host: &Host,
         list: &HostList,
         batch: &PinnedBatch,
+        budget: &mut Option<ID3D12Resource>,
     ) -> Result<(), BatchError> {
+        let indirect = match self.call {
+            DrawCall::Indirect(draw) => Some(draw.prepare(host, list, batch, budget)?),
+            _ => None,
+        };
         for &input in &self.inputs {
             input.encode(host, list, batch)?;
         }
@@ -179,6 +198,7 @@ impl ClosedDraw {
                 DrawCall::Indexed { indices, instances, first, base, first_instance } => {
                     cmd.DrawIndexedInstanced(indices, instances, first, base, first_instance);
                 }
+                DrawCall::Indirect(_) => indirect.as_ref().expect("indirect arguments prepared").draw(cmd),
             }
             if before != render_target {
                 cmd.ResourceBarrier(&[transition(texture, render_target, before)]);
@@ -191,6 +211,17 @@ impl ClosedDraw {
 #[cfg(all(test, feature = "diagnostics"))]
 #[test]
 fn paged_title_draw_reads_gpu_copied_vertices_and_renders_pixels() {
+    check_paged_title_pixels(false);
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[test]
+fn paged_title_indirect_draw_reads_gpu_generated_records_and_count() {
+    check_paged_title_pixels(true);
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn check_paged_title_pixels(indirect: bool) {
     use victory_memory::{PAGE_BYTES, physical::PageNumbers};
     use windows::Win32::Graphics::Direct3D::{
         D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, Fxc::D3DCompile,
@@ -318,6 +349,10 @@ float4 pixel() : SV_Target0 { return green; }
     {
         let mut bytes = section.lock().unwrap();
         bytes[..24].fill(0); // Degenerate triangle before the GPU copy.
+        bytes[64..100].fill(0); // Zero count and args before GPU copies.
+        for (slot, value) in bytes[112..132].chunks_exact_mut(4).zip([3u32, 1, 0, 0, 1]) {
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
         for (slot, value) in bytes[32..56].chunks_exact_mut(4)
             .zip([-1.0f32, -1., -1., 3., 3., -1.])
         {
@@ -332,12 +367,22 @@ float4 pixel() : SV_Target0 { return green; }
     let color = ColorTarget::capture(target_state.clone(), None).unwrap();
     let title = host.new_list().unwrap();
     title.defer_copy(VA as *mut u8, (ALIAS + 32) as *const u8, 24);
+    let call = if indirect {
+        title.defer_copy((VA + 64) as *mut u8, (ALIAS + 112) as *const u8, 16);
+        title.defer_copy((VA + 96) as *mut u8, (ALIAS + 128) as *const u8, 4);
+        DrawCall::Indirect(crate::page_indirect::IndirectDraw {
+            indexed: false, stride: 16, max: 2,
+            arguments: (VA + 64) as u64, count: Some((VA + 96) as u64),
+        })
+    } else {
+        DrawCall::Direct { vertices: 3, instances: 1, first: 0, first_instance: 0 }
+    };
     let mut draw = ClosedDraw::from_proven_native(
         pso, root, color, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
         D3D12_VIEWPORT { Width: 4.0, Height: 4.0, MaxDepth: 1.0, ..Default::default() },
         RECT { left: 0, top: 0, right: 4, bottom: 4 },
         vec![InputView::Vertex(0, VertexView { address: VA as u64, size: 24, stride: 8 })],
-        DrawCall::Direct { vertices: 3, instances: 1, first: 0, first_instance: 0 },
+        call,
     );
     draw.constants.push(RootWords {
         parameter: 0,

@@ -153,6 +153,7 @@ impl Host {
                 None
             };
             let mut dirty = BTreeSet::new();
+            let mut indirect_budget = None;
             for op in ops {
                 match op {
                     PageOp::Copy(copy) => {
@@ -164,7 +165,7 @@ impl Host {
                             .map_err(BatchError::Native)?;
                     }
                     PageOp::Input(input) => input.encode(self, list, batch)?,
-                    PageOp::Draw(draw) => draw.encode(self, list, batch)?,
+                    PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget)?,
                 }
             }
             Ok(dirty)

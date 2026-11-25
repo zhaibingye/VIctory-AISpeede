@@ -49,6 +49,9 @@ mod page_queue;
 #[allow(dead_code, reason = "closed native draws are admitted at renderer cutover")]
 mod page_draw;
 #[cfg(windows)]
+#[allow(dead_code, reason = "closed indirect draws are admitted at renderer cutover")]
+mod page_indirect;
+#[cfg(windows)]
 #[allow(dead_code, reason = "strict graphics resource admission is used at renderer cutover")]
 mod page_shader;
 #[cfg(windows)]
