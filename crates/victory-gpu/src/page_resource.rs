@@ -100,6 +100,50 @@ impl PageBarrier {
     }
 }
 
+fn single_color(d: D3D12_RESOURCE_DESC) -> bool {
+    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.MipLevels == 1 && d.DepthOrArraySize == 1
+        && d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0
+        && d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+        && !d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+}
+
+/// Full replacement from a placed linear view into a native title
+/// texture. It shares the queue's authority and transition ledger.
+pub(crate) struct TextureUpload {
+    source: crate::page_texture::LinearTexture,
+    target: Arc<HostTexture>,
+}
+
+impl TextureUpload {
+    pub(crate) fn capture(source: crate::page_texture::LinearTexture, target: Arc<HostTexture>) -> Option<Self> {
+        // SAFETY: the retained resource is live.
+        let desc = unsafe { target.texture.GetDesc() };
+        if !single_color(desc) || target.sparse.is_some()
+            || target.twin.get().is_some_and(Option::is_some)
+            || desc.Width != u64::from(source.width) || desc.Height != source.height
+            || desc.Format != source.format
+        {
+            return None;
+        }
+        Some(Self { source, target })
+    }
+
+    pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
+        ranges.extend(self.source.rows()?);
+        Ok(())
+    }
+
+    pub(crate) fn encode(&self, host: &crate::host::Host, list: &HostList,
+        batch: &crate::page_slabs::PinnedBatch, plan: &mut ResourcePlan,
+    ) -> Result<(), BatchError> {
+        plan.transition_texture(list, &self.target, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
+        self.source.copy_to(host, list, batch, &self.target.texture)?;
+        plan.initialize(&self.target);
+        Ok(())
+    }
+}
+
 /// An ordered copy between exact, native-authoritative color surfaces.
 /// Title-backed uploads, conversion, sparse and twin surfaces are not
 /// interchangeable with this operation.
@@ -132,13 +176,6 @@ impl TextureCopy {
     ) -> Option<Self> {
         // SAFETY: the references retain both native resources.
         let (a, b) = unsafe { (src.texture.GetDesc(), dst.texture.GetDesc()) };
-        let single_color = |d: D3D12_RESOURCE_DESC| {
-            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
-                && d.MipLevels == 1 && d.DepthOrArraySize == 1
-                && d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0
-                && d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
-                && !d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
-        };
         if Arc::ptr_eq(&src, &dst) || src.texture == dst.texture
             || !single_color(a) || !single_color(b)
             || a.Format != b.Format

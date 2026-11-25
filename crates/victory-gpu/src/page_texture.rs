@@ -42,7 +42,7 @@ impl LinearTexture {
     pub(crate) fn encode(
         self, host: &Host, list: &HostList, batch: &PinnedBatch,
     ) -> Result<ID3D12Resource, BatchError> {
-        let rows = self.rows()?;
+        let _ = self.rows()?;
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: u64::from(self.width),
@@ -53,21 +53,9 @@ impl LinearTexture {
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             ..Default::default()
         };
-        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-        let (mut row_count, mut row_bytes, mut total) = (0, 0, 0);
-        // SAFETY: one subresource and correctly sized output locations.
-        let alloc = unsafe {
-            host.device.GetCopyableFootprints(&desc, 0, 1, 0,
-                Some(&mut footprint), Some(&mut row_count), Some(&mut row_bytes), Some(&mut total));
-            host.device.GetResourceAllocationInfo(0, &[desc]).SizeInBytes
-        };
-        if row_count != self.height || row_bytes != u64::from(self.width) * 4
-            || total == u64::MAX || total == 0 || footprint.Footprint.Depth != 1
-        {
-            return Err(BatchError::Native(E_FAIL.into()));
-        }
+        // SAFETY: one validated 2D texture description.
+        let alloc = unsafe { host.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
-        let read = D3D12_RESOURCE_STATE_COPY_SOURCE;
         let texture: ID3D12Resource = host.managed_gpu(alloc, |heap| {
             let mut resource = None;
             // SAFETY: checked texture description and live output slot.
@@ -77,18 +65,57 @@ impl LinearTexture {
             }
             resource.ok_or_else(|| Error::from(E_FAIL))
         }).map_err(BatchError::Native)?;
+        self.copy_to(host, list, batch, &texture)?;
+        // SAFETY: copy_to leaves the retained texture in COPY_DEST.
+        unsafe {
+            list.recording().ResourceBarrier(&[transition(&texture, dest,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                    | D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        }
+        Ok(texture)
+    }
+
+    /// Gather current GPU bytes at the exact point of use. The caller
+    /// supplies a matching native subresource zero in COPY_DEST.
+    pub(crate) fn copy_to(
+        self, host: &Host, list: &HostList, batch: &PinnedBatch, texture: &ID3D12Resource,
+    ) -> Result<(), BatchError> {
+        let rows = self.rows()?;
+        // SAFETY: live native resource. Only an exact single subresource
+        // is consumed here, regardless of the guest's pitch.
+        let desc = unsafe { texture.GetDesc() };
+        if desc.Width != u64::from(self.width) || desc.Height != self.height || desc.Format != self.format
+            || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
+            || desc.MipLevels != 1 || desc.DepthOrArraySize != 1
+        {
+            return Err(BatchError::Native(E_FAIL.into()));
+        }
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut row_count, mut row_bytes, mut total) = (0, 0, 0);
+        // SAFETY: one subresource and correctly sized output locations.
+        unsafe {
+            host.device.GetCopyableFootprints(&desc, 0, 1, 0,
+                Some(&mut footprint), Some(&mut row_count), Some(&mut row_bytes), Some(&mut total));
+        }
+        if row_count != self.height || row_bytes != u64::from(self.width) * 4
+            || total == u64::MAX || total == 0 || footprint.Footprint.Depth != 1
+        {
+            return Err(BatchError::Native(E_FAIL.into()));
+        }
+        let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+        let read = D3D12_RESOURCE_STATE_COPY_SOURCE;
         let staging = host.default_buffer(total)
             .ok_or_else(|| BatchError::Native(E_OUTOFMEMORY.into()))?;
         let pitch = u64::from(footprint.Footprint.RowPitch);
         crate::page_view::gather_regions(list, batch, rows.enumerate().map(|(i, range)| {
             (range, footprint.Offset + i as u64 * pitch)
         }), &staging, dest, read)?;
-        list.keep(&texture);
+        list.keep(texture);
         // SAFETY: both resources stay alive in the named states. The
         // placed buffer footprint came from exactly this texture desc.
         unsafe {
             let to = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&texture),
+                pResource: std::mem::transmute_copy(texture),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
             };
@@ -99,10 +126,8 @@ impl LinearTexture {
             };
             let cmd = list.recording();
             cmd.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-            cmd.ResourceBarrier(&[transition(&texture, dest,
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | read)]);
         }
-        Ok(texture)
+        Ok(())
     }
 }
 

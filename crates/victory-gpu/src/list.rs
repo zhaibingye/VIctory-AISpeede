@@ -584,6 +584,25 @@ extern "system" fn copy_texture_region(
                         .then(|| (*location).resource)
                 }
             };
+            // SAFETY: the discriminator is initialized for every
+            // readable location; read the footprint only in that variant.
+            if !src.is_null() && unsafe { (*src).kind } == FOOTPRINT {
+                let target = subresource_zero(dst).and_then(crate::resource::host_copy);
+                let upload = if x == 0 && y == 0 && z == 0 && source_box.is_null() {
+                    // SAFETY: the initialized footprint variant.
+                    unsafe { (*src).footprint.linear_page_source((*src).resource) }
+                        .zip(target)
+                        .and_then(|(from, to)| crate::page_resource::TextureUpload::capture(from, to))
+                } else {
+                    None
+                };
+                if let Some(upload) = upload {
+                    list.record_page_texture_upload(upload);
+                } else {
+                    list.mark_unlowered();
+                }
+                return;
+            }
             if z != 0 {
                 list.mark_unlowered();
                 return;

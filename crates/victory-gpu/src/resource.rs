@@ -367,6 +367,23 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    #[cfg(windows)]
+    pub(crate) fn linear_page_source(self, buffer: This) -> Option<crate::page_texture::LinearTexture> {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let (base, size) = buffer_bytes(buffer)?;
+        if base.is_null() || self.depth != 1 {
+            return None;
+        }
+        let address = (base as u64).checked_add(self.offset)?;
+        let texture = crate::page_texture::LinearTexture {
+            address, width: self.width, height: self.height, row_pitch: self.row_pitch,
+            format: DXGI_FORMAT(self.format as i32),
+        };
+        let end = texture.rows().ok()?.last()?.1;
+        (end.checked_sub(base as u64)? <= size).then_some(texture)
+    }
+
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
