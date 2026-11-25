@@ -5,6 +5,7 @@ use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{Host, HostList};
+use crate::page_shader::{RootWords, UnloweredShader};
 use crate::page_slabs::{BatchError, PinnedBatch};
 use crate::page_view::InputView;
 
@@ -22,6 +23,7 @@ pub(crate) struct ClosedDraw {
     scissor: RECT,
     inputs: Vec<InputView>,
     call: DrawCall,
+    constants: Vec<RootWords>,
 }
 
 impl ClosedDraw {
@@ -39,7 +41,42 @@ impl ClosedDraw {
         inputs: Vec<InputView>,
         call: DrawCall,
     ) -> Self {
-        Self { pipeline, root, target, topology, viewport, scissor, inputs, call }
+        Self {
+            pipeline, root, target, topology, viewport, scissor, inputs, call,
+            constants: Vec::new(),
+        }
+    }
+
+    /// Admit a real translated title PSO only when every stage gets an
+    /// unambiguous captured constant block and has no guest memory views.
+    /// The producer is still responsible for complete IA and target state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_translated(
+        pipeline: &crate::pipeline::host::HostPipeline,
+        values: impl Fn(u8, u32) -> Option<u32>,
+        target: ID3D12Resource,
+        topology: D3D_PRIMITIVE_TOPOLOGY,
+        viewport: D3D12_VIEWPORT,
+        scissor: RECT,
+        inputs: Vec<InputView>,
+        call: DrawCall,
+    ) -> Result<Self, UnloweredShader> {
+        if pipeline.compute || pipeline.mesh || pipeline.rectangles || pipeline.marks.is_some() {
+            return Err(UnloweredShader::UnknownUserData);
+        }
+        let mut constants = Vec::new();
+        for stage in &pipeline.stages {
+            let t = stage.translated();
+            if let Some(words) = crate::page_shader::constants_only(
+                &t.host, &t.used, stage.user_data, &values,
+            )? {
+                constants.push(words);
+            }
+        }
+        Ok(Self {
+            pipeline: pipeline.pso.clone(), root: pipeline.root.clone(),
+            target, topology, viewport, scissor, inputs, call, constants,
+        })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -68,6 +105,11 @@ impl ClosedDraw {
             let cmd = list.recording();
             cmd.SetGraphicsRootSignature(&self.root);
             cmd.SetPipelineState(&self.pipeline);
+            for root in &self.constants {
+                cmd.SetGraphicsRoot32BitConstants(
+                    root.parameter, root.words.len() as u32, root.words.as_ptr().cast(), 0,
+                );
+            }
             cmd.IASetPrimitiveTopology(self.topology);
             cmd.RSSetViewports(&[self.viewport]);
             cmd.RSSetScissorRects(&[self.scissor]);
@@ -103,7 +145,8 @@ fn paged_title_draw_reads_gpu_copied_vertices_and_renders_pixels() {
     let device = &host.device;
     let source = r#"
 float4 vertex(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }
-float4 pixel() : SV_Target0 { return float4(0, 1, 0, 1); }
+cbuffer Color : register(b0) { float4 green; }
+float4 pixel() : SV_Target0 { return green; }
 "#;
     let compile = |entry, profile| {
         let mut code: Option<ID3DBlob> = None;
@@ -120,8 +163,17 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 1); }
     // SAFETY: creation descriptors and shader blobs live through calls.
     let (root, pso, target): (ID3D12RootSignature, ID3D12PipelineState, ID3D12Resource) = unsafe {
         let mut serialized: Option<ID3DBlob> = None;
+        let constants = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        };
         D3D12SerializeRootSignature(
             &D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: 1,
+                pParameters: &constants,
                 Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
                 ..Default::default()
             },
@@ -211,13 +263,18 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 1); }
     }
     let title = host.new_list().unwrap();
     title.defer_copy(VA as *mut u8, (ALIAS + 32) as *const u8, 24);
-    title.record_page_draw(ClosedDraw::from_proven_native(
+    let mut draw = ClosedDraw::from_proven_native(
         pso, root, target.clone(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
         D3D12_VIEWPORT { Width: 4.0, Height: 4.0, MaxDepth: 1.0, ..Default::default() },
         RECT { left: 0, top: 0, right: 4, bottom: 4 },
         vec![InputView::Vertex(0, VertexView { address: VA as u64, size: 24, stride: 8 })],
         DrawCall::Direct { vertices: 3, instances: 1, first: 0, first_instance: 0 },
-    ));
+    );
+    draw.constants.push(RootWords {
+        parameter: 0,
+        words: [0.0f32, 1.0, 0.0, 1.0].into_iter().map(f32::to_bits).collect(),
+    });
+    title.record_page_draw(draw);
     title.close();
     let stats = host.execute_paged_title(heap, &mut backing, &[&title]).unwrap();
     assert_eq!((stats.uploaded, stats.downloaded), (1, 1));

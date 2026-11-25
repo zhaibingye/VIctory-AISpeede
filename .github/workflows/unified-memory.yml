@@ -60,6 +60,7 @@ jobs:
       - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_title_recording_rejects_mixed_lists_before_alias_copy
       - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_input_views_gather_cross_page_gpu_writes
       - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_title_draw_reads_gpu_copied_vertices_and_renders_pixels
+      - run: cargo test -p victory-gpu --features diagnostics --locked --lib closed_draw_
   shader-pages:
     runs-on: windows-latest
     timeout-minutes: 25
