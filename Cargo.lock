@@ -737,6 +737,9 @@ dependencies = [
 [[package]]
 name = "victory-memory"
 version = "0.1.0"
+dependencies = [
+ "windows",
+]
 
 [[package]]
 name = "victory-pe"

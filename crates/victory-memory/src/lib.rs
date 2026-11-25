@@ -1,5 +1,5 @@
 //! Portable policy for the replacement Series S memory engine.
-#![forbid(unsafe_code)]
+#![cfg_attr(not(windows), forbid(unsafe_code))]
 
 pub mod budget;
 pub mod coherence;
@@ -8,3 +8,6 @@ pub mod guest;
 pub mod residency;
 
 pub const PAGE_BYTES: u64 = 64 << 10;
+
+#[cfg(windows)]
+pub mod d3d12;

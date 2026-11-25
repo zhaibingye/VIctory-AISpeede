@@ -42,6 +42,11 @@ impl Engine {
 
     pub fn used(&self, pool: Pool) -> u64 { self.budget.used(pool) }
 
+    #[cfg(windows)]
+    pub(crate) fn charge_staging(&mut self, bytes: u64) -> Result<Charge, Error> {
+        self.budget.charge(Pool::Ram, bytes).map_err(Error::Space)
+    }
+
     pub fn commit(&mut self, address: u64) -> Result<PageId, Error> {
         let ram = self.budget.charge(Pool::Ram, PAGE_BYTES).map_err(Error::Space)?;
         match self.guest.commit_page(address) {

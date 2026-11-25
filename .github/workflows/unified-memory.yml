@@ -1,0 +1,23 @@
+name: Unified memory fixture
+
+on:
+  push:
+    branches: [refactor/unified-memory-engine]
+    paths:
+      - '.github/workflows/unified-memory.yml'
+      - 'crates/victory-memory/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  warp:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo test -p victory-memory --locked
