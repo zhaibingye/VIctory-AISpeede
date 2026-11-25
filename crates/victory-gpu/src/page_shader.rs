@@ -18,6 +18,7 @@ pub(crate) enum UnloweredShader {
 pub(crate) struct RootWords {
     pub(crate) parameter: u32,
     pub(crate) words: Vec<u32>,
+    pub(crate) tables: Vec<(usize, u8)>,
 }
 
 pub(crate) fn constants_only(
@@ -25,6 +26,16 @@ pub(crate) fn constants_only(
     used: &[UsedResource],
     block: Option<(u32, u32)>,
     values: impl Fn(u8, u32) -> Option<u32>,
+) -> Result<Option<RootWords>, UnloweredShader> {
+    stage_words(shader, used, block, values, |_| false)
+}
+
+pub(crate) fn stage_words(
+    shader: &HostShader,
+    used: &[UsedResource],
+    block: Option<(u32, u32)>,
+    values: impl Fn(u8, u32) -> Option<u32>,
+    tables: impl Fn(u8) -> bool,
 ) -> Result<Option<RootWords>, UnloweredShader> {
     if shader.memory || shader.memory_writes || shader.view_addresses {
         return Err(UnloweredShader::DynamicAddress);
@@ -37,13 +48,14 @@ pub(crate) fn constants_only(
     {
         return Err(UnloweredShader::RootView);
     }
-    if used.iter().any(|u| u.root == RootType::Table) {
-        return Err(UnloweredShader::DescriptorTable);
+    for u in used {
+        if u.root != RootType::Table || u.kind != victory_shader::ResourceType::Srv
+            || !tables(u.slot)
+        {
+            return Err(UnloweredShader::DescriptorTable);
+        }
     }
-    if !used.is_empty() {
-        return Err(UnloweredShader::UnknownUserData);
-    }
-    pack_constants(&shader.user_data, shader.user_data_dwords(), block, values)
+    pack_words(&shader.user_data, shader.user_data_dwords(), block, values, tables)
 }
 
 fn pack_constants(
@@ -52,9 +64,16 @@ fn pack_constants(
     block: Option<(u32, u32)>,
     values: impl Fn(u8, u32) -> Option<u32>,
 ) -> Result<Option<RootWords>, UnloweredShader> {
-    if metadata.iter().any(|u| u.root != RootType::Constants) {
-        return Err(UnloweredShader::UnknownUserData);
-    }
+    pack_words(metadata, size, block, values, |_| false)
+}
+
+fn pack_words(
+    metadata: &[UserData],
+    size: u32,
+    block: Option<(u32, u32)>,
+    values: impl Fn(u8, u32) -> Option<u32>,
+    supported_table: impl Fn(u8) -> bool,
+) -> Result<Option<RootWords>, UnloweredShader> {
     if metadata.is_empty() && block.is_none() {
         return Ok(None);
     }
@@ -66,6 +85,7 @@ fn pack_constants(
     }
     let mut words = vec![0; count as usize];
     let mut occupied = 0u64;
+    let mut tables = Vec::new();
     for u in metadata {
         let w = words.get_mut(u.index as usize).ok_or(UnloweredShader::ConstantLayout)?;
         let mask = 1u64 << u.index;
@@ -73,10 +93,18 @@ fn pack_constants(
             return Err(UnloweredShader::ConstantLayout);
         }
         occupied |= mask;
-        *w = values(u.slot, u.dword)
-            .ok_or(UnloweredShader::MissingConstant { slot: u.slot, dword: u.dword })?;
+        match u.root {
+            RootType::Constants => {
+                *w = values(u.slot, u.dword)
+                    .ok_or(UnloweredShader::MissingConstant { slot: u.slot, dword: u.dword })?;
+            }
+            RootType::Table if u.dword == 0 && supported_table(u.slot) => {
+                tables.push((u.index as usize, u.slot));
+            }
+            _ => return Err(UnloweredShader::UnknownUserData),
+        }
     }
-    Ok(Some(RootWords { parameter, words }))
+    Ok(Some(RootWords { parameter, words, tables }))
 }
 
 #[cfg(test)]
@@ -142,16 +170,23 @@ fn closed_draw_rejects_unlowered_shader_accesses() {
 }
 
 
-/// Resolve only views explicitly named by a complete texture-only shader
-/// proof. No unbound descriptor is substituted for an unavailable view.
-pub(crate) fn resolve_static_textures(
-    container: &[u8],
-    mut capture: impl FnMut(u8, u32) -> Option<crate::page_texture::LinearTexture>,
-) -> Result<Vec<(victory_shader::emit::StaticTextureSlot, crate::page_texture::LinearTexture)>, UnloweredShader> {
-    let slots = victory_shader::emit::static_texture_slots(container)
-        .ok().flatten().ok_or(UnloweredShader::DescriptorTable)?;
-    slots.into_iter().map(|slot| {
-        let texture = capture(slot.root, slot.index).ok_or(UnloweredShader::DescriptorTable)?;
-        Ok((slot, texture))
-    }).collect()
+impl RootWords {
+    pub(crate) fn relocated(&self, bases: &std::collections::BTreeMap<u8, u32>) -> Option<Vec<u32>> {
+        let mut words = self.words.clone();
+        for &(word, slot) in &self.tables {
+            words[word] = bases.get(&slot)?.checked_mul(32)?;
+        }
+        Some(words)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn closed_draw_relocates_table_byte_offsets_without_changing_constants() {
+    let table = UserData { index: 0, slot: 4, root: RootType::Table, dword: 0 };
+    let constant = UserData { index: 2, slot: 1, root: RootType::Constants, dword: 3 };
+    let words = pack_words(&[table, constant], 4, Some((5, 4)), |_, _| Some(0x700), |s| s == 4)
+        .unwrap().unwrap();
+    assert_eq!(words.relocated(&[(4, 32)].into()), Some(vec![1024, 0, 0x700, 0]));
+    assert_eq!(words.relocated(&std::collections::BTreeMap::new()), None);
 }

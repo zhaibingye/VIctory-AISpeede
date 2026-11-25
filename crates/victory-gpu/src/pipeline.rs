@@ -63,6 +63,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    static_texture_slots: OnceLock<Option<Vec<victory_shader::emit::StaticTextureSlot>>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -93,6 +95,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            static_texture_slots: OnceLock::new(),
         }
     }
 }
@@ -106,6 +110,12 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    pub(crate) fn static_texture_slots(&self) -> Option<&[victory_shader::emit::StaticTextureSlot]> {
+        self.static_texture_slots
+            .get_or_init(|| victory_shader::emit::static_texture_slots(&self.container).ok().flatten())
+            .as_deref()
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {

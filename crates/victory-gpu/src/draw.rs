@@ -405,6 +405,12 @@ impl State {
                 Some(Root::Constants(words)) => words.get(dword as usize).copied().flatten(),
                 _ => None,
             },
+            |root, index| {
+                let Root::Table(first) = *self.graphics.get(root as usize)? else { return None };
+                let heap = self.heap_of(first)?;
+                let records = heap.table_records(first, index.checked_add(1)?)?;
+                table_view(*records.get(index as usize)?)?.paged_linear_srv()
+            },
             target,
             D3D_PRIMITIVE_TOPOLOGY(self.topology as i32),
             viewport,

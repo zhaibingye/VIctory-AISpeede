@@ -60,6 +60,24 @@ impl PageDescriptors<'_> {
         Ok(slot)
     }
 
+    pub(crate) fn reserve_texture_run(
+        &mut self,
+        views: &[Option<(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>],
+    ) -> Result<u32> {
+        let n = u32::try_from(views.len()).map_err(|_| oom())?;
+        let first = self.heap.dynamic(n).ok_or_else(oom)?;
+        for (offset, view) in views.iter().enumerate() {
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+            let slot = first + offset as u32;
+            let (resource, format) = view.as_ref().map_or(
+                (None, DXGI_FORMAT_R8G8B8A8_UNORM), |(tex, f)| (Some(tex), *f),
+            );
+            self.heap.paged_texture_at(slot, resource, format);
+            self.textures.push((slot, format));
+        }
+        Ok(first)
+    }
+
     pub(crate) fn reserve_texture(
         &mut self,
         texture: &ID3D12Resource,

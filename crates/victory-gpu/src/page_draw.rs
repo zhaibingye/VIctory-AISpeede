@@ -4,6 +4,7 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::Ordering};
 
 use crate::host::{Host, HostList, transition};
@@ -71,6 +72,7 @@ pub(crate) struct ClosedDraw {
     constants: Vec<RootWords>,
     blend_factor: [f32; 4],
     sample: Option<crate::page_texture::SampledTexture>,
+    texture_tables: BTreeMap<u8, BTreeMap<u32, crate::page_texture::LinearTexture>>,
 }
 
 impl ClosedDraw {
@@ -93,6 +95,7 @@ impl ClosedDraw {
             constants: Vec::new(),
             blend_factor: [1.0; 4],
             sample: None,
+            texture_tables: BTreeMap::new(),
         }
     }
 
@@ -103,6 +106,7 @@ impl ClosedDraw {
     pub(crate) fn from_translated(
         pipeline: &crate::pipeline::host::HostPipeline,
         values: impl Fn(u8, u32) -> Option<u32>,
+        texture: impl Fn(u8, u32) -> Option<crate::page_texture::LinearTexture>,
         target: ColorTarget,
         topology: D3D_PRIMITIVE_TOPOLOGY,
         viewport: D3D12_VIEWPORT,
@@ -121,12 +125,31 @@ impl ClosedDraw {
             return Err(UnloweredShader::GraphicsState);
         }
         let mut constants = Vec::new();
+        let mut texture_tables = BTreeMap::<u8, BTreeMap<u32, _>>::new();
         for stage in &pipeline.stages {
             let t = stage.translated();
-            if let Some(words) = crate::page_shader::constants_only(
+            let needs_table = t.host.user_data.iter().any(|u| u.root == victory_shader::RootType::Table);
+            let slots = if needs_table {
+                stage.shader.static_texture_slots().ok_or(UnloweredShader::DescriptorTable)?
+            } else {
+                &[]
+            };
+            if let Some(words) = crate::page_shader::stage_words(
                 &t.host, &t.used, stage.user_data, &values,
+                |root| slots.iter().any(|s| s.root == root),
             )? {
+                for slot in slots {
+                    if !words.tables.iter().any(|&(_, root)| root == slot.root) {
+                        return Err(UnloweredShader::DescriptorTable);
+                    }
+                    let table = texture_tables.entry(slot.root).or_default();
+                    if let std::collections::btree_map::Entry::Vacant(e) = table.entry(slot.index) {
+                        e.insert(texture(slot.root, slot.index).ok_or(UnloweredShader::DescriptorTable)?);
+                    }
+                }
                 constants.push(words);
+            } else if !slots.is_empty() {
+                return Err(UnloweredShader::DescriptorTable);
             }
         }
         Ok(Self {
@@ -134,6 +157,7 @@ impl ClosedDraw {
             target, topology, viewport, scissor, inputs, call, constants,
             blend_factor: [1.0; 4],
             sample: None,
+            texture_tables,
         })
     }
 
@@ -150,6 +174,11 @@ impl ClosedDraw {
         }
         if let Some(sample) = &self.sample {
             ranges.extend(sample.input.rows()?);
+        }
+        for table in self.texture_tables.values() {
+            for texture in table.values() {
+                ranges.extend(texture.rows()?);
+            }
         }
         Ok(())
     }
@@ -168,6 +197,20 @@ impl ClosedDraw {
         };
         let sample = self.sample.as_ref()
             .map(|input| input.prepare(host, list, batch, descriptors)).transpose()?;
+        let mut bases = BTreeMap::new();
+        for (&root, table) in &self.texture_tables {
+            let size = table.last_key_value().expect("captured slots exist").0 + 1;
+            let mut views = vec![None; size as usize];
+            for (&index, &texture) in table {
+                views[index as usize] = Some((texture.encode(host, list, batch)?, texture.format));
+            }
+            let first = descriptors.reserve_texture_run(&views).map_err(BatchError::Native)?;
+            bases.insert(root, first);
+        }
+        let words: Vec<_> = self.constants.iter().map(|root| {
+            root.relocated(&bases).map(|words| (root.parameter, words))
+                .ok_or_else(|| BatchError::Native(windows::Win32::Foundation::E_FAIL.into()))
+        }).collect::<Result<_, _>>()?;
         for &input in &self.inputs {
             input.encode(host, list, batch)?;
         }
@@ -193,9 +236,12 @@ impl ClosedDraw {
             if let Some(sample) = &sample {
                 sample.bind(cmd, descriptors);
             }
-            for root in &self.constants {
+            if !bases.is_empty() {
+                cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
+            }
+            for (param, words) in &words {
                 cmd.SetGraphicsRoot32BitConstants(
-                    root.parameter, root.words.len() as u32, root.words.as_ptr().cast(), 0,
+                    *param, words.len() as u32, words.as_ptr().cast(), 0,
                 );
             }
             cmd.IASetPrimitiveTopology(self.topology);
@@ -454,6 +500,7 @@ float4 pixel() : SV_Target0 { return green; }
         draw.constants.push(RootWords {
             parameter: 0,
             words: [0.0f32, 1.0, 0.0, 1.0].into_iter().map(f32::to_bits).collect(),
+            tables: Vec::new(),
         });
     }
     title.record_page_draw(draw);
