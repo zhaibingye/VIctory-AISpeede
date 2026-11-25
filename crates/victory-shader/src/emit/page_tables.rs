@@ -1,9 +1,9 @@
-//! A conservative proof of the exact texture slots a title shader reads.
+//! A conservative proof of exact descriptor slots and admitted accesses.
 //! UsedResource records describe ranges, not an upper bound on runtime
 //! indices. Trace the actual descriptor operands instead of trusting them.
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::gfx10::Fields;
+use crate::gfx10::{Fields, NULL, Operand};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType};
 use crate::resource::{Address, Role, Source};
 use crate::{Container, FourCC, ShaderError};
@@ -16,10 +16,31 @@ pub struct StaticTextureSlot {
     pub index: u32,
 }
 
-/// Prove the descriptor operand footprint for one native shader. A
-/// successful proof of descriptors alone does not admit the program:
-/// raw memory, root views and writes must be checked by the renderer too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StaticViewAccess {
+    TextureRead,
+    /// An immediate aligned write relative to the raw buffer descriptor.
+    RawWrite { offset: u32, bytes: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StaticViewSlot {
+    pub slot: StaticTextureSlot,
+    pub access: StaticViewAccess,
+}
+
 pub fn static_texture_slots(container: &[u8]) -> Result<Option<Vec<StaticTextureSlot>>, ShaderError> {
+    Ok(static_view_slots(container)?.and_then(|views| {
+        views.into_iter().map(|view| {
+            (view.access == StaticViewAccess::TextureRead).then_some(view.slot)
+        }).collect()
+    }))
+}
+
+/// Prove descriptor operands and raw store byte windows from native
+/// instructions, not inferred from resource declarations. Excludes
+/// arbitrary addresses and does not by itself admit a host shader.
+pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
@@ -45,23 +66,46 @@ pub fn static_texture_slots(container: &[u8]) -> Result<Option<Vec<StaticTexture
             continue;
         }
         let name = inst.name();
-        if !matches!(inst.fields, Fields::Image { dim: 1, .. })
-            || !(name.starts_with("image_sample") || matches!(name, "image_load" | "image_load_mip"))
+        let access = if matches!(inst.fields, Fields::Image { dim: 1, .. })
+            && (name.starts_with("image_sample") || matches!(name, "image_load" | "image_load_mip"))
         {
+            StaticViewAccess::TextureRead
+        } else if let Some(access) = immediate_raw_store(name, &inst.fields) {
+            access
+        } else {
             return Ok(None);
-        }
+        };
         let Source::Loaded { load, first } = descriptor.source else {
             return Ok(None);
         };
         if resources.waterfall.loads.contains(&load) {
             return Ok(None);
         }
-        let Some(slot) = addresses.get(&load).and_then(|a| proven_slot(&native, *a, first)) else {
+        let Some(slot) = addresses.get(&load).and_then(|a| proven_slot(&native, *a, first, access)) else {
             return Ok(None);
         };
-        slots.insert(slot);
+        slots.insert(StaticViewSlot { slot, access });
     }
     Ok(Some(slots.into_iter().collect()))
+}
+
+fn immediate_raw_store(name: &str, fields: &Fields) -> Option<StaticViewAccess> {
+    let bytes = match name {
+        "buffer_store_dword" => 4,
+        "buffer_store_dwordx2" => 8,
+        "buffer_store_dwordx3" => 12,
+        "buffer_store_dwordx4" => 16,
+        _ => return None,
+    };
+    let Fields::Buffer {
+        offset, soffset, offen: false, idxen: false, format: None, lds: false, tfe: false, ..
+    } = fields else { return None };
+    if !matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128))
+        || !offset.is_multiple_of(4)
+    {
+        return None;
+    }
+    Some(StaticViewAccess::RawWrite { offset: u32::from(*offset), bytes })
 }
 
 fn table_slot(address: Address, first: u8) -> Option<u32> {
@@ -78,18 +122,27 @@ fn table_slot(address: Address, first: u8) -> Option<u32> {
     (slot < 256).then_some(slot)
 }
 
-fn proven_slot(native: &NativeProgram, address: Address, first: u8) -> Option<StaticTextureSlot> {
+fn proven_slot(
+    native: &NativeProgram, address: Address, first: u8, access: StaticViewAccess,
+) -> Option<StaticTextureSlot> {
     let param = native.layout.get(address.param)?;
     let index = table_slot(address, first)?;
     if param.root != RootType::Table {
         return None;
     }
-    let used = native.used.iter().filter(|u| {
+    let relevant = native.used.iter().filter(|u| {
         u.root == RootType::Table && u.user_data == param.user_data
             && u.slot == param.slot && u.table_offset_dwords <= index * 8
-    }).max_by_key(|u| u.table_offset_dwords)?;
-    (used.kind == ResourceType::Srv && used.dwords == 8)
-        .then_some(StaticTextureSlot { root: param.slot, index })
+    });
+    let used = relevant.clone().max_by_key(|u| u.table_offset_dwords)?;
+    let admitted = match access {
+        StaticViewAccess::TextureRead => used.kind == ResourceType::Srv && used.dwords == 8,
+        StaticViewAccess::RawWrite { .. } => {
+            used.kind == ResourceType::Uav && used.dwords == 4 && used.stride == 0
+                && relevant.filter(|u| u.table_offset_dwords == used.table_offset_dwords).count() == 1
+        }
+    };
+    admitted.then_some(StaticTextureSlot { root: param.slot, index })
 }
 
 #[cfg(test)]

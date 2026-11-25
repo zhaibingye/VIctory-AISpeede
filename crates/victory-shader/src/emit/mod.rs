@@ -218,7 +218,7 @@ mod waterfall_tests;
 mod wave;
 
 mod page_tables;
-pub use page_tables::{StaticTextureSlot, static_texture_slots};
+pub use page_tables::{StaticTextureSlot, StaticViewAccess, StaticViewSlot, static_texture_slots, static_view_slots};
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
