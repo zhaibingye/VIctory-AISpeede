@@ -1,18 +1,19 @@
 //! Native direct-queue submission for the unified-memory engine. The
 //! caller records only commands whose views use the same physical pages.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 
 use victory_memory::{
     PAGE_BYTES,
     coherence::Fence,
     gpu_table::RawPageTable,
-    physical::{HostBudget, PhysicalPage},
+    physical::{BackingPins, HostBudget, PhysicalPage},
 };
 use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Error, Interface, Result};
 
+use crate::copy_plan::{GuestCopy, Unbound};
 use crate::descriptor::host::HostHeap;
 use crate::host::{Host, HostList, fail, transition};
 use crate::page_slabs::{BatchError, CapturedUploads, PinnedBatch, Transfer, download};
@@ -78,6 +79,41 @@ impl Host {
         ranges: &[(u64, u64)],
         record: impl FnOnce(&HostList, PageRoots) -> Result<()>,
     ) -> std::result::Result<PageStats, BatchError> {
+        self.execute_paged_work(heap, backing, ranges, |list, roots, _, _| {
+            record(list, roots).map_err(BatchError::Native)?;
+            Ok(BTreeSet::new())
+        })
+    }
+
+    pub(crate) fn execute_paged_copy(
+        &self,
+        heap: &HostHeap,
+        backing: &mut SubmissionBacking,
+        copy: GuestCopy,
+    ) -> std::result::Result<PageStats, BatchError> {
+        self.execute_paged_work(heap, backing, &copy.ranges(), |list, _, batch, pins| {
+            let pieces = copy.bind(pins).map_err(|miss| match miss {
+                Unbound::AddressWidth => BatchError::Range(copy.src as u64, copy.dst as u64),
+                Unbound::Source(va) | Unbound::Destination(va) => {
+                    BatchError::NotCaptured(va as u64)
+                }
+            })?;
+            record_copy(self, list, batch, copy.len, &pieces).map_err(BatchError::Native)
+        })
+    }
+
+    fn execute_paged_work(
+        &self,
+        heap: &HostHeap,
+        backing: &mut SubmissionBacking,
+        ranges: &[(u64, u64)],
+        record: impl FnOnce(
+            &HostList,
+            PageRoots,
+            &PinnedBatch,
+            &BackingPins,
+        ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
+    ) -> std::result::Result<PageStats, BatchError> {
         let mut signal = self.direct_queue();
         let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
         let batch = PinnedBatch::capture(self, &mut slabs, backing, ranges)?;
@@ -104,7 +140,12 @@ fn run(
     heap: &HostHeap,
     backing: &SubmissionBacking,
     batch: &PinnedBatch,
-    record: impl FnOnce(&HostList, PageRoots) -> Result<()>,
+    record: impl FnOnce(
+        &HostList,
+        PageRoots,
+        &PinnedBatch,
+        &BackingPins,
+    ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
 ) -> std::result::Result<Completion, BatchError> {
     let native = BatchError::Native;
     let mut pairs = Pairs {
@@ -150,7 +191,7 @@ fn run(
     };
     let uploaded = uploads.as_ref().map_or(0, |stage| stage.record(&list));
     barrier(&list, slabs.values().copied(), false);
-    record(&list, roots).map_err(native)?;
+    let declared_dirty = record(&list, roots, batch, backing.pins())?;
     barrier(&list, slabs.values().copied(), true);
     list.close();
     let command = list.list.cast().map_err(native)?;
@@ -165,11 +206,12 @@ fn run(
     // initialized and no other submission uses it.
     let bitmap_slice =
         unsafe { std::slice::from_raw_parts(bitmap_ptr.as_ptr().cast::<u32>(), bitmap_words) };
-    let dirty = leaves.dirty_pages(bitmap_slice).unwrap_or_else(|leaf| {
+    let mut dirty = leaves.dirty_pages(bitmap_slice).unwrap_or_else(|leaf| {
         fail(format_args!(
             "paged dispatch accessed unbound page-table leaf {leaf}"
         ))
     });
+    dirty.extend(declared_dirty);
     let mut digests = uploads
         .as_ref()
         .map_or_else(BTreeMap::new, CapturedUploads::digests);
@@ -241,6 +283,86 @@ fn run(
         stats,
         digests,
     })
+}
+
+/// Gather all source fragments into disjoint scratch before scattering.
+/// A D3D12 buffer cannot be COPY_SOURCE and COPY_DEST simultaneously,
+/// and otherwise an earlier write could corrupt a later alias read.
+fn record_copy(
+    host: &Host,
+    list: &HostList,
+    batch: &PinnedBatch,
+    bytes: usize,
+    pieces: &[crate::copy_plan::CopyPiece],
+) -> Result<BTreeSet<PhysicalPage>> {
+    let scratch = host.default_buffer(bytes as u64).ok_or_else(oom)?;
+    let mut source = BTreeMap::new();
+    let mut dest = BTreeMap::new();
+    for piece in pieces {
+        let s = batch.pinned(piece.src).ok_or_else(|| Error::from(E_FAIL))?;
+        source.insert(s.slab(), s.buffer());
+        let d = batch.pinned(piece.dst).ok_or_else(|| Error::from(E_FAIL))?;
+        dest.insert(d.slab(), d.buffer());
+    }
+    list.keep(&scratch);
+    let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    let copy_src = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    let copy_dst = D3D12_RESOURCE_STATE_COPY_DEST;
+    let mut dirty = BTreeSet::new();
+    // SAFETY: native buffers are owned by the same captured batch; all
+    // byte spans are bounded by its guest copy plan.
+    unsafe {
+        let cmd = &list.list;
+        cmd.ResourceBarrier(
+            &source
+                .values()
+                .map(|s| transition(s, uav, copy_src))
+                .collect::<Vec<_>>(),
+        );
+        let mut offset = 0;
+        for piece in pieces {
+            let s = batch.pinned(piece.src).expect("validated source");
+            cmd.CopyBufferRegion(
+                &scratch,
+                offset,
+                s.buffer(),
+                s.offset() + u64::from(piece.src_offset),
+                u64::from(piece.count),
+            );
+            offset += u64::from(piece.count);
+        }
+        let restore_source: Vec<_> = source
+            .values()
+            .map(|s| transition(s, copy_src, uav))
+            .collect();
+        cmd.ResourceBarrier(&restore_source);
+        let scatter: Vec<_> = dest
+            .values()
+            .map(|d| transition(d, uav, copy_dst))
+            .chain([transition(&scratch, copy_dst, copy_src)])
+            .collect();
+        cmd.ResourceBarrier(&scatter);
+        offset = 0;
+        for piece in pieces {
+            let d = batch.pinned(piece.dst).expect("validated destination");
+            cmd.CopyBufferRegion(
+                d.buffer(),
+                d.offset() + u64::from(piece.dst_offset),
+                &scratch,
+                offset,
+                u64::from(piece.count),
+            );
+            offset += u64::from(piece.count);
+            dirty.insert(piece.dst);
+        }
+        cmd.ResourceBarrier(
+            &dest
+                .values()
+                .map(|d| transition(d, copy_dst, uav))
+                .collect::<Vec<_>>(),
+        );
+    }
+    Ok(dirty)
 }
 
 fn barrier<'a>(
@@ -353,4 +475,27 @@ void main(uint3 thread : SV_DispatchThreadID) {
             downloaded: 0
         }
     );
+}
+
+#[cfg(test)]
+#[test]
+fn paged_buffer_copy_gathers_overlapping_physical_aliases() {
+    use victory_memory::physical::PageNumbers;
+    const VA: usize = PAGE_BYTES as usize;
+    const ALIAS: usize = 0x81_0000_0000;
+    let host = crate::host::host().expect("D3D12 renderer host (CI selects WARP)");
+    let heap = crate::memory::heap().unwrap();
+    let id = PageNumbers::default().allocate(2).unwrap().offset(1);
+    let (mut backing, section) = crate::title_backing::test_capture(id, &[VA, ALIAS]);
+    section.lock().unwrap()[..6].copy_from_slice(&[10, 20, 30, 40, 50, 60]);
+    let copy = GuestCopy::new(ALIAS + 1, VA, 5).unwrap();
+    let stats = host.execute_paged_copy(heap, &mut backing, copy).unwrap();
+    assert_eq!(
+        stats,
+        PageStats {
+            uploaded: 1,
+            downloaded: 1
+        }
+    );
+    assert_eq!(&section.lock().unwrap()[..6], &[10, 10, 20, 30, 40, 50]);
 }
