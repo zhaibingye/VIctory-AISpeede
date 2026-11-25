@@ -70,6 +70,7 @@ pub(crate) struct ClosedDraw {
     call: DrawCall,
     constants: Vec<RootWords>,
     blend_factor: [f32; 4],
+    sample: Option<crate::page_texture::SampledTexture>,
 }
 
 impl ClosedDraw {
@@ -91,6 +92,7 @@ impl ClosedDraw {
             pipeline, root, target, topology, viewport, scissor, inputs, call,
             constants: Vec::new(),
             blend_factor: [1.0; 4],
+            sample: None,
         }
     }
 
@@ -131,6 +133,7 @@ impl ClosedDraw {
             pipeline: pipeline.pso.clone(), root: pipeline.root.clone(),
             target, topology, viewport, scissor, inputs, call, constants,
             blend_factor: [1.0; 4],
+            sample: None,
         })
     }
 
@@ -144,6 +147,9 @@ impl ClosedDraw {
         }
         if let DrawCall::Indirect(draw) = self.call {
             draw.ranges(ranges)?;
+        }
+        if let Some(sample) = &self.sample {
+            ranges.extend(sample.input.rows()?);
         }
         Ok(())
     }
@@ -159,6 +165,8 @@ impl ClosedDraw {
             DrawCall::Indirect(draw) => Some(draw.prepare(host, list, batch, budget)?),
             _ => None,
         };
+        let sample = self.sample.as_ref()
+            .map(|input| input.prepare(host, list, batch)).transpose()?;
         for &input in &self.inputs {
             input.encode(host, list, batch)?;
         }
@@ -181,6 +189,9 @@ impl ClosedDraw {
             }
             cmd.SetGraphicsRootSignature(&self.root);
             cmd.SetPipelineState(&self.pipeline);
+            if let Some(sample) = &sample {
+                sample.bind(cmd);
+            }
             for root in &self.constants {
                 cmd.SetGraphicsRoot32BitConstants(
                     root.parameter, root.words.len() as u32, root.words.as_ptr().cast(), 0,
@@ -211,17 +222,23 @@ impl ClosedDraw {
 #[cfg(all(test, feature = "diagnostics"))]
 #[test]
 fn paged_title_draw_reads_gpu_copied_vertices_and_renders_pixels() {
-    check_paged_title_pixels(false);
+    check_paged_title_pixels(false, false);
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
 #[test]
 fn paged_title_indirect_draw_reads_gpu_generated_records_and_count() {
-    check_paged_title_pixels(true);
+    check_paged_title_pixels(true, false);
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
-fn check_paged_title_pixels(indirect: bool) {
+#[test]
+fn paged_title_draw_samples_texture_written_by_preceding_gpu_copy() {
+    check_paged_title_pixels(false, true);
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn check_paged_title_pixels(indirect: bool, sampled: bool) {
     use victory_memory::{PAGE_BYTES, physical::PageNumbers};
     use windows::Win32::Graphics::Direct3D::{
         D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, Fxc::D3DCompile,
@@ -234,11 +251,20 @@ fn check_paged_title_pixels(indirect: bool) {
     let host = crate::host::host().expect("D3D12 renderer host (CI selects WARP)");
     let heap = crate::memory::heap().unwrap();
     let device = &host.device;
-    let source = r#"
+    let source = if sampled {
+        r#"
+float4 vertex(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }
+Texture2D<float4> colors : register(t0);
+SamplerState nearest : register(s0);
+float4 pixel() : SV_Target0 { return colors.SampleLevel(nearest, float2(0.5, 0.5), 0); }
+"#
+    } else {
+        r#"
 float4 vertex(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }
 cbuffer Color : register(b0) { float4 green; }
 float4 pixel() : SV_Target0 { return green; }
-"#;
+"#
+    };
     let compile = |entry, profile| {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: HLSL and entry/profile literals are live during compile.
@@ -261,10 +287,36 @@ float4 pixel() : SV_Target0 { return green; }
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
         };
+        let range = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV, NumDescriptors: 1,
+            ..Default::default()
+        };
+        let view = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1, pDescriptorRanges: &range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        };
+        let sampler = D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            MaxLOD: f32::MAX,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            ..Default::default()
+        };
         D3D12SerializeRootSignature(
             &D3D12_ROOT_SIGNATURE_DESC {
                 NumParameters: 1,
-                pParameters: &constants,
+                pParameters: if sampled { &view } else { &constants },
+                NumStaticSamplers: u32::from(sampled),
+                pStaticSamplers: if sampled { &sampler } else { std::ptr::null() },
                 Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
                 ..Default::default()
             },
@@ -350,6 +402,9 @@ float4 pixel() : SV_Target0 { return green; }
         let mut bytes = section.lock().unwrap();
         bytes[..24].fill(0); // Degenerate triangle before the GPU copy.
         bytes[64..100].fill(0); // Zero count and args before GPU copies.
+        bytes[160..164].copy_from_slice(&[0, 0, 255, 255]); // old blue texel
+        bytes[176..180].copy_from_slice(&[0, 255, 0, 255]); // GPU will copy green
+
         for (slot, value) in bytes[112..132].chunks_exact_mut(4).zip([3u32, 1, 0, 0, 1]) {
             slot.copy_from_slice(&value.to_le_bytes());
         }
@@ -384,10 +439,22 @@ float4 pixel() : SV_Target0 { return green; }
         vec![InputView::Vertex(0, VertexView { address: VA as u64, size: 24, stride: 8 })],
         call,
     );
-    draw.constants.push(RootWords {
-        parameter: 0,
-        words: [0.0f32, 1.0, 0.0, 1.0].into_iter().map(f32::to_bits).collect(),
-    });
+    if sampled {
+        use crate::page_texture::{LinearTexture, SampledTexture};
+        title.defer_copy((VA + 160) as *mut u8, (ALIAS + 176) as *const u8, 4);
+        draw.sample = Some(SampledTexture {
+            root: 0,
+            input: LinearTexture {
+                address: (VA + 160) as u64, row_pitch: 4, width: 1, height: 1,
+                format: FORMAT,
+            },
+        });
+    } else {
+        draw.constants.push(RootWords {
+            parameter: 0,
+            words: [0.0f32, 1.0, 0.0, 1.0].into_iter().map(f32::to_bits).collect(),
+        });
+    }
     title.record_page_draw(draw);
     title.close();
     let stats = host.execute_paged_title(heap, &mut backing, &[&title]).unwrap();

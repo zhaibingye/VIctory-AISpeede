@@ -63,6 +63,7 @@ jobs:
       - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_title_indirect_draw_reads_gpu_generated_records_and_count
       - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_indirect_checks_stride_and_entire_counted_range
       - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_linear_texture_
+      - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_title_draw_samples_texture_written_by_preceding_gpu_copy
       - run: cargo test -p victory-gpu --features diagnostics --locked --lib closed_draw_
   shader-pages:
     runs-on: windows-latest

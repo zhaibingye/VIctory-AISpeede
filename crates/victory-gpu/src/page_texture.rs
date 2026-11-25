@@ -118,3 +118,51 @@ fn paged_linear_texture_rejects_unknown_or_short_layouts() {
     tex.format = DXGI_FORMAT_NV12;
     assert!(tex.rows().is_err());
 }
+
+/// One explicit SRV table parameter, not a title bindless heap. The
+/// trusted recorder must prove that the root signature matches the table
+/// and that the shader uses no other descriptor heap.
+pub(crate) struct SampledTexture {
+    pub(crate) input: LinearTexture,
+    pub(crate) root: u32,
+}
+
+pub(crate) struct PreparedSample {
+    heap: ID3D12DescriptorHeap,
+    root: u32,
+}
+
+impl SampledTexture {
+    pub(crate) fn prepare(
+        &self, host: &Host, list: &HostList, batch: &PinnedBatch,
+    ) -> Result<PreparedSample, BatchError> {
+        let texture = self.input.encode(host, list, batch)?;
+        // SAFETY: a live device, one shader-visible SRV slot and a live
+        // texture in read state. Both resource and heap are retained.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                },
+            ).map_err(BatchError::Native)?;
+            host.device.CreateShaderResourceView(&texture, None, heap.GetCPUDescriptorHandleForHeapStart());
+            heap
+        };
+        list.keep(&heap);
+        Ok(PreparedSample { heap, root: self.root })
+    }
+}
+
+impl PreparedSample {
+    pub(crate) fn bind(&self, cmd: &ID3D12GraphicsCommandList) {
+        // SAFETY: the heap is retained and the command's root signature
+        // was constructed for one texture SRV at this parameter.
+        unsafe {
+            cmd.SetDescriptorHeaps(&[Some(self.heap.clone())]);
+            cmd.SetGraphicsRootDescriptorTable(self.root, self.heap.GetGPUDescriptorHandleForHeapStart());
+        }
+    }
+}
