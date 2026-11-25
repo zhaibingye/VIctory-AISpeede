@@ -275,6 +275,7 @@ impl ClosedDraw {
         pipeline: &crate::pipeline::host::HostPipeline,
         values: impl Fn(u8, u32) -> Option<u32>,
         texture: impl Fn(u8, u32) -> Option<crate::page_texture::LinearTexture>,
+        address: impl Fn(u8) -> Option<u64>,
         target: ColorTarget,
         depth: Option<DepthTarget>,
         stencil_ref: u32,
@@ -296,7 +297,7 @@ impl ClosedDraw {
         {
             return Err(UnloweredShader::GraphicsState);
         }
-        let shader = ShaderBindings::capture(pipeline, values, texture)?;
+        let shader = ShaderBindings::capture(pipeline, values, texture, address)?;
         Ok(Self {
             pipeline: pipeline.pso.clone(), root: pipeline.root.clone(),
             target, depth, stencil_ref, topology, viewport, scissor, inputs, call, shader,
@@ -371,11 +372,7 @@ impl ClosedDraw {
             if let Some(sample) = &sample {
                 sample.bind(cmd, descriptors);
             }
-            for (param, words) in &words {
-                cmd.SetGraphicsRoot32BitConstants(
-                    *param, words.len() as u32, words.as_ptr().cast(), 0,
-                );
-            }
+            words.bind(cmd, false);
             cmd.IASetPrimitiveTopology(self.topology);
             cmd.RSSetViewports(&[self.viewport]);
             cmd.RSSetScissorRects(&[self.scissor]);

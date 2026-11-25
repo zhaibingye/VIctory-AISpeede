@@ -433,6 +433,7 @@ impl State {
             pipeline,
             |slot, dword| self.page_word(false, slot, dword),
             |root, index| self.page_texture(false, root, index),
+            |slot| self.page_address(false, slot),
             target,
             self.page_depth.clone(),
             self.page_stencil,
@@ -1007,6 +1008,7 @@ impl State {
                 pipeline,
                 |slot, dword| self.page_word(true, slot, dword),
                 |root, index| self.page_texture(true, root, index),
+                |slot| self.page_address(true, slot),
                 call,
             ).ok());
         if let Some(dispatch) = ready {
@@ -1015,6 +1017,13 @@ impl State {
         } else {
             list.mark_unlowered();
             false
+        }
+    }
+
+    fn page_address(&self, compute: bool, slot: u8) -> Option<u64> {
+        match *self.roots_ref(compute).get(slot as usize)? {
+            Root::View(address) => Some(address),
+            _ => None,
         }
     }
 

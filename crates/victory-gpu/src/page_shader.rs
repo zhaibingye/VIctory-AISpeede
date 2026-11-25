@@ -8,6 +8,8 @@ use crate::page_slabs::{BatchError, PinnedBatch};
 use crate::page_texture::LinearTexture;
 use crate::pipeline::host::HostPipeline;
 
+use windows::Win32::Graphics::Direct3D12::*;
+
 use victory_shader::emit::{HostShader, UserData};
 use victory_shader::{RootType, UsedResource};
 
@@ -35,7 +37,7 @@ pub(crate) fn constants_only(
     block: Option<(u32, u32)>,
     values: impl Fn(u8, u32) -> Option<u32>,
 ) -> Result<Option<RootWords>, UnloweredShader> {
-    stage_words(shader, used, block, values, |_| false)
+    stage_words(shader, used, block, values, |_| false, |_| false)
 }
 
 pub(crate) fn stage_words(
@@ -44,6 +46,7 @@ pub(crate) fn stage_words(
     block: Option<(u32, u32)>,
     values: impl Fn(u8, u32) -> Option<u32>,
     tables: impl Fn(u8) -> bool,
+    cbvs: impl Fn(u8) -> bool,
 ) -> Result<Option<RootWords>, UnloweredShader> {
     if shader.memory || shader.memory_writes || shader.view_addresses {
         return Err(UnloweredShader::DynamicAddress);
@@ -51,12 +54,15 @@ pub(crate) fn stage_words(
     if shader.heap || shader.heap_writes || shader.view_marks {
         return Err(UnloweredShader::DescriptorHeap);
     }
-    if !shader.root_cbvs.is_empty() || !shader.root_srvs.is_empty() || !shader.root_uavs.is_empty()
-        || used.iter().any(|u| u.root == RootType::Descriptor)
+    if !shader.root_srvs.is_empty() || !shader.root_uavs.is_empty()
+        || shader.root_cbvs.iter().any(|&slot| !cbvs(slot))
     {
         return Err(UnloweredShader::RootView);
     }
     for u in used {
+        if u.root == RootType::Descriptor && u.kind == victory_shader::ResourceType::Cbv && cbvs(u.slot) {
+            continue;
+        }
         if u.root != RootType::Table || u.kind != victory_shader::ResourceType::Srv
             || !tables(u.slot)
         {
@@ -205,6 +211,53 @@ fn closed_draw_relocates_table_byte_offsets_without_changing_constants() {
 pub(crate) struct ShaderBindings {
     pub(crate) constants: Vec<RootWords>,
     pub(crate) texture_tables: BTreeMap<u8, BTreeMap<u32, LinearTexture>>,
+    cbvs: Vec<(u32, ConstantSpan)>,
+}
+
+#[derive(Clone, Copy)]
+struct ConstantSpan(u64);
+
+impl ConstantSpan {
+    /// Matches the size annotated on the translated root-CBV handle.
+    const BYTES: u64 = 65536;
+
+    fn capture(address: u64) -> Option<Self> {
+        (address != 0 && address.is_multiple_of(256)
+            && address.checked_add(Self::BYTES)? <= victory_memory::gpu_table::ADDRESS_LIMIT)
+            .then_some(Self(address))
+    }
+
+    fn range(self) -> (u64, u64) {
+        (self.0, self.0 + Self::BYTES)
+    }
+}
+
+pub(crate) struct PreparedShader {
+    words: Vec<(u32, Vec<u32>)>,
+    cbvs: Vec<(u32, u64)>,
+}
+
+impl PreparedShader {
+    pub(crate) fn bind(&self, cmd: &ID3D12GraphicsCommandList, compute: bool) {
+        // SAFETY: the caller binds the matching prevalidated root
+        // signature; every address points to retained read-only memory.
+        unsafe {
+            for (param, words) in &self.words {
+                if compute {
+                    cmd.SetComputeRoot32BitConstants(*param, words.len() as u32, words.as_ptr().cast(), 0);
+                } else {
+                    cmd.SetGraphicsRoot32BitConstants(*param, words.len() as u32, words.as_ptr().cast(), 0);
+                }
+            }
+            for &(param, gpu) in &self.cbvs {
+                if compute {
+                    cmd.SetComputeRootConstantBufferView(param, gpu);
+                } else {
+                    cmd.SetGraphicsRootConstantBufferView(param, gpu);
+                }
+            }
+        }
+    }
 }
 
 impl ShaderBindings {
@@ -212,14 +265,21 @@ impl ShaderBindings {
         pipeline: &HostPipeline,
         values: impl Fn(u8, u32) -> Option<u32>,
         texture: impl Fn(u8, u32) -> Option<LinearTexture>,
+        address: impl Fn(u8) -> Option<u64>,
     ) -> Result<Self, UnloweredShader> {
         if pipeline.marks.is_some() {
             return Err(UnloweredShader::DescriptorHeap);
         }
         let mut constants = Vec::new();
+        let mut cbvs = Vec::new();
         let mut texture_tables = BTreeMap::<u8, BTreeMap<u32, _>>::new();
         for stage in &pipeline.stages {
             let t = stage.translated();
+            for &(slot, param) in &stage.root_cbvs {
+                let span = address(slot).and_then(ConstantSpan::capture)
+                    .ok_or(UnloweredShader::RootView)?;
+                cbvs.push((param, span));
+            }
             let needs_table = t.host.user_data.iter().any(|u| u.root == victory_shader::RootType::Table);
             let slots = if needs_table {
                 stage.shader.static_texture_slots().ok_or(UnloweredShader::DescriptorTable)?
@@ -229,6 +289,7 @@ impl ShaderBindings {
             if let Some(words) = stage_words(
                 &t.host, &t.used, stage.user_data, &values,
                 |root| slots.iter().any(|s| s.root == root),
+                |slot| stage.root_cbvs.iter().any(|&(bound, _)| bound == slot),
             )? {
                 for slot in slots {
                     if !words.tables.iter().any(|&(_, root)| root == slot.root) {
@@ -244,10 +305,11 @@ impl ShaderBindings {
                 return Err(UnloweredShader::DescriptorTable);
             }
         }
-        Ok(Self { constants, texture_tables })
+        Ok(Self { constants, texture_tables, cbvs })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
+        ranges.extend(self.cbvs.iter().map(|(_, span)| span.range()));
         for table in self.texture_tables.values() {
             for texture in table.values() {
                 ranges.extend(texture.rows()?);
@@ -259,7 +321,7 @@ impl ShaderBindings {
     pub(crate) fn prepare(
         &self, host: &Host, list: &HostList, batch: &PinnedBatch,
         descriptors: &mut PageDescriptors<'_>,
-    ) -> Result<Vec<(u32, Vec<u32>)>, BatchError> {
+    ) -> Result<PreparedShader, BatchError> {
         let mut bases = BTreeMap::new();
         for (&root, table) in &self.texture_tables {
             let size = table.last_key_value().expect("captured slots exist").0 + 1;
@@ -274,6 +336,23 @@ impl ShaderBindings {
             root.relocated(&bases).map(|words| (root.parameter, words))
                 .ok_or_else(|| BatchError::Native(windows::Win32::Foundation::E_FAIL.into()))
         }).collect::<Result<_, _>>()?;
-        Ok(words)
+        let mut gathered = BTreeMap::new();
+        let mut cbvs = Vec::with_capacity(self.cbvs.len());
+        for &(param, span) in &self.cbvs {
+            let gpu = match gathered.entry(span.0) {
+                std::collections::btree_map::Entry::Occupied(e) => *e.get(),
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    let buffer = host.default_buffer(ConstantSpan::BYTES).ok_or_else(|| {
+                        BatchError::Native(windows::Win32::Foundation::E_OUTOFMEMORY.into())
+                    })?;
+                    crate::page_view::gather_span(list, batch, span.range(), &buffer,
+                        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)?;
+                    // SAFETY: gather retains a full-sized aligned resource.
+                    *e.insert(unsafe { buffer.GetGPUVirtualAddress() })
+                }
+            };
+            cbvs.push((param, gpu));
+        }
+        Ok(PreparedShader { words, cbvs })
     }
 }

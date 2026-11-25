@@ -26,6 +26,7 @@ impl ClosedDispatch {
         pipeline: &HostPipeline,
         constants: impl Fn(u8, u32) -> Option<u32>,
         texture: impl Fn(u8, u32) -> Option<LinearTexture>,
+        address: impl Fn(u8) -> Option<u64>,
         call: DispatchCall,
     ) -> Result<Self, UnloweredShader> {
         if !pipeline.compute || pipeline.mesh {
@@ -44,7 +45,7 @@ impl ClosedDispatch {
         Ok(Self {
             pipeline: pipeline.pso.clone(),
             root: pipeline.root.clone(),
-            shader: ShaderBindings::capture(pipeline, constants, texture)?,
+            shader: ShaderBindings::capture(pipeline, constants, texture, address)?,
             call,
         })
     }
@@ -76,9 +77,7 @@ impl ClosedDispatch {
             cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
             cmd.SetComputeRootSignature(&self.root);
             cmd.SetPipelineState(&self.pipeline);
-            for (param, words) in &words {
-                cmd.SetComputeRoot32BitConstants(*param, words.len() as u32, words.as_ptr().cast(), 0);
-            }
+            words.bind(cmd, true);
             match self.call {
                 DispatchCall::Direct(x, y, z) => cmd.Dispatch(x, y, z),
                 DispatchCall::Indirect(_) => args.as_ref().expect("indirect args prepared").execute(cmd),
