@@ -65,6 +65,8 @@ mod page_slabs;
 #[allow(dead_code, reason = "physical input views are enabled at unified renderer cutover")]
 mod page_view;
 #[cfg(windows)]
+mod page_uav;
+#[cfg(windows)]
 #[allow(dead_code, reason = "texture derivation is used at renderer cutover")]
 mod page_texture;
 pub mod object;

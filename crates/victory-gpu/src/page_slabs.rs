@@ -50,6 +50,10 @@ pub(crate) struct PinnedPage {
 }
 
 impl PinnedPage {
+    pub(crate) fn physical(&self) -> PhysicalPage {
+        self.page
+    }
+
     pub(crate) fn slab(&self) -> u64 {
         self.loc.slab
     }

@@ -497,18 +497,7 @@ impl HostHeap {
         // SAFETY: a slot of our heap; the buffer is live (or none: a null view).
         unsafe {
             if uav {
-                let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                    Format: DXGI_FORMAT_R32_TYPELESS,
-                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                        Buffer: D3D12_BUFFER_UAV {
-                            FirstElement: first,
-                            NumElements: elements,
-                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                            ..Default::default()
-                        },
-                    },
-                };
+                let desc = raw_uav_desc(first, elements);
                 host.device
                     .CreateUnorderedAccessView(buffer, None, Some(&desc), self.cpu(index));
             } else {
@@ -895,6 +884,46 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
             .cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>()
             .read_unaligned()
     }
+}
+
+pub(crate) fn raw_uav_desc(first: u64, elements: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                FirstElement: first,
+                NumElements: elements,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    }
+}
+
+pub(crate) fn paged_raw_clear(view: &View, values: [u32; 4]) -> Option<crate::page_uav::RawClear> {
+    let View::Unordered(resource, 0, Some(words)) = view else { return None };
+    let desc = uav_desc(words);
+    if desc.Format != DXGI_FORMAT_R32_TYPELESS || desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the dimension selects Buffer.
+    let raw = unsafe { desc.Anonymous.Buffer };
+    if raw.Flags != D3D12_BUFFER_UAV_FLAG_RAW || raw.StructureByteStride != 0 {
+        return None;
+    }
+    let (base, size) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+    let offset = raw.FirstElement.checked_mul(4)?;
+    let len = u64::from(raw.NumElements) * 4;
+    let stop = offset.checked_add(len)?;
+    if stop > size { return None; }
+    let clear = crate::page_uav::RawClear {
+        start: (base as u64).checked_add(offset)?,
+        end: (base as u64).checked_add(stop)?,
+        values,
+    };
+    clear.range().ok()?;
+    Some(clear)
 }
 
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {

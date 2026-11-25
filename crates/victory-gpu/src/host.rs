@@ -2105,6 +2105,10 @@ impl HostList {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Barrier(std::sync::Arc::new(barrier))));
     }
 
+    pub(crate) fn record_page_raw_clear(&self, clear: crate::page_uav::RawClear) {
+        self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::ClearRaw(std::sync::Arc::new(clear))));
+    }
+
     pub(crate) fn record_page_input(&self, view: crate::page_view::InputView) {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Input(view)));
     }

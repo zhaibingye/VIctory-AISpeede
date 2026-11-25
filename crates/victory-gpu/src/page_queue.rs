@@ -41,6 +41,7 @@ pub(crate) enum PageOp {
     Clear(std::sync::Arc<crate::page_draw::ColorClear>),
     ClearDepth(std::sync::Arc<crate::page_draw::DepthClear>),
     Barrier(std::sync::Arc<crate::page_resource::PageBarrier>),
+    ClearRaw(std::sync::Arc<crate::page_uav::RawClear>),
 }
 
 struct Completion {
@@ -55,6 +56,7 @@ pub(crate) struct PageDescriptors<'a> {
     pub(crate) heap: &'a HostHeap,
     slots: Vec<u32>,
     textures: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>,
+    raw_uavs: Vec<u32>,
 }
 
 impl PageDescriptors<'_> {
@@ -62,6 +64,15 @@ impl PageDescriptors<'_> {
         let slot = self.heap.pair().ok_or_else(oom)?;
         self.heap.raw_pair_at(slot, slab, bytes);
         self.slots.push(slot);
+        Ok(slot)
+    }
+
+    pub(crate) fn reserve_raw_uav(
+        &mut self, buffer: &ID3D12Resource, offset: u64, bytes: u64,
+    ) -> Result<u32> {
+        let slot = self.heap.dynamic(1).ok_or_else(oom)?;
+        self.heap.raw_view_at(slot, Some(buffer), offset, bytes, true);
+        self.raw_uavs.push(slot);
         Ok(slot)
     }
 
@@ -97,6 +108,10 @@ impl PageDescriptors<'_> {
 
 impl Drop for PageDescriptors<'_> {
     fn drop(&mut self) {
+        for slot in self.raw_uavs.drain(..) {
+            self.heap.raw_view_at(slot, None, 0, 0, true);
+            self.heap.release(slot, 1);
+        }
         for (slot, format) in self.textures.drain(..) {
             self.heap.paged_texture_at(slot, None, format);
             self.heap.release(slot, 1);
@@ -180,6 +195,7 @@ impl Host {
                 }
                 PageOp::Input(input) => ranges.push(input.range()?),
                 PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
+                PageOp::ClearRaw(clear) => ranges.push(clear.range()?),
                 PageOp::Dispatch(dispatch) => dispatch.ranges(&mut ranges)?,
                 PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
             }
@@ -211,6 +227,7 @@ impl Host {
                     PageOp::Clear(clear) => clear.encode(self, list, targets)?,
                     PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,
                     PageOp::Barrier(barrier) => barrier.encode(list, targets)?,
+                    PageOp::ClearRaw(clear) => clear.encode(self, list, batch, descriptors, targets, &mut dirty)?,
                 }
             }
             Ok(dirty)
@@ -271,6 +288,7 @@ fn run(
         heap,
         slots: Vec::new(),
         textures: Vec::new(),
+        raw_uavs: Vec::new(),
     };
     let mut raw = RawPageTable::new(pairs.reserve(None, 0).map_err(native)?);
     let leaves = batch.bind(&mut raw, |pin| {

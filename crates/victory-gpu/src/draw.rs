@@ -953,6 +953,16 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        if cfg!(feature = "paged-title") {
+            let clear = (!float && rects.is_empty()).then(|| crate::descriptor::view(cpu)).flatten()
+                .and_then(|view| crate::descriptor::host::paged_raw_clear(&view, values));
+            if let Some(clear) = clear {
+                list.record_page_raw_clear(clear);
+            } else {
+                list.mark_unlowered();
+            }
+            return;
+        }
         let Some(view) = crate::descriptor::view(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
