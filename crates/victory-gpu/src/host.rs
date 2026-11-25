@@ -929,6 +929,8 @@ enum Step {
     Memory(usize),
 }
 
+type AfterSubmission = Box<dyn Fn(&crate::title_backing::SubmissionBacking) + Send>;
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -956,7 +958,7 @@ struct Deferred {
     budget_zeroed: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
-    after: Vec<Box<dyn Fn() + Send>>,
+    after: Vec<AfterSubmission>,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
@@ -1386,20 +1388,20 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
-        crate::shadow::copy_back_marks(&withheld);
+        crate::shadow::copy_back_marks(&withheld, &backing);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
-                let written = shadow.copy_back(address, len);
+                let written = shadow.copy_back(address, len, &backing);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             } else {
-                shadow.keep_writes(address, len);
+                shadow.keep_writes(address, len, &backing);
                 crate::memory::note_withheld(len as u64);
             }
         }
         for list in runs {
             for work in &list.deferred().after {
-                work();
+                work(&backing);
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2081,6 +2083,12 @@ impl HostList {
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.defer_writeback(move |_| work());
+    }
+
+    pub(crate) fn defer_writeback(
+        &self, work: impl Fn(&crate::title_backing::SubmissionBacking) + Send + 'static,
+    ) {
         self.deferred().after.push(Box::new(work));
     }
 
@@ -4082,7 +4090,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         }
         writer.close();
         host.execute(&[&writer]);
-        assert_eq!(copy.copy_back(busy, 4), 4);
+        assert_eq!(copy.copy_back(busy, 4, &Default::default()), 4);
         // SAFETY: the copy-back completed and the test owns this page.
         assert_eq!(unsafe { (busy as *const u8).read_volatile() }, 55);
 

@@ -3,16 +3,18 @@
 
 use std::sync::OnceLock;
 
-use victory_memory::physical::BackingPins;
+use victory_memory::physical::{BackingPins, PhysicalPage};
 
 type Range = (usize, usize);
 pub type BackingPinner = fn(&[Range], &mut BackingPins);
 
-static PINNER: OnceLock<BackingPinner> = OnceLock::new();
+pub type WritebackPage = fn(usize, Option<PhysicalPage>, &mut dyn FnMut()) -> bool;
+
+static BACKING: OnceLock<(BackingPinner, WritebackPage)> = OnceLock::new();
 
 /// Installed by the runtime before the title creates its D3D12 device.
-pub fn use_pinner(pinner: BackingPinner) {
-    let _ = PINNER.set(pinner);
+pub fn use_backing(pinner: BackingPinner, writeback: WritebackPage) {
+    let _ = BACKING.set((pinner, writeback));
 }
 
 #[derive(Default)]
@@ -23,7 +25,7 @@ pub(crate) struct SubmissionBacking {
 
 impl SubmissionBacking {
     pub(crate) fn include(&mut self, start: usize, end: usize) {
-        if start < end && PINNER.get().is_some() {
+        if start < end && BACKING.get().is_some() {
             self.pending.push((start, end));
         }
     }
@@ -33,12 +35,26 @@ impl SubmissionBacking {
             return;
         }
         merge(&mut self.pending);
-        if let Some(pin) = PINNER.get() {
+        if let Some((pin, _)) = BACKING.get() {
             // Called without a GPU page table/descriptor/shadow registry lock.
             pin(&self.pending, &mut self.pins);
         }
         self.pending.clear();
     }
+    /// Run the read/merge/write on one 64 KiB page without a concurrent
+    /// XMem remap. A stale destination is left alone.
+    pub(crate) fn write_page<T>(&self, address: usize, write: impl FnOnce() -> T) -> Option<T> {
+        let Some((_, with_page)) = BACKING.get() else {
+            return Some(write());
+        };
+        let mut write = Some(write);
+        let mut result = None;
+        with_page(address, self.pins.expected(address), &mut || {
+            result = write.take().map(|write| write());
+        });
+        result
+    }
+
 }
 
 fn merge(ranges: &mut Vec<Range>) {

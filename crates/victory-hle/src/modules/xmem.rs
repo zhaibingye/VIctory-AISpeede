@@ -432,12 +432,45 @@ impl Physical {
 pub(crate) fn pin_backing(ranges: &[(usize, usize)], pins: &mut BackingPins) {
     let physical = physical();
     for &(start, end) in ranges {
-        if start < end {
-            for (_, (_, slice)) in physical.views_in(start, end) {
-                pins.keep(slice.section.first, &slice.section);
+        if start >= end {
+            continue;
+        }
+        let start = start / PAGE * PAGE;
+        let end = end.checked_next_multiple_of(PAGE).unwrap_or(usize::MAX / PAGE * PAGE);
+        if start >= end {
+            continue;
+        }
+        let mut at = start;
+        for (base, &(size, ref slice)) in physical.views_in(start, end) {
+            let from = base.max(start);
+            let to = (base + size).min(end);
+            if at < from {
+                pins.remember(at, from, None);
             }
+            pins.keep(slice.section.first, &slice.section);
+            pins.remember(from, to, Some(slice.page((from - base) / PAGE)));
+            at = to;
+        }
+        if at < end {
+            pins.remember(at, end, None);
         }
     }
+}
+
+/// Verify the page identity and perform the write under the same map lock.
+/// This protects against a remap between validation and the CPU copy.
+pub(crate) fn with_writeback_page(
+    address: usize, expected: Option<PhysicalPage>, write: &mut dyn FnMut(),
+) -> bool {
+    let physical = physical();
+    let current = physical.views.range(..=address).next_back()
+        .filter(|&(&base, &(size, _))| address - base < size)
+        .map(|(&base, (_, slice))| slice.page((address - base) / PAGE));
+    if current != expected {
+        return false;
+    }
+    write();
+    true
 }
 
 /// Every address of a title view showing a page that title memory at
@@ -1383,6 +1416,38 @@ mod tests {
             assert_ne!(VirtualFree(a as *mut c_void, 0, MEM_RELEASE), 0);
             assert_ne!(VirtualFree(b as *mut c_void, 0, MEM_RELEASE), 0);
         }
+    }
+
+    #[test]
+    fn submitted_writeback_rejects_same_address_rebound_to_a_different_page() {
+        let pages = allocate(2);
+        let ptr = XMemVirtualAlloc(
+            std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+        );
+        assert!(!ptr.is_null());
+        assert_eq!(XMemMapPhysicalPages(ptr, 1, pages.as_ptr()), ptr);
+        let address = ptr as usize;
+        let mut pins = BackingPins::default();
+        pin_backing(&[(address + 1, address + 2)], &mut pins);
+        let expected = pins.expected(address + 1);
+        assert!(expected.is_some());
+        let write = &mut || {
+            // SAFETY: this closure is allowed only for the captured writable address.
+            unsafe { ptr.cast::<u8>().add(1).write(7) };
+        };
+        assert!(with_writeback_page(address + 1, expected, write));
+        assert_eq!(XMemMapPhysicalPages(ptr, 1, pages[1..].as_ptr()), ptr);
+        pin_backing(&[(address, address + PAGE)], &mut pins);
+        assert_eq!(pins.expected(address + 1), expected);
+        assert!(!with_writeback_page(address + 1, expected, write));
+        assert!(!with_writeback_page(address + 1, None, write));
+        // SAFETY: the rebound page belongs to this test and is still mapped.
+        assert_eq!(unsafe { ptr.cast::<u8>().add(1).read() }, 0);
+        assert_eq!(XMemMapPhysicalPages(ptr, 1, std::ptr::null()), ptr);
+        assert!(!with_writeback_page(address + 1, expected, write));
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        // SAFETY: the one unmapped page is again our placeholder.
+        assert_ne!(unsafe { VirtualFree(ptr, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]

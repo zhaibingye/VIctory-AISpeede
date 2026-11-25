@@ -1,6 +1,6 @@
 //! Physical allocations and alias identity, independent of host address.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::{
@@ -135,11 +135,45 @@ impl Aliases {
 /// Retains real host backing across a GPU submission. Aliases and repeated
 /// ranges can name one allocation; there is only one retained reference to it.
 #[derive(Default)]
-pub struct BackingPins(HashMap<PhysicalPage, Arc<dyn Send + Sync>>);
+pub struct BackingPins {
+    sections: HashMap<PhysicalPage, Arc<dyn Send + Sync>>,
+    // Aligned half-open VA runs from the first observation in this
+    // submission. None describes a run without XMem backing.
+    mappings: BTreeMap<usize, (usize, Option<PhysicalPage>)>,
+}
 
 impl BackingPins {
     /// `section` identifies the first physical page of this allocation.
     pub fn keep<T: Send + Sync + 'static>(&mut self, section: PhysicalPage, backing: &Arc<T>) {
-        self.0.entry(section).or_insert_with(|| backing.clone());
+        self.sections.entry(section).or_insert_with(|| backing.clone());
+    }
+
+    /// Capture only previously unseen addresses. If a queue chunk sees a
+    /// remap, it must not retarget pending writebacks from an earlier chunk.
+    pub fn remember(&mut self, start: usize, end: usize, first: Option<PhysicalPage>) {
+        const PAGE: usize = PAGE_BYTES as usize;
+        debug_assert!(start.is_multiple_of(PAGE) && end.is_multiple_of(PAGE));
+        let mut at = start;
+        while at < end {
+            if let Some((_, &(previous_end, _))) = self.mappings.range(..=at).next_back()
+                && at < previous_end
+            {
+                at = previous_end;
+                continue;
+            }
+            let to = self.mappings.range(at..).next()
+                .map_or(end, |(&next, _)| end.min(next));
+            let page = first.map(|p| p.offset((at - start) / PAGE));
+            self.mappings.insert(at, (to, page));
+            at = to;
+        }
+    }
+
+    pub fn expected(&self, address: usize) -> Option<PhysicalPage> {
+        let (&start, &(end, first)) = self.mappings.range(..=address).next_back()?;
+        if address >= end {
+            return None;
+        }
+        first.map(|p| p.offset((address - start) / PAGE_BYTES as usize))
     }
 }

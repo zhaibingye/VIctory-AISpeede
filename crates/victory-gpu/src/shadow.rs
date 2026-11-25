@@ -16,6 +16,7 @@
 //! themselves, every buffer range the heap's views reach
 //! (`crate::bindless`).
 
+use crate::title_backing::SubmissionBacking;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -456,27 +457,27 @@ impl Shadow {
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    pub(crate) fn copy_back(&self, address: usize, len: usize, backing: &SubmissionBacking) -> usize {
         if self.in_place {
             self.landed(address, len);
             return 0;
         }
-        self.copy_back_or_not(address, len, true)
+        self.copy_back_or_not(address, len, true, backing)
     }
 
     /// After the submission ran: what its shaders wrote in the range stays
     /// in the copy and does not go into title memory (they computed it
     /// from memory with no copy, `crate::memory`).
-    pub(crate) fn keep_writes(&self, address: usize, len: usize) {
+    pub(crate) fn keep_writes(&self, address: usize, len: usize, backing: &SubmissionBacking) {
         if self.in_place {
             // Written into title memory already: nothing can keep them out.
             self.landed(address, len);
             return;
         }
-        self.copy_back_or_not(address, len, false);
+        self.copy_back_or_not(address, len, false, backing);
     }
 
-    fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+    fn copy_back_or_not(&self, address: usize, len: usize, back: bool, backing: &SubmissionBacking) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -511,15 +512,18 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    if merge_writeback(title, host, old) {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
+                if host != old {
+                    let address = start + at;
+                    backing.write_page(address, || {
+                        if crate::host::read_into(address as *const u8, title) {
+                            if merge_writeback(title, host, old) {
+                                let _writing = crate::watch::writing(address, n);
+                                crate::host::write_mapped(address as *mut u8, title.as_ptr(), n);
+                                written += n;
+                            }
+                            synced.push(address / PAGE);
+                        }
+                    });
                 }
                 at += n;
             }
@@ -851,7 +855,7 @@ pub(crate) fn view_writes() -> Option<u64> {
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
-pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
+pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], backing: &SubmissionBacking) {
     let Some(b) = bitmap() else {
         return;
     };
@@ -897,7 +901,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
         {
             continue;
         }
-        let written = copy.copy_back_marked(page);
+        let written = backing.write_page(page, || copy.copy_back_marked(page)).unwrap_or(0);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -1452,7 +1456,7 @@ mod tests {
         copy.write_host((p + 10) as u64, &[0xaa]);
         // SAFETY: a byte of our pool.
         unsafe { title(PAGE + 20).write_volatile(0x66) };
-        copy.copy_back(p, len);
+        copy.copy_back(p, len, &Default::default());
         // SAFETY: bytes of our pool.
         unsafe {
             assert_eq!(title(10).read_volatile(), 0xaa, "the shader's write goes back");
@@ -1485,11 +1489,11 @@ mod tests {
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
-        assert_eq!(copy.copy_back(p + 16, 64), 64, "the range's part of the piece");
-        assert_eq!(copy.copy_back(p + PAGE, 2 * PAGE), PAGE, "the piece written");
-        assert_eq!(copy.copy_back(p + PAGE, PAGE), 0, "compared once");
-        assert_eq!(copy.copy_back(p + 3 * PAGE, 100), 0);
-        assert_eq!(copy.copy_back(p + 80, 8), 0);
+        assert_eq!(copy.copy_back(p + 16, 64, &Default::default()), 64, "the range's part of the piece");
+        assert_eq!(copy.copy_back(p + PAGE, 2 * PAGE, &Default::default()), PAGE, "the piece written");
+        assert_eq!(copy.copy_back(p + PAGE, PAGE, &Default::default()), 0, "compared once");
+        assert_eq!(copy.copy_back(p + 3 * PAGE, 100, &Default::default()), 0);
+        assert_eq!(copy.copy_back(p + 80, 8, &Default::default()), 0);
         // SAFETY: our pool.
         let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
@@ -1534,7 +1538,7 @@ mod tests {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
         }
-        copy_back_marks(&[]);
+        copy_back_marks(&[], &Default::default());
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { title(at).read_volatile() };
         assert_eq!(read(10), 0xaa, "the shader's byte, page 0");
@@ -1543,7 +1547,7 @@ mod tests {
         // SAFETY: dwords of the mapped bitmap.
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
-        assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        assert_eq!(copy.copy_back(p, len, &Default::default()), 0, "nothing kept to compare");
         unregister(p, p as u64);
     }
 
@@ -1790,7 +1794,7 @@ mod tests {
         // Windows does not guard memory a heap was opened over: such a page
         // stays changed, so copies of it are always copied again.
         let guarded = !other.changed(p / PAGE);
-        in_place.copy_back(p + 8, 4);
+        in_place.copy_back(p + 8, 4, &Default::default());
         let marked = other.changed(p / PAGE);
         let beside = other.changed(p / PAGE + 1);
         drop((other, in_place));

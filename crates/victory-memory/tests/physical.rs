@@ -114,3 +114,22 @@ fn local_allocations_obey_the_smaller_dxgi_cap_without_double_counting() {
     assert_eq!(budget.used(Pool::Local), 0);
     assert_eq!(budget.used(Pool::Ram), 0);
 }
+
+#[test]
+fn writeback_snapshot_keeps_original_identity_across_partial_overlaps() {
+    use victory_memory::physical::BackingPins;
+    const PAGE: usize = PAGE_BYTES as usize;
+    let mut numbers = PageNumbers::default();
+    let old = numbers.allocate(3).unwrap();
+    let later = numbers.allocate(4).unwrap();
+    let mut pins = BackingPins::default();
+    pins.remember(PAGE, 3 * PAGE, Some(old));
+    pins.remember(3 * PAGE, 4 * PAGE, None);
+    pins.remember(0, 4 * PAGE, Some(later));
+
+    assert_eq!(pins.expected(0), Some(later));
+    assert_eq!(pins.expected(PAGE + 1), Some(old));
+    assert_eq!(pins.expected(2 * PAGE + PAGE / 2), Some(old.offset(1)));
+    assert_eq!(pins.expected(3 * PAGE), None);
+    assert_eq!(pins.expected(4 * PAGE), None);
+}
