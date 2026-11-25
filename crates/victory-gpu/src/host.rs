@@ -905,7 +905,7 @@ struct ScratchChunk {
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
-    Copy(usize, usize, usize),
+    Copy(crate::copy_plan::GuestCopy),
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
@@ -2023,11 +2023,11 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
-        let mut deferred = self.deferred();
-        deferred
-            .copies
-            .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        if let Some(copy) = crate::copy_plan::GuestCopy::new(dst as usize, src as usize, len) {
+            let mut deferred = self.deferred();
+            deferred.copies.push(Step::Copy(copy));
+            deferred.refreshed.clear();
+        }
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -2286,7 +2286,7 @@ impl HostList {
                 },
             );
             let copied = match step {
-                &Step::Copy(dst, src, len) => {
+                &Step::Copy(crate::copy_plan::GuestCopy { dst, src, len }) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);

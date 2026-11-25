@@ -45,6 +45,7 @@ jobs:
       - run: cargo test -p victory-gpu --locked --lib a_full_table_names_the_largest_copies
       - run: cargo test -p victory-gpu --locked --lib physical_page_delta_preserves_unwritten_cpu_bytes
       - run: cargo test -p victory-gpu --locked --lib captured_page_snapshot_and_merge_use_original_section
+      - run: cargo test -p victory-gpu --locked --lib guest_copy_splits_both_ends_and_preserves_physical_aliases
   renderer-page-slabs:
     runs-on: windows-latest
     timeout-minutes: 25

@@ -21,6 +21,9 @@ mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
+#[cfg(windows)]
+#[allow(dead_code, reason = "native copy binding is enabled at unified renderer cutover")]
+mod copy_plan;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
