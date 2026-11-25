@@ -3,7 +3,12 @@
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
 
-use victory_memory::{PAGE_BYTES, gpu_table::RawPageTable, physical::HostBudget};
+use victory_memory::{
+    PAGE_BYTES,
+    coherence::Fence,
+    gpu_table::RawPageTable,
+    physical::{HostBudget, PhysicalPage},
+};
 use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Error, Interface, Result};
@@ -17,6 +22,18 @@ use crate::title_backing::SubmissionBacking;
 pub(crate) struct PageRoots {
     pub(crate) table: u64,
     pub(crate) dirty: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PageStats {
+    pub(crate) uploaded: usize,
+    pub(crate) downloaded: usize,
+}
+
+struct Completion {
+    fence: Fence,
+    stats: PageStats,
+    digests: BTreeMap<PhysicalPage, blake3::Hash>,
 }
 
 /// One heap's reserved descriptor slots. They are released only after the
@@ -60,7 +77,7 @@ impl Host {
         backing: &mut SubmissionBacking,
         ranges: &[(u64, u64)],
         record: impl FnOnce(&HostList, PageRoots) -> Result<()>,
-    ) -> std::result::Result<(), BatchError> {
+    ) -> std::result::Result<PageStats, BatchError> {
         let mut signal = self.direct_queue();
         let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
         let batch = PinnedBatch::capture(self, &mut slabs, backing, ranges)?;
@@ -69,8 +86,9 @@ impl Host {
             Ok(completed) => {
                 // The readback was merged before the pins are relinquished.
                 // The next submission revalidates its own CPU snapshot.
-                batch.submitted(&mut slabs, completed, |_| (true, false));
-                Ok(())
+                batch.submitted(&mut slabs, completed.fence, |_| (true, false));
+                slabs.publish_completed_content(completed.digests);
+                Ok(completed.stats)
             }
             Err(e) => {
                 batch.cancel(&mut slabs);
@@ -87,7 +105,7 @@ fn run(
     backing: &SubmissionBacking,
     batch: &PinnedBatch,
     record: impl FnOnce(&HostList, PageRoots) -> Result<()>,
-) -> std::result::Result<victory_memory::coherence::Fence, BatchError> {
+) -> std::result::Result<Completion, BatchError> {
     let native = BatchError::Native;
     let mut pairs = Pairs {
         heap,
@@ -130,9 +148,7 @@ fn run(
             dirty: bitmap.GetGPUVirtualAddress(),
         }
     };
-    if let Some(ref stage) = uploads {
-        stage.record(&list);
-    }
+    let uploaded = uploads.as_ref().map_or(0, |stage| stage.record(&list));
     barrier(&list, slabs.values().copied(), false);
     record(&list, roots).map_err(native)?;
     barrier(&list, slabs.values().copied(), true);
@@ -154,8 +170,19 @@ fn run(
             "paged dispatch accessed unbound page-table leaf {leaf}"
         ))
     });
+    let mut digests = uploads
+        .as_ref()
+        .map_or_else(BTreeMap::new, CapturedUploads::digests);
+    let stats = PageStats {
+        uploaded,
+        downloaded: dirty.len(),
+    };
     if dirty.is_empty() {
-        return Ok(rendered);
+        return Ok(Completion {
+            fence: rendered,
+            stats,
+            digests,
+        });
     }
 
     let readback = (|| -> Result<_> {
@@ -207,8 +234,13 @@ fn run(
                 page.number()
             ));
         }
+        digests.insert(page, blake3::hash(bytes));
     }
-    Ok(completed)
+    Ok(Completion {
+        fence: completed,
+        stats,
+        digests,
+    })
 }
 
 fn barrier<'a>(
@@ -269,26 +301,56 @@ void main(uint3 thread : SV_DispatchThreadID) {
         (ALIAS as u64, (ALIAS + PAGE) as u64),
     ];
     let before = host.completed_fence().unwrap();
-    host.execute_paged(heap, &mut backing, &ranges, |list, roots| {
-        // A CPU write lands after snapshot; the GPU never touched byte 0.
-        section.lock().unwrap()[0] = 0xa5;
-        // SAFETY: paged queue keeps heap, table, bitmap and slab pins
-        // through this dispatch and native readback.
-        unsafe {
-            let cmd = &list.list;
-            cmd.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
-            cmd.SetComputeRootSignature(&root);
-            cmd.SetComputeRootDescriptorTable(0, heap.gpu(0));
-            cmd.SetComputeRootShaderResourceView(1, roots.table);
-            cmd.SetComputeRootUnorderedAccessView(2, roots.dirty);
-            let args = [ALIAS as u32, (ALIAS as u64 >> 32) as u32];
-            cmd.SetComputeRoot32BitConstants(3, 2, args.as_ptr().cast(), 0);
-            cmd.SetPipelineState(&state);
-            cmd.Dispatch(1, 1, 1);
-        }
-        Ok(())
-    })
-    .unwrap();
+    let first = host
+        .execute_paged(heap, &mut backing, &ranges, |list, roots| {
+            // A CPU write lands after snapshot; the GPU never touched byte 0.
+            section.lock().unwrap()[0] = 0xa5;
+            // SAFETY: paged queue keeps heap, table, bitmap and slab pins
+            // through this dispatch and native readback.
+            unsafe {
+                let cmd = &list.list;
+                cmd.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                cmd.SetComputeRootSignature(&root);
+                cmd.SetComputeRootDescriptorTable(0, heap.gpu(0));
+                cmd.SetComputeRootShaderResourceView(1, roots.table);
+                cmd.SetComputeRootUnorderedAccessView(2, roots.dirty);
+                let args = [ALIAS as u32, (ALIAS as u64 >> 32) as u32];
+                cmd.SetComputeRoot32BitConstants(3, 2, args.as_ptr().cast(), 0);
+                cmd.SetPipelineState(&state);
+                cmd.Dispatch(1, 1, 1);
+            }
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(&section.lock().unwrap()[..4], &[0xa5, 0x33, 0x11, 0x11]);
     assert!(host.completed_fence().unwrap().0 >= before.0 + 2);
+    assert_eq!(
+        first,
+        PageStats {
+            uploaded: 1,
+            downloaded: 1
+        }
+    );
+    // The first upload only saw 0x11 at byte 0; the previous dispatch
+    // preserved the CPU's 0xa5, so update the GPU once more, then reuse it.
+    let refresh = host
+        .execute_paged(heap, &mut backing, &ranges, |_, _| Ok(()))
+        .unwrap();
+    assert_eq!(
+        refresh,
+        PageStats {
+            uploaded: 1,
+            downloaded: 0
+        }
+    );
+    let reused = host
+        .execute_paged(heap, &mut backing, &ranges, |_, _| Ok(()))
+        .unwrap();
+    assert_eq!(
+        reused,
+        PageStats {
+            uploaded: 0,
+            downloaded: 0
+        }
+    );
 }

@@ -34,6 +34,7 @@ struct Location {
 struct Page {
     loc: Location,
     initialized: bool,
+    digest: Option<blake3::Hash>,
     dirty: Option<Fence>,
 }
 
@@ -45,6 +46,7 @@ pub(crate) struct PinnedPage {
     loc: Location,
     buffer: ID3D12Resource,
     initialized: bool,
+    digest: Option<blake3::Hash>,
 }
 
 impl PinnedPage {
@@ -100,6 +102,7 @@ impl PageSlabs {
                 Page {
                     loc,
                     initialized: false,
+                    digest: None,
                     dirty: None,
                 },
             );
@@ -112,6 +115,7 @@ impl PageSlabs {
             loc: page.loc,
             buffer: self.slabs[&page.loc.slab].resource.clone(),
             initialized: page.initialized,
+            digest: page.digest,
         })
     }
 
@@ -176,10 +180,27 @@ impl PageSlabs {
             "partial write to an uninitialized slot"
         );
         page.initialized |= initialized;
+        page.digest = None; // callers that know the completed bytes publish their digest later
         if written {
             page.dirty = Some(page.dirty.map_or(fence, |prior| prior.max(fence)));
         }
         assert!(self.residency.end_recording(pin.page, Some(fence)));
+    }
+
+    /// Publish the GPU's bytes (not merged CPU bytes) after this queue's
+    /// actual completion. Eviction drops the digest with the physical ID.
+    pub(crate) fn publish_completed_content(
+        &mut self,
+        digests: BTreeMap<PhysicalPage, blake3::Hash>,
+    ) {
+        for (id, digest) in digests {
+            let page = self
+                .pages
+                .get_mut(&id)
+                .expect("content for pinned resident page");
+            debug_assert!(page.initialized && page.dirty.is_none());
+            page.digest = Some(digest);
+        }
     }
 
     /// Mark only the exact GPU version that was successfully merged back
@@ -374,7 +395,7 @@ pub(crate) struct CapturedUploads<'a> {
     batch: &'a PinnedBatch,
     staging: ID3D12Resource,
     mapped: std::ptr::NonNull<u8>,
-    offsets: BTreeMap<PhysicalPage, usize>,
+    snapshots: BTreeMap<PhysicalPage, (usize, blake3::Hash)>,
 }
 
 impl<'a> CapturedUploads<'a> {
@@ -397,7 +418,7 @@ impl<'a> CapturedUploads<'a> {
             .ok_or_else(|| BatchError::Native(Error::from(E_OUTOFMEMORY)))?;
         let mapped = std::ptr::NonNull::new(data)
             .ok_or_else(|| BatchError::Native(Error::from(E_INVALIDARG)))?;
-        let mut offsets = BTreeMap::new();
+        let mut snapshots = BTreeMap::new();
         for (i, (id, va, _)) in batch.pages().enumerate() {
             let offset = i * PAGE;
             // SAFETY: staging is still exclusively CPU-owned; one slot in
@@ -410,27 +431,38 @@ impl<'a> CapturedUploads<'a> {
             if !backing.stage_page(va as usize, id, dest) {
                 return Err(BatchError::NotCaptured(va));
             }
-            offsets.insert(id, offset);
+            snapshots.insert(id, (offset, blake3::hash(dest)));
         }
         Ok(Some(Self {
             batch,
             staging,
             mapped,
-            offsets,
+            snapshots,
         }))
     }
 
-    pub(crate) fn record(&self, list: &HostList) {
+    pub(crate) fn record(&self, list: &HostList) -> usize {
         let entries: Vec<_> = self
             .batch
             .pages()
-            .map(|(id, _, page)| Transfer {
-                page,
-                staging: &self.staging,
-                offset: self.offsets[&id] as u64,
+            .filter_map(|(id, _, page)| {
+                let (offset, digest) = self.snapshots[&id];
+                (page.digest != Some(digest)).then_some(Transfer {
+                    page,
+                    staging: &self.staging,
+                    offset: offset as u64,
+                })
             })
             .collect();
         upload(list, &entries);
+        entries.len()
+    }
+
+    pub(crate) fn digests(&self) -> BTreeMap<PhysicalPage, blake3::Hash> {
+        self.snapshots
+            .iter()
+            .map(|(&id, &(_, digest))| (id, digest))
+            .collect()
     }
 
     /// Called after actual readback completion. A failed merge leaves
@@ -442,7 +474,8 @@ impl<'a> CapturedUploads<'a> {
         gpu: &[u8],
         scratch: &mut [u8],
     ) -> bool {
-        let Some((&offset, &(va, _))) = self.offsets.get(&page).zip(self.batch.pages.get(&page))
+        let Some((&(offset, _), &(va, _))) =
+            self.snapshots.get(&page).zip(self.batch.pages.get(&page))
         else {
             return false;
         };
