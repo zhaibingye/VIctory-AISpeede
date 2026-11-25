@@ -372,6 +372,31 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        if cfg!(feature = "paged-title") {
+            use crate::page_resource::PageBarrier;
+            for b in barriers {
+                let typed = match (b.kind, b.flags) {
+                    (2, 0) => Some(PageBarrier::Uav),
+                    (0, 0) if b.second as u32 == u32::MAX && !b.first.is_null() => {
+                        if let Some(texture) = crate::resource::host_copy(b.first) {
+                            Some(PageBarrier::Texture(texture, crate::host::texture_state(b.last as u32)))
+                        } else if crate::resource::buffer_bytes(b.first).is_some() {
+                            Some(PageBarrier::Uav)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(typed) = typed {
+                    list.record_page_barrier(typed);
+                } else {
+                    list.mark_unlowered();
+                    break;
+                }
+            }
+            return 0;
+        }
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
@@ -831,10 +856,20 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && dst != 0
-        && src != 0
-    {
+    if let Some(list) = host_list(this) {
+        if cfg!(feature = "paged-title") {
+            if _flags != 0 || (len != 0 && (dst == 0 || src == 0)) {
+                list.mark_unlowered();
+            } else if len != 0 {
+                if crate::copy_plan::GuestCopy::new(dst as usize, src as usize, len as usize).is_some() {
+                    list.defer_copy(dst as *mut u8, src as *const u8, len as usize);
+                } else {
+                    list.mark_unlowered();
+                }
+            }
+            return;
+        }
+        if dst == 0 || src == 0 { return; }
         let len = len as usize;
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)

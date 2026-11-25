@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::Ordering};
 
 use crate::host::{Host, HostList, transition};
+use crate::page_resource::ResourcePlan;
 use crate::page_shader::{RootWords, UnloweredShader};
 use crate::page_slabs::{BatchError, PinnedBatch};
 use crate::page_view::InputView;
@@ -75,16 +76,10 @@ impl ColorTarget {
         Some(Self { copy, desc })
     }
 
-    fn key(&self) -> usize {
-        Arc::as_ptr(&self.copy) as usize
-    }
-
-    fn authoritative(&self, initialized: &TargetWrites) -> bool {
-        self.copy.host_written.load(Ordering::Acquire) || initialized.contains_key(&self.key())
+    fn authoritative(&self, plan: &ResourcePlan) -> bool {
+        plan.authoritative(&self.copy)
     }
 }
-
-pub(crate) type TargetWrites = BTreeMap<usize, Arc<HostTexture>>;
 
 pub(crate) struct ColorClear {
     pub(crate) target: ColorTarget,
@@ -94,13 +89,13 @@ pub(crate) struct ColorClear {
 
 impl ColorClear {
     pub(crate) fn encode(
-        &self, host: &Host, list: &HostList, initialized: &mut TargetWrites,
+        &self, host: &Host, list: &HostList, initialized: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
         if !self.rects.is_empty() && !self.target.authoritative(initialized) {
             return Err(BatchError::TargetNotInitialized);
         }
         let texture = &self.target.copy.texture;
-        let before = D3D12_RESOURCE_STATES(self.target.copy.state.load(Ordering::Acquire) as i32);
+        let before = initialized.state(&self.target.copy);
         let after = D3D12_RESOURCE_STATE_RENDER_TARGET;
         let rtv = host.rtv(texture, self.target.desc.as_ref());
         list.keep(texture);
@@ -117,7 +112,7 @@ impl ColorClear {
                 cmd.ResourceBarrier(&[transition(texture, after, before)]);
             }
         }
-        initialized.insert(self.target.key(), self.target.copy.clone());
+        initialized.initialize(&self.target.copy);
         Ok(())
     }
 }
@@ -169,19 +164,15 @@ impl DepthTarget {
         Some(Self { copy, desc, format, planes })
     }
 
-    fn key(&self) -> usize {
-        Arc::as_ptr(&self.copy) as usize
-    }
-
-    fn authoritative(&self, initialized: &TargetWrites) -> bool {
-        self.copy.host_written.load(Ordering::Acquire) || initialized.contains_key(&self.key())
+    fn authoritative(&self, plan: &ResourcePlan) -> bool {
+        plan.authoritative(&self.copy)
     }
 
     fn begin(
-        &self, host: &Host, list: &HostList,
+        &self, host: &Host, list: &HostList, initialized: &ResourcePlan,
     ) -> (D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_RESOURCE_STATES) {
         let texture = &self.copy.texture;
-        let before = D3D12_RESOURCE_STATES(self.copy.state.load(Ordering::Acquire) as i32);
+        let before = initialized.state(&self.copy);
         list.keep(texture);
         if before != D3D12_RESOURCE_STATE_DEPTH_WRITE {
             // SAFETY: held resource and direct queue lock; restored in end.
@@ -212,7 +203,7 @@ pub(crate) struct DepthClear {
 
 impl DepthClear {
     pub(crate) fn encode(
-        &self, host: &Host, list: &HostList, initialized: &mut TargetWrites,
+        &self, host: &Host, list: &HostList, initialized: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
         let planes = self.target.planes as u32;
         if self.flags == 0 || self.flags & !planes != 0
@@ -223,7 +214,7 @@ impl DepthClear {
         if (!self.rects.is_empty() || self.flags != planes) && !self.target.authoritative(initialized) {
             return Err(BatchError::TargetNotInitialized);
         }
-        let (handle, before) = self.target.begin(host, list);
+        let (handle, before) = self.target.begin(host, list, initialized);
         // SAFETY: retained matching DSV in the scoped depth state.
         unsafe {
             let rects = (!self.rects.is_empty()).then_some(self.rects.as_slice());
@@ -231,7 +222,7 @@ impl DepthClear {
                 self.depth, self.stencil, rects);
         }
         self.target.end(list, before);
-        initialized.insert(self.target.key(), self.target.copy.clone());
+        initialized.initialize(&self.target.copy);
         Ok(())
     }
 }
@@ -372,7 +363,7 @@ impl ClosedDraw {
         batch: &PinnedBatch,
         budget: &mut Option<ID3D12Resource>,
         descriptors: &mut crate::page_queue::PageDescriptors<'_>,
-        initialized: &TargetWrites,
+        initialized: &ResourcePlan,
     ) -> Result<(), BatchError> {
         if !self.target.authoritative(initialized)
             || self.depth.as_ref().is_some_and(|d| !d.authoritative(initialized))
@@ -405,11 +396,11 @@ impl ClosedDraw {
         list.keep(&self.pipeline);
         list.keep(&self.root);
         let texture = &self.target.copy.texture;
-        let before = D3D12_RESOURCE_STATES(self.target.copy.state.load(Ordering::Acquire) as i32);
+        let before = initialized.state(&self.target.copy);
         let render_target = D3D12_RESOURCE_STATE_RENDER_TARGET;
         list.keep(texture);
         let rtv = host.rtv(texture, self.target.desc.as_ref());
-        let dsv = self.depth.as_ref().map(|d| d.begin(host, list));
+        let dsv = self.depth.as_ref().map(|d| d.begin(host, list, initialized));
         // SAFETY: the proven draw owns its pipeline, root and target. The
         // inputs were gathered in this same list from admitted pages.
         unsafe {

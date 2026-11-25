@@ -32,12 +32,14 @@ pub(crate) struct PageStats {
     pub(crate) downloaded: usize,
 }
 
+#[derive(Clone)]
 pub(crate) enum PageOp {
     Copy(GuestCopy),
     Input(InputView),
     Draw(std::sync::Arc<crate::page_draw::ClosedDraw>),
     Clear(std::sync::Arc<crate::page_draw::ColorClear>),
     ClearDepth(std::sync::Arc<crate::page_draw::DepthClear>),
+    Barrier(std::sync::Arc<crate::page_resource::PageBarrier>),
 }
 
 struct Completion {
@@ -177,7 +179,7 @@ impl Host {
                 }
                 PageOp::Input(input) => ranges.push(input.range()?),
                 PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
-                PageOp::Clear(_) | PageOp::ClearDepth(_) => {},
+                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
             }
         }
         self.execute_paged_work(heap, backing, &ranges, |list, _, batch, pins, descriptors, targets| {
@@ -205,6 +207,7 @@ impl Host {
                     PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets)?,
                     PageOp::Clear(clear) => clear.encode(self, list, targets)?,
                     PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,
+                    PageOp::Barrier(barrier) => barrier.encode(list, targets)?,
                 }
             }
             Ok(dirty)
@@ -222,7 +225,7 @@ impl Host {
             &PinnedBatch,
             &BackingPins,
             &mut PageDescriptors<'_>,
-            &mut crate::page_draw::TargetWrites,
+            &mut crate::page_resource::ResourcePlan,
         ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
     ) -> std::result::Result<PageStats, BatchError> {
         let mut signal = self.direct_queue();
@@ -257,7 +260,7 @@ fn run(
         &PinnedBatch,
         &BackingPins,
         &mut PageDescriptors<'_>,
-        &mut crate::page_draw::TargetWrites,
+        &mut crate::page_resource::ResourcePlan,
     ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
 ) -> std::result::Result<Completion, BatchError> {
     let native = BatchError::Native;
@@ -305,7 +308,7 @@ fn run(
     };
     let uploaded = uploads.as_ref().map_or(0, |stage| stage.record(&list));
     barrier(&list, slabs.values().copied(), false);
-    let mut targets = crate::page_draw::TargetWrites::new();
+    let mut targets = crate::page_resource::ResourcePlan::default();
     let declared_dirty = record(&list, roots, batch, backing.pins(), &mut pairs, &mut targets)?;
     barrier(&list, slabs.values().copied(), true);
     list.close();
@@ -318,9 +321,7 @@ fn run(
     }
 
     // Publish authority only after the native queue really executed it.
-    for target in targets.into_values() {
-        target.host_written.store(true, std::sync::atomic::Ordering::Release);
-    }
+    targets.commit();
 
     // SAFETY: the rendering fence completed; this bitmap is fully
     // initialized and no other submission uses it.

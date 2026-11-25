@@ -252,6 +252,7 @@ pub(crate) enum BatchError {
     UnloweredList(usize),
     TargetNotInitialized,
     UnsupportedDepth,
+    UnsupportedBarrier,
     Range(u64, u64),
     NotCaptured(u64),
     Native(Error),
