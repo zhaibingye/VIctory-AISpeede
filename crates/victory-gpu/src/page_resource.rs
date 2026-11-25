@@ -108,25 +108,34 @@ fn single_color(d: D3D12_RESOURCE_DESC) -> bool {
         && !d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
 }
 
-/// Full replacement from a placed linear view into a native title
-/// texture. It shares the queue's authority and transition ledger.
+/// An exact region from a placed linear source into a native target.
+/// Partial uploads consume existing target authority; full ones establish it.
 pub(crate) struct TextureUpload {
     source: crate::page_texture::LinearTexture,
     target: Arc<HostTexture>,
+    offset: (u32, u32),
+    fills_target: bool,
 }
 
 impl TextureUpload {
-    pub(crate) fn capture(source: crate::page_texture::LinearTexture, target: Arc<HostTexture>) -> Option<Self> {
+    pub(crate) fn capture(
+        source: crate::page_texture::LinearTexture, target: Arc<HostTexture>,
+        (x, y): (u32, u32), bounds: Option<[u32; 6]>,
+    ) -> Option<Self> {
+        let source = source.crop(bounds)?;
+        let end_x = u64::from(x.checked_add(source.width)?);
+        let end_y = y.checked_add(source.height)?;
         // SAFETY: the retained resource is live.
         let desc = unsafe { target.texture.GetDesc() };
         if !single_color(desc) || target.sparse.is_some()
             || target.twin.get().is_some_and(Option::is_some)
-            || desc.Width != u64::from(source.width) || desc.Height != source.height
+            || end_x > desc.Width || end_y > desc.Height
             || desc.Format != source.format
         {
             return None;
         }
-        Some(Self { source, target })
+        let fills_target = x == 0 && y == 0 && end_x == desc.Width && end_y == desc.Height;
+        Some(Self { source, target, offset: (x, y), fills_target })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -137,8 +146,11 @@ impl TextureUpload {
     pub(crate) fn encode(&self, host: &crate::host::Host, list: &HostList,
         batch: &crate::page_slabs::PinnedBatch, plan: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
+        if !self.fills_target && !plan.authoritative(&self.target) {
+            return Err(BatchError::TargetNotInitialized);
+        }
         plan.transition_texture(list, &self.target, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
-        self.source.copy_to(host, list, batch, &self.target.texture)?;
+        self.source.copy_to(host, list, batch, &self.target.texture, self.offset)?;
         plan.initialize(&self.target);
         Ok(())
     }

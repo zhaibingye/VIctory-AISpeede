@@ -39,11 +39,21 @@ impl LinearTexture {
         }))
     }
 
-    pub(crate) fn encode(
-        self, host: &Host, list: &HostList, batch: &PinnedBatch,
-    ) -> Result<ID3D12Resource, BatchError> {
-        let _ = self.rows()?;
-        let desc = D3D12_RESOURCE_DESC {
+    pub(crate) fn crop(self, bounds: Option<[u32; 6]>) -> Option<Self> {
+        let [left, top, front, right, bottom, back] =
+            bounds.unwrap_or([0, 0, 0, self.width, self.height, 1]);
+        if front != 0 || back != 1 || left >= right || top >= bottom
+            || right > self.width || bottom > self.height
+        {
+            return None;
+        }
+        let address = self.address.checked_add(u64::from(top) * u64::from(self.row_pitch))?
+            .checked_add(u64::from(left) * 4)?;
+        Some(Self { address, width: right - left, height: bottom - top, ..self })
+    }
+
+    fn native_desc(self) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: u64::from(self.width),
             Height: self.height,
@@ -52,7 +62,14 @@ impl LinearTexture {
             Format: self.format,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             ..Default::default()
-        };
+        }
+    }
+
+    pub(crate) fn encode(
+        self, host: &Host, list: &HostList, batch: &PinnedBatch,
+    ) -> Result<ID3D12Resource, BatchError> {
+        let _ = self.rows()?;
+        let desc = self.native_desc();
         // SAFETY: one validated 2D texture description.
         let alloc = unsafe { host.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -65,7 +82,7 @@ impl LinearTexture {
             }
             resource.ok_or_else(|| Error::from(E_FAIL))
         }).map_err(BatchError::Native)?;
-        self.copy_to(host, list, batch, &texture)?;
+        self.copy_to(host, list, batch, &texture, (0, 0))?;
         // SAFETY: copy_to leaves the retained texture in COPY_DEST.
         unsafe {
             list.recording().ResourceBarrier(&[transition(&texture, dest,
@@ -79,22 +96,26 @@ impl LinearTexture {
     /// supplies a matching native subresource zero in COPY_DEST.
     pub(crate) fn copy_to(
         self, host: &Host, list: &HostList, batch: &PinnedBatch, texture: &ID3D12Resource,
+        (x, y): (u32, u32),
     ) -> Result<(), BatchError> {
         let rows = self.rows()?;
         // SAFETY: live native resource. Only an exact single subresource
         // is consumed here, regardless of the guest's pitch.
         let desc = unsafe { texture.GetDesc() };
-        if desc.Width != u64::from(self.width) || desc.Height != self.height || desc.Format != self.format
-            || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
+        if x.checked_add(self.width).is_none_or(|end| u64::from(end) > desc.Width)
+            || y.checked_add(self.height).is_none_or(|end| end > desc.Height)
+            || desc.Format != self.format || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
             || desc.MipLevels != 1 || desc.DepthOrArraySize != 1
         {
             return Err(BatchError::Native(E_FAIL.into()));
         }
         let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let (mut row_count, mut row_bytes, mut total) = (0, 0, 0);
-        // SAFETY: one subresource and correctly sized output locations.
+        // SAFETY: staging describes the cropped source, not the target,
+        // with one subresource and correctly sized output locations.
         unsafe {
-            host.device.GetCopyableFootprints(&desc, 0, 1, 0,
+            host.device.GetCopyableFootprints(&self.native_desc(), 0, 1, 0,
                 Some(&mut footprint), Some(&mut row_count), Some(&mut row_bytes), Some(&mut total));
         }
         if row_count != self.height || row_bytes != u64::from(self.width) * 4
@@ -112,7 +133,7 @@ impl LinearTexture {
         }), &staging, dest, read)?;
         list.keep(texture);
         // SAFETY: both resources stay alive in the named states. The
-        // placed buffer footprint came from exactly this texture desc.
+        // placed buffer footprint describes the validated source extent.
         unsafe {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(texture),
@@ -125,7 +146,7 @@ impl LinearTexture {
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
             };
             let cmd = list.recording();
-            cmd.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            cmd.CopyTextureRegion(&to, x, y, 0, &from, None);
         }
         Ok(())
     }
