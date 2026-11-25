@@ -231,13 +231,15 @@ impl ClosedDraw {
             if before != render_target {
                 cmd.ResourceBarrier(&[transition(texture, before, render_target)]);
             }
+            if !bases.is_empty() {
+                // Directly indexed root signatures require their descriptor
+                // heap to be set before the root signature itself.
+                cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
+            }
             cmd.SetGraphicsRootSignature(&self.root);
             cmd.SetPipelineState(&self.pipeline);
             if let Some(sample) = &sample {
                 sample.bind(cmd, descriptors);
-            }
-            if !bases.is_empty() {
-                cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
             }
             for (param, words) in &words {
                 cmd.SetGraphicsRoot32BitConstants(
@@ -269,23 +271,51 @@ impl ClosedDraw {
 #[cfg(all(test, feature = "diagnostics"))]
 #[test]
 fn paged_title_draw_reads_gpu_copied_vertices_and_renders_pixels() {
-    check_paged_title_pixels(false, false);
+    check_paged_title_pixels(false, false, false);
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
 #[test]
 fn paged_title_indirect_draw_reads_gpu_generated_records_and_count() {
-    check_paged_title_pixels(true, false);
+    check_paged_title_pixels(true, false, false);
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
 #[test]
 fn paged_title_draw_samples_texture_written_by_preceding_gpu_copy() {
-    check_paged_title_pixels(false, true);
+    check_paged_title_pixels(false, true, false);
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
-fn check_paged_title_pixels(indirect: bool, sampled: bool) {
+#[test]
+fn paged_title_draw_uses_relocated_texture_table_byte_base() {
+    check_paged_title_pixels(false, true, true);
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn compile_relocated_pixel(source: &str) -> Vec<u8> {
+    let dxc = std::env::var_os("VICTORY_PC_DXC").map(std::path::PathBuf::from)
+        .or_else(|| {
+            let mut paths: Vec<_> = std::fs::read_dir("C:/Program Files (x86)/Windows Kits/10/bin")
+                .ok()?.filter_map(Result::ok)
+                .map(|p| p.path().join("x64/dxc.exe"))
+                .filter(|p| p.is_file()).collect();
+            paths.sort();
+            paths.pop()
+        })
+        .expect("Windows SDK dxc.exe is required for the paged direct-index test");
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("shader.hlsl");
+    let blob = temp.path().join("shader.dxil");
+    std::fs::write(&src, source).unwrap();
+    let output = std::process::Command::new(dxc).args(["-T", "ps_6_6", "-E", "pixel", "-Fo"])
+        .arg(&blob).arg(&src).output().unwrap();
+    assert!(output.status.success(), "DXC: {}", String::from_utf8_lossy(&output.stderr));
+    std::fs::read(blob).unwrap()
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn check_paged_title_pixels(indirect: bool, sampled: bool, relocated: bool) {
     use victory_memory::{PAGE_BYTES, physical::PageNumbers};
     use windows::Win32::Graphics::Direct3D::{
         D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, Fxc::D3DCompile,
@@ -322,7 +352,15 @@ float4 pixel() : SV_Target0 { return green; }
         code.unwrap()
     };
     let vs = compile(s!("vertex"), s!("vs_5_0"));
-    let ps = compile(s!("pixel"), s!("ps_5_0"));
+    let fxc_ps = (!relocated).then(|| compile(s!("pixel"), s!("ps_5_0")));
+    let dxc_ps = relocated.then(|| compile_relocated_pixel(r#"
+cbuffer Table : register(b0) { uint table_bytes; }
+SamplerState nearest : register(s0);
+float4 pixel() : SV_Target0 {
+    Texture2D<float4> colors = ResourceDescriptorHeap[(table_bytes >> 5) + 3];
+    return colors.SampleLevel(nearest, float2(0.5, 0.5), 0);
+}
+"#));
     const FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
     // SAFETY: creation descriptors and shader blobs live through calls.
     let (root, pso, target): (ID3D12RootSignature, ID3D12PipelineState, ID3D12Resource) = unsafe {
@@ -358,19 +396,43 @@ float4 pixel() : SV_Target0 { return green; }
             ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
             ..Default::default()
         };
-        D3D12SerializeRootSignature(
-            &D3D12_ROOT_SIGNATURE_DESC {
-                NumParameters: 1,
-                pParameters: if sampled { &view } else { &constants },
-                NumStaticSamplers: u32::from(sampled),
-                pStaticSamplers: if sampled { &sampler } else { std::ptr::null() },
-                Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
-                ..Default::default()
-            },
-            D3D_ROOT_SIGNATURE_VERSION_1,
-            &mut serialized,
-            None,
-        ).unwrap();
+        if relocated {
+            let parameter = D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 { Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4,
+                } },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            D3D12SerializeVersionedRootSignature(
+                &D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                    Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+                    Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                        Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                            NumParameters: 1, pParameters: &parameter,
+                            NumStaticSamplers: 1, pStaticSamplers: &sampler,
+                            Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+                                | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
+                        },
+                    },
+                },
+                &mut serialized,
+                None,
+            ).unwrap();
+        } else {
+            D3D12SerializeRootSignature(
+                &D3D12_ROOT_SIGNATURE_DESC {
+                    NumParameters: 1,
+                    pParameters: if sampled { &view } else { &constants },
+                    NumStaticSamplers: u32::from(sampled),
+                    pStaticSamplers: if sampled { &sampler } else { std::ptr::null() },
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+                },
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut serialized,
+                None,
+            ).unwrap();
+        }
         let serialized = serialized.unwrap();
         let bytes = std::slice::from_raw_parts(
             serialized.GetBufferPointer().cast::<u8>(), serialized.GetBufferSize(),
@@ -388,8 +450,11 @@ float4 pixel() : SV_Target0 { return green; }
             VS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: vs.GetBufferPointer(), BytecodeLength: vs.GetBufferSize(),
             },
-            PS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: ps.GetBufferPointer(), BytecodeLength: ps.GetBufferSize(),
+            PS: if let Some(ps) = &dxc_ps {
+                D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr().cast(), BytecodeLength: ps.len() }
+            } else {
+                let ps = fxc_ps.as_ref().unwrap();
+                D3D12_SHADER_BYTECODE { pShaderBytecode: ps.GetBufferPointer(), BytecodeLength: ps.GetBufferSize() }
             },
             BlendState: blend,
             SampleMask: u32::MAX,
@@ -489,13 +554,19 @@ float4 pixel() : SV_Target0 { return green; }
     if sampled {
         use crate::page_texture::{LinearTexture, SampledTexture};
         title.defer_copy((VA + 160) as *mut u8, (ALIAS + 176) as *const u8, 4);
-        draw.sample = Some(SampledTexture {
-            root: 0,
-            input: LinearTexture {
-                address: (VA + 160) as u64, row_pitch: 4, width: 1, height: 1,
-                format: FORMAT,
-            },
-        });
+        let input = LinearTexture {
+            address: (VA + 160) as u64, row_pitch: 4, width: 1, height: 1,
+            format: FORMAT,
+        };
+        if relocated {
+            draw.texture_tables.entry(7).or_default().insert(3, input);
+            // An unrelocated table would read from the wrong heap slot.
+            draw.constants.push(RootWords {
+                parameter: 0, words: vec![0; 4], tables: vec![(0, 7)],
+            });
+        } else {
+            draw.sample = Some(SampledTexture { root: 0, input });
+        }
     } else {
         draw.constants.push(RootWords {
             parameter: 0,
