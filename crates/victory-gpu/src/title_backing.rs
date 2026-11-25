@@ -213,12 +213,15 @@ fn physical_page_delta_preserves_unwritten_cpu_bytes() {
 }
 
 #[cfg(test)]
-#[test]
-fn captured_page_snapshot_and_merge_use_original_section() {
+pub(crate) fn test_capture(
+    id: PhysicalPage,
+    aliases: &[usize],
+) -> (
+    SubmissionBacking,
+    std::sync::Arc<std::sync::Mutex<Box<[u8]>>>,
+) {
     use std::sync::{Arc, Mutex};
-    use victory_memory::physical::PageNumbers;
     const PAGE: usize = PAGE_BYTES as usize;
-    const VA: usize = PAGE;
     type Section = Mutex<Box<[u8]>>;
 
     // Simulate an old section surviving with no original title VA, while
@@ -249,13 +252,24 @@ fn captured_page_snapshot_and_merge_use_original_section() {
         test_api: Some((|_, _| {}, write, read)),
         ..Default::default()
     };
+    let section = Arc::new(Mutex::new(vec![0x11u8; PAGE].into_boxed_slice()));
+    submission.pins.keep(id, &section);
+    for &va in aliases {
+        submission.pins.remember(va, va + PAGE, Some(id));
+    }
+    (submission, section)
+}
+
+#[cfg(test)]
+#[test]
+fn captured_page_snapshot_and_merge_use_original_section() {
+    use victory_memory::physical::PageNumbers;
+    const PAGE: usize = PAGE_BYTES as usize;
+    const VA: usize = PAGE;
     let mut ids = PageNumbers::default();
     let first = ids.allocate(1).unwrap();
     let replacement = ids.allocate(1).unwrap();
-    let section = Arc::new(Mutex::new(vec![0x11u8; PAGE].into_boxed_slice()));
-    submission.pins.keep(first, &section);
-    submission.pins.remember(VA, VA + PAGE, Some(first));
-
+    let (submission, section) = test_capture(first, &[VA]);
     let mut before = vec![0; PAGE];
     assert!(!submission.stage_page(VA, replacement, &mut before));
     assert!(submission.stage_page(VA, first, &mut before));

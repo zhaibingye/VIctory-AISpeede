@@ -52,6 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: cargo test -p victory-gpu --features diagnostics --locked --lib renderer_page_slab_roundtrip_uses_direct_queue_fence
+      - run: cargo test -p victory-gpu --features diagnostics --locked --lib paged_direct_queue_merges_only_marked_physical_pages
   shader-pages:
     runs-on: windows-latest
     timeout-minutes: 25

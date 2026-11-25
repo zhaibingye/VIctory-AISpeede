@@ -40,6 +40,9 @@ pub mod list;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+#[allow(dead_code, reason = "will replace title dispatch after direct and texture views use physical pages")]
+mod page_queue;
+#[cfg(windows)]
 #[allow(dead_code, reason = "wired into title submissions together with direct/texture coherence at cutover")]
 mod page_slabs;
 pub mod object;

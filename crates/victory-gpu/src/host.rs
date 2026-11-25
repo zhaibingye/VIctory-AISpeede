@@ -45,6 +45,7 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    pub(crate) paged: Mutex<crate::page_slabs::PageSlabs>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -258,6 +259,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            paged: Mutex::default(),
             event,
             rtvs,
             rtv_size,
@@ -1149,12 +1151,36 @@ impl Host {
         (completed != u64::MAX).then_some(victory_memory::coherence::Fence(completed))
     }
 
+    /// Signal once for an entire native list group. The caller holds the
+    /// submission lock across preparation and physical writeback.
+    pub(crate) fn run_native_group(
+        &self, submitted: &mut u64, group: &[Option<ID3D12CommandList>],
+    ) -> windows::core::Result<victory_memory::coherence::Fence> {
+        *submitted = submitted.checked_add(1).filter(|&v| v != u64::MAX)
+            .ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+        // SAFETY: callers supply closed lists and serialize the device event
+        // and queue with the submission lock.
+        unsafe {
+            self.queue.ExecuteCommandLists(group);
+            self.queue.Signal(&self.fence, *submitted)?;
+            self.fence.SetEventOnCompletion(*submitted, self.event)?;
+            if WaitForSingleObject(self.event, INFINITE) != WAIT_OBJECT_0 {
+                return Err(windows::core::Error::from_thread());
+            }
+        }
+        Ok(victory_memory::coherence::Fence(*submitted))
+    }
+
+    pub(crate) fn direct_queue(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         crate::working_set::sample(self.memory_adapter());
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = self.direct_queue();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let mut faults = crate::copystat::page_faults();
@@ -1266,32 +1292,14 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             let groups = [&lists[..]];
             for (i, group) in groups.iter().enumerate() {
-                *submitted += 1;
                 let group_started = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
-                crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-                // SAFETY: closed lists; the fence and event are ours.
-                unsafe {
-                    self.queue.ExecuteCommandLists(group);
-                    let waited = self
-                        .queue
-                        .Signal(&self.fence, *submitted)
-                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                    let waited = waited.and_then(|()| {
-                        if WaitForSingleObject(self.event, INFINITE) == WAIT_OBJECT_0 {
-                            Ok(())
-                        } else {
-                            Err(windows::core::Error::from_thread())
-                        }
-                    });
-                    if let Err(e) = waited {
-                        // The next chunk can reset this allocator. Never
-                        // proceed if the preceding fence did not complete.
-                        fail(format_args!(
-                            "host submission fence wait failed: {e}{}",
-                            self.removal_data(runs)
-                        ));
-                    }
+                crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted + 1, 0);
+                if let Err(e) = self.run_native_group(&mut submitted, group) {
+                    fail(format_args!(
+                        "host submission fence wait failed: {e}{}",
+                        self.removal_data(runs)
+                    ));
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
