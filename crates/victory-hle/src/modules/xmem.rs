@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_DECOMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
@@ -31,7 +31,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
-use victory_memory::budget::Pool;
+use victory_memory::{budget::Pool, virtual_pages::VirtualPages};
 use victory_memory::physical::{
     Aliases, BackingPins, HostBudget, PageNumbers, PhysicalPage, Reservation,
 };
@@ -88,6 +88,55 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+// Serialize the wrapped host OS commit/release with GPU capture. Slots
+// describe ordinary virtual memory, not aliased XMem section views.
+fn virtual_pages() -> MutexGuard<'static, VirtualPages> {
+    static PRIVATE: LazyLock<Mutex<VirtualPages>> = LazyLock::new(Mutex::default);
+    PRIVATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn note_private_commit(pages: &mut VirtualPages, at: *mut c_void, bytes: usize, kind: u32) {
+    if at.is_null() || kind & MEM_COMMIT == 0 {
+        return;
+    }
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: querying the successful allocation writes one local record.
+    let found = unsafe { VirtualQueryEx(GetCurrentProcess(), at, &mut info, size_of_val(&info)) };
+    if found != 0 && info.State == MEM_COMMIT
+        && info.Type == windows_sys::Win32::System::Memory::MEM_PRIVATE
+    {
+        pages.committed(info.AllocationBase as usize, at as usize, bytes);
+    }
+}
+
+pub(crate) fn private_virtual_alloc(base: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+    let mut pages = virtual_pages();
+    // SAFETY: this has the same pointer/flags contract as the title's
+    // VirtualAlloc import. The host validates address alignment and range.
+    let at = unsafe { VirtualAlloc(base, size, kind, protect) };
+    let bytes = if base.is_null() || at.is_null() {
+        size
+    } else {
+        (base as usize).saturating_add(size).saturating_sub(at as usize)
+    };
+    note_private_commit(&mut pages, at, bytes, kind);
+    at
+}
+
+pub(crate) fn private_virtual_free(base: *mut c_void, size: usize, kind: u32) -> BOOL {
+    let mut pages = virtual_pages();
+    // SAFETY: unchanged host VirtualFree ABI; only publish success.
+    let freed = unsafe { VirtualFree(base, size, kind) };
+    if freed != 0 {
+        if kind & (MEM_RELEASE | MEM_DECOMMIT) != 0 && size == 0 {
+            pages.released(base as usize);
+        } else if kind & (MEM_RELEASE | MEM_DECOMMIT) != 0 {
+            pages.decommitted(base as usize, size);
+        }
+    }
+    freed
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -142,6 +191,7 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
+    let mut private = virtual_pages();
     let at = unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
@@ -157,6 +207,13 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    let bytes = if base.is_null() || at.is_null() {
+        size
+    } else {
+        (base as usize).saturating_add(size).saturating_sub(at as usize)
+    };
+    note_private_commit(&mut private, at, bytes, kind);
+    drop(private);
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -348,7 +405,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            private_virtual_free(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -430,8 +487,20 @@ impl Physical {
 
 /// Resolve title ranges once with the mapping lock. The GPU holds the
 /// returned section leases after the OS views or title handles are removed.
+fn remember_private(
+    private: &VirtualPages, pins: &mut BackingPins, start: usize, end: usize,
+) {
+    let mut at = start;
+    while at < end {
+        let (next, page) = private.run_at(at, end);
+        pins.remember(at, next, page);
+        at = next;
+    }
+}
+
 pub(crate) fn pin_backing(ranges: &[(usize, usize)], pins: &mut BackingPins) {
     let physical = physical();
+    let private = virtual_pages();
     for &(start, end) in ranges {
         if start >= end {
             continue;
@@ -446,14 +515,14 @@ pub(crate) fn pin_backing(ranges: &[(usize, usize)], pins: &mut BackingPins) {
             let from = base.max(start);
             let to = (base + size).min(end);
             if at < from {
-                pins.remember(at, from, None);
+                remember_private(&private, pins, at, from);
             }
             pins.keep(slice.section.first, &slice.section);
             pins.remember(from, to, Some(slice.page((from - base) / PAGE)));
             at = to;
         }
         if at < end {
-            pins.remember(at, end, None);
+            remember_private(&private, pins, at, end);
         }
     }
 }
@@ -466,6 +535,7 @@ pub(crate) fn read_backing_runs(
     visit: &mut dyn FnMut(usize, Option<usize>, usize, bool),
 ) {
     let physical = physical();
+    let private = virtual_pages();
     let mut at = start;
     while at < end {
         let (limit, expected) = pins.run_at(at, end);
@@ -478,7 +548,7 @@ pub(crate) fn read_backing_runs(
             None => {
                 let next = physical.views.range(at..).next()
                     .map_or(limit, |(&base, _)| limit.min(base));
-                (next, None)
+                private.run_at(at, next)
             }
         };
         let len = limit - at;
@@ -515,10 +585,12 @@ pub(crate) fn with_writeback_page(
         return false;
     }
     let physical = physical();
+    let private = virtual_pages();
     let expected = pins.expected(address);
     let current = physical.views.range(..=address).next_back()
         .filter(|&(&base, &(size, _))| address - base < size)
-        .map(|(&base, (_, slice))| slice.page((address - base) / PAGE));
+        .map(|(&base, (_, slice))| slice.page((address - base) / PAGE))
+        .or_else(|| private.page(address));
     if current == expected {
         write(WritebackTarget { address, original_va: true });
         return true;
@@ -1209,6 +1281,43 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_private_decommit_does_not_retarget_captured_gpu_page() {
+        let p = super::super::kernel::VirtualAlloc(
+            std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+        let va = p as usize;
+        let mut before = BackingPins::default();
+        pin_backing(&[(va, va + 2 * PAGE)], &mut before);
+        let original = before.expected(va).unwrap();
+        assert!(original.is_private());
+        let adjacent = before.expected(va + PAGE).unwrap();
+        assert_ne!(original, adjacent);
+        let granule = (va + 4096) as *mut c_void;
+        assert_ne!(super::super::kernel::VirtualFree(granule, 4096, MEM_DECOMMIT), 0);
+        assert_eq!(super::super::kernel::VirtualAlloc(granule, 4096, MEM_COMMIT, PAGE_READWRITE), granule);
+        let mut after = BackingPins::default();
+        pin_backing(&[(va, va + 2 * PAGE)], &mut after);
+        let fresh = after.expected(va).unwrap();
+        assert!(fresh.is_private() && fresh != original);
+        assert_eq!(after.expected(va + PAGE), Some(adjacent));
+        read_backing_runs(va, va + PAGE, &before, &mut |_, at, len, same| {
+            assert_eq!(at, None, "do not return bytes of the replacement page");
+            assert_eq!(len, PAGE);
+            assert!(!same);
+        });
+        assert!(!with_writeback_page(va, 1, &before, true, &mut |_| panic!("stale write")));
+        assert!(with_writeback_page(va, 1, &after, true, &mut |target| {
+            assert_eq!(target.address, va);
+            assert!(target.original_va);
+        }));
+        assert_ne!(super::super::kernel::VirtualFree(p, 0, MEM_RELEASE), 0);
+        let mut released = BackingPins::default();
+        pin_backing(&[(va, va + PAGE)], &mut released);
+        assert_ne!(released.expected(va), Some(fresh));
+    }
+
+    #[test]
     fn alloc_honours_alignment_and_frees() {
         for (field, align) in [(0, 16), (4, 16), (0xc, 4096), (0x10, 64 * 1024)] {
             let attributes = field << ALIGNMENT_SHIFT | 1 << 29; // a graphics type
@@ -1277,7 +1386,7 @@ mod tests {
         };
         assert_eq!(watched, 0);
         // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(private_virtual_free(p, 0, MEM_RELEASE), 0);
         assert_eq!(query(p).flags, 0);
         // No address field: above the 32-bit range and below 2^40, where
         // the console keeps it.
@@ -1291,7 +1400,7 @@ mod tests {
         assert!(!p.is_null() && (p as usize) >= 1 << 32, "{p:p}");
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(private_virtual_free(p, 0, MEM_RELEASE), 0);
     }
 
     #[test]

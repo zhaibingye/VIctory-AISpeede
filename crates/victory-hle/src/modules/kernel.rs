@@ -361,6 +361,16 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+#[cfg(windows)]
+pub extern "system" fn VirtualAlloc(base: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+    super::xmem::private_virtual_alloc(base, size, kind, protect)
+}
+
+#[cfg(windows)]
+pub extern "system" fn VirtualFree(base: *mut c_void, size: usize, kind: u32) -> i32 {
+    super::xmem::private_virtual_free(base, size, kind)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -370,6 +380,7 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
+            "api-ms-win-core-memory-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
         ],
@@ -392,6 +403,10 @@ pub(crate) fn module() -> HleModule {
             hle_export!(terminate),
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
+            #[cfg(windows)]
+            hle_export!(VirtualAlloc),
+            #[cfg(windows)]
+            hle_export!(VirtualFree),
             hle_export!(SetUnhandledExceptionFilter),
         ],
     }

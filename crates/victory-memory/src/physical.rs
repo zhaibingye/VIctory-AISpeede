@@ -66,8 +66,9 @@ impl Drop for Reservation {
     }
 }
 
-/// Physical page identity in the title's ABI: a 21-bit index packed as a
-/// number of 4 KiB frames. Monotonic across allocations, regardless of VA.
+/// Stable backing identity. XMem numbers below the reserved private bit
+/// keep their title ABI encoding (21-bit index of 64 KiB pages, expressed
+/// in 4 KiB frames); private mappings use a disjoint internal namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PhysicalPage(usize);
 
@@ -76,11 +77,22 @@ const FIRST: usize = 0x10_0000;
 const END: usize = (1 << 21) * FRAMES;
 
 impl PhysicalPage {
+    const PRIVATE: usize = 1usize << (usize::BITS - 1);
+
+    pub(crate) fn private(generation: usize) -> Option<Self> {
+        (generation < Self::PRIVATE / FRAMES).then(|| Self(Self::PRIVATE | generation * FRAMES))
+    }
+
+    pub fn is_private(self) -> bool {
+        self.0 & Self::PRIVATE != 0
+    }
+
     pub fn number(self) -> usize {
         self.0
     }
 
     pub fn offset_from(self, section: Self) -> Option<usize> {
+        if self.is_private() != section.is_private() { return None; }
         self.0.checked_sub(section.0).map(|distance| distance / FRAMES)
     }
 
@@ -156,6 +168,7 @@ impl BackingPins {
     /// Recover the pinned section for an identity previously captured by
     /// this submission. The caller checks the offset against the extent.
     pub fn section<T: Any + Send + Sync>(&self, page: PhysicalPage) -> Option<(Arc<T>, usize)> {
+        if page.is_private() { return None; }
         let (&first, section) = self.sections.range(..=page).next_back()?;
         Some((section.clone().downcast::<T>().ok()?, page.offset_from(first)?))
     }

@@ -9,6 +9,7 @@ on:
       - 'crates/victory-hle/Cargo.toml'
       - 'crates/victory-hle/src/modules/xmem.rs'
       - 'crates/victory-hle/src/modules/d3d12x.rs'
+      - 'crates/victory-hle/src/modules/kernel.rs'
       - 'crates/victory-gpu/**'
       - 'crates/victory-shader/**'
       - 'apps/victory/src/translate.rs'
