@@ -53,6 +53,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
+#[cfg(all(windows, test))]
+mod shared_memory_probe;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
