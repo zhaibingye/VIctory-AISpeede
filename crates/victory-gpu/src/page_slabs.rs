@@ -1,21 +1,21 @@
 //! Renderer-owned physical page storage. Native slabs are charged to the same
 //! ledger as XMem. A slab is one D3D12 buffer, so one descriptor pair can bind
 //! every slot. The queue must transition a slab as a unit, not per slot.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use victory_memory::{
     PAGE_BYTES,
     coherence::Fence,
-    gpu_table::{BindError, RawPageTable},
-    physical::PhysicalPage,
+    gpu_table::{ADDRESS_LIMIT, BindError, RawPageTable},
+    physical::{BackingPins, PhysicalPage},
     residency::Residency,
 };
 use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::{Common::DXGI_SAMPLE_DESC, DXGI_ERROR_DEVICE_REMOVED};
-use windows::core::{Error, Result};
+use windows::core::{Error, Interface, Result};
 
-use crate::host::Host;
+use crate::host::{Host, HostList, transition};
 
 const SLOTS: u8 = 16;
 pub(crate) const SLAB_BYTES: u64 = PAGE_BYTES * SLOTS as u64;
@@ -219,6 +219,213 @@ impl PageSlabs {
     }
 }
 
+/// One direct-queue batch. Distinct VAs can have separate leaf/dirty bits;
+/// the physical page is pinned and transferred only once.
+pub(crate) struct PinnedBatch {
+    pages: BTreeMap<PhysicalPage, (u64, PinnedPage)>,
+    aliases: BTreeMap<u64, PhysicalPage>,
+}
+
+#[derive(Debug)]
+pub(crate) enum BatchError {
+    Range(u64, u64),
+    NotCaptured(u64),
+    Native(Error),
+    Table(BindError),
+}
+
+/// Translation back from the GPU's per-VA mark bitmap. One missing leaf
+/// taints the whole batch; the caller must not merge writes computed
+/// from a partial/missing address space.
+pub(crate) struct BoundLeaves(BTreeMap<usize, PhysicalPage>);
+
+impl BoundLeaves {
+    pub(crate) fn dirty_pages(
+        &self,
+        bitmap: &[u32],
+    ) -> std::result::Result<BTreeSet<PhysicalPage>, usize> {
+        let mut dirty = BTreeSet::new();
+        for (word, &bits) in bitmap.iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let leaf = word * 32 + bits.trailing_zeros() as usize;
+                let page = self.0.get(&leaf).copied().ok_or(leaf)?;
+                dirty.insert(page);
+                bits &= bits - 1;
+            }
+        }
+        Ok(dirty)
+    }
+}
+
+impl PinnedBatch {
+    /// `ranges` are half-open GPU virtual addresses. Until ordinary
+    /// allocations receive their own stable identity, unknown pages fail
+    /// this path as a batch rather than becoming readable nulls.
+    pub(crate) fn from_capture(
+        host: &Host,
+        slabs: &mut PageSlabs,
+        backing: &BackingPins,
+        ranges: &[(u64, u64)],
+    ) -> std::result::Result<Self, BatchError> {
+        let mut aliases = BTreeMap::new();
+        for &(start, end) in ranges {
+            if start > end || end > ADDRESS_LIMIT {
+                return Err(BatchError::Range(start, end));
+            }
+            if start == end {
+                continue;
+            }
+            let mut va = start & !(PAGE_BYTES - 1);
+            while va < end {
+                let (stop, physical) = backing.run_at(va as usize, end as usize);
+                let physical = physical.ok_or(BatchError::NotCaptured(va))?;
+                for (i, addr) in (va..stop as u64).step_by(PAGE_BYTES as usize).enumerate() {
+                    aliases.insert(addr, physical.offset(i));
+                }
+                va = stop as u64;
+            }
+        }
+        let mut pages = BTreeMap::new();
+        for (&va, &id) in &aliases {
+            use std::collections::btree_map::Entry;
+            if let Entry::Vacant(slot) = pages.entry(id) {
+                match slabs.pin(host, id) {
+                    Ok(pin) => {
+                        slot.insert((va, pin));
+                    }
+                    Err(e) => {
+                        for (_, pin) in pages.into_values() {
+                            slabs.cancel(pin);
+                        }
+                        return Err(BatchError::Native(e));
+                    }
+                }
+            }
+        }
+        Ok(Self { pages, aliases })
+    }
+
+    /// The first captured VA is a source handle, not a new physical ID.
+    pub(crate) fn pages(&self) -> impl Iterator<Item = (PhysicalPage, u64, &PinnedPage)> {
+        self.pages.iter().map(|(&id, (va, pin))| (id, *va, pin))
+    }
+
+    pub(crate) fn bind(
+        &self,
+        table: &mut RawPageTable,
+        mut pair: impl FnMut(&PinnedPage) -> Result<u32>,
+    ) -> std::result::Result<BoundLeaves, BatchError> {
+        let mut leaves = BTreeMap::new();
+        let mut pairs = BTreeMap::new();
+        for (&va, &physical) in &self.aliases {
+            let pin = &self.pages[&physical].1;
+            use std::collections::btree_map::Entry;
+            let pair = match pairs.entry(pin.slab()) {
+                Entry::Occupied(e) => *e.get(),
+                Entry::Vacant(e) => *e.insert(pair(pin).map_err(BatchError::Native)?),
+            };
+            let index = pin.bind(table, va, pair).map_err(BatchError::Table)?;
+            leaves.insert(index, physical);
+        }
+        Ok(BoundLeaves(leaves))
+    }
+
+    pub(crate) fn cancel(self, slabs: &mut PageSlabs) {
+        for (_, pin) in self.pages.into_values() {
+            slabs.cancel(pin);
+        }
+    }
+
+    pub(crate) fn submitted(
+        self,
+        slabs: &mut PageSlabs,
+        signal: Fence,
+        mut access: impl FnMut(PhysicalPage) -> (bool, bool),
+    ) {
+        for (physical, (_, pin)) in self.pages {
+            let (initialized, written) = access(physical);
+            slabs.submitted(pin, signal, initialized, written);
+        }
+    }
+}
+
+/// A full-page transfer. Staging offsets belong to the containing batch;
+/// staging allocations need not be contiguous across pages.
+pub(crate) struct Transfer<'a> {
+    pub(crate) page: &'a PinnedPage,
+    pub(crate) staging: &'a ID3D12Resource,
+    pub(crate) offset: u64,
+}
+
+pub(crate) fn upload(list: &HostList, pages: &[Transfer<'_>]) {
+    transfer(list, pages, true);
+}
+
+pub(crate) fn download(list: &HostList, pages: &[Transfer<'_>]) {
+    transfer(list, pages, false);
+}
+
+/// Between operations slabs are in COMMON. A renderer may transition
+/// them for shader access between transfers, but must restore COMMON
+/// before calling again. Staging is already in a compatible copy state.
+/// The list keeps native resources; the submitter must additionally hold
+/// the logical page pins and descriptor pairs through the queue signal.
+fn transfer(list: &HostList, pages: &[Transfer<'_>], upload: bool) {
+    if pages.is_empty() {
+        return;
+    }
+    let state = if upload {
+        D3D12_RESOURCE_STATE_COPY_DEST
+    } else {
+        D3D12_RESOURCE_STATE_COPY_SOURCE
+    };
+    let slabs: BTreeMap<_, _> = pages
+        .iter()
+        .map(|copy| (copy.page.buffer().as_raw() as usize, copy.page.buffer()))
+        .collect();
+    let to_copy: Vec<_> = slabs
+        .values()
+        .map(|r| transition(r, D3D12_RESOURCE_STATE_COMMON, state))
+        .collect();
+    let restore: Vec<_> = slabs
+        .values()
+        .map(|r| transition(r, state, D3D12_RESOURCE_STATE_COMMON))
+        .collect();
+    for buffer in slabs.values() {
+        list.keep(*buffer);
+    }
+    let mut staging = BTreeSet::new();
+    // SAFETY: borrowed resources remain live through the list; each
+    // transfer references one allocated slot and an in-range staging page.
+    unsafe {
+        list.list.ResourceBarrier(&to_copy);
+        for copy in pages {
+            if staging.insert(copy.staging.as_raw() as usize) {
+                list.keep(copy.staging);
+            }
+            if upload {
+                list.list.CopyBufferRegion(
+                    copy.page.buffer(),
+                    copy.page.offset(),
+                    copy.staging,
+                    copy.offset,
+                    PAGE_BYTES,
+                );
+            } else {
+                list.list.CopyBufferRegion(
+                    copy.staging,
+                    copy.offset,
+                    copy.page.buffer(),
+                    copy.page.offset(),
+                    PAGE_BYTES,
+                );
+            }
+        }
+        list.list.ResourceBarrier(&restore);
+    }
+}
+
 fn make_slab(host: &Host) -> Result<ID3D12Resource> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -256,7 +463,6 @@ fn make_slab(host: &Host) -> Result<ID3D12Resource> {
 #[cfg(test)]
 #[test]
 fn renderer_page_slab_roundtrip_uses_direct_queue_fence() {
-    use crate::host::transition;
     use victory_memory::physical::{BackingPins, PageNumbers};
 
     let host = crate::host::host().expect("D3D12 renderer host (CI selects WARP)");
@@ -272,19 +478,62 @@ fn renderer_page_slab_roundtrip_uses_direct_queue_fence() {
 
     let mut slabs = PageSlabs::default();
     let before = host.completed_fence().unwrap();
-    let a = slabs.pin(host, backing.expected(low).unwrap()).unwrap();
-    let b = slabs.pin(host, backing.expected(low * 2).unwrap()).unwrap();
-    let alias = slabs.pin(host, backing.expected(high).unwrap()).unwrap();
+    let batch = PinnedBatch::from_capture(
+        host,
+        &mut slabs,
+        &backing,
+        &[
+            (low as u64, (low * 3) as u64),
+            (high as u64 + 4, (high + low) as u64),
+        ],
+    )
+    .unwrap();
+    let pages: Vec<_> = batch.pages().collect();
+    let [(first, first_va, a), (second, second_va, b)] = pages.as_slice() else {
+        panic!("dedup by physical page")
+    };
+    assert_eq!((*first, *first_va), (id, low as u64));
+    assert_eq!((*second, *second_va), (id.offset(1), (low * 2) as u64));
     assert_eq!(b.slab(), a.slab());
-    assert_eq!(alias.slab(), b.slab());
-    assert_eq!(alias.offset(), b.offset());
     assert_eq!(b.offset(), PAGE_BYTES);
     assert!(a.needs_upload() && b.needs_upload());
-    let mut table = RawPageTable::new(2);
-    assert_ne!(
-        b.bind(&mut table, (low * 2) as u64, 8).unwrap(),
-        alias.bind(&mut table, high as u64, 8).unwrap(),
+    let heap = crate::memory::heap().unwrap();
+    let null = heap.pair().unwrap();
+    heap.raw_pair_at(null, None, 0);
+    let mut table = RawPageTable::new(null);
+    let mut pairs = Vec::new();
+    let leaves = batch
+        .bind(&mut table, |pin| {
+            let pair = heap.pair().ok_or_else(|| Error::from(E_OUTOFMEMORY))?;
+            heap.raw_pair_at(pair, Some(pin.buffer()), SLAB_BYTES);
+            pairs.push(pair);
+            Ok(pair)
+        })
+        .unwrap();
+    assert_eq!(pairs.len(), 1, "one descriptor pair per native slab");
+    let alias_leaves: Vec<_> = leaves
+        .0
+        .iter()
+        .filter_map(|(&leaf, &p)| (p == id.offset(1)).then_some(leaf))
+        .collect();
+    assert_eq!(alias_leaves.len(), 2);
+    let mut bitmap = vec![0; alias_leaves[1] / 32 + 1];
+    for leaf in alias_leaves {
+        bitmap[leaf / 32] |= 1 << (leaf % 32);
+    }
+    assert_eq!(
+        leaves.dirty_pages(&bitmap).unwrap(),
+        BTreeSet::from([id.offset(1)])
     );
+    bitmap[0] |= 1;
+    assert_eq!(leaves.dirty_pages(&bitmap), Err(0));
+    let (words, _) = table.into_parts();
+    let table_bytes = words.len() * 4;
+    let (table_resource, table_ptr) = host.upload_buffer(table_bytes as u64).unwrap();
+    let (out, out_ptr) = host.shared_buffer(32).unwrap();
+    let (root, pso) = crate::memory::tests::pipeline();
+    // SAFETY: the table is a mapped D3D12 upload buffer of the copied size.
+    unsafe { std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), table_ptr, table_bytes) };
     // Later submissions see a different fresh ID at the same address.
     let mut next = BackingPins::default();
     next.remember(high, high + low, Some(remapped));
@@ -293,42 +542,88 @@ fn renderer_page_slab_roundtrip_uses_direct_queue_fence() {
     assert_ne!(distinct.offset(), b.offset());
     slabs.cancel(distinct);
     assert!(slabs.retire(remapped, before));
-    slabs.cancel(alias);
     assert!(!slabs.retire(id.offset(1), before), "recording pin");
 
     let (upload, up) = host.upload_buffer(PAGE_BYTES * 2).unwrap();
     let (download, down) = host.shared_buffer(PAGE_BYTES * 2).unwrap();
     let list = host.new_list().unwrap();
-    // SAFETY: both mapped two-page buffers and the native slab are live;
-    // this command list owns execution and no CPU uses the download before its fence.
+    // SAFETY: the two-page upload allocation is mapped for CPU writes.
     unsafe {
         std::ptr::write_bytes(up, 0x31, low);
         std::ptr::write_bytes(up.add(low), 0x72, low);
-        list.list.ResourceBarrier(&[transition(
+    }
+    self::upload(
+        &list,
+        &[
+            Transfer {
+                page: a,
+                staging: &upload,
+                offset: 0,
+            },
+            Transfer {
+                page: b,
+                staging: &upload,
+                offset: PAGE_BYTES,
+            },
+        ],
+    );
+    // SAFETY: all descriptors, pipeline, table, and output stay valid
+    // until the direct-queue fence; this draw phase only reads the slab.
+    unsafe {
+        let cmd = &list.list;
+        cmd.ResourceBarrier(&[transition(
             a.buffer(),
             D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
         )]);
-        list.list
-            .CopyBufferRegion(a.buffer(), a.offset(), &upload, 0, PAGE_BYTES);
-        list.list
-            .CopyBufferRegion(b.buffer(), b.offset(), &upload, PAGE_BYTES, PAGE_BYTES);
-        list.list.ResourceBarrier(&[transition(
+        cmd.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+        cmd.SetComputeRootSignature(&root);
+        cmd.SetComputeRootDescriptorTable(0, heap.gpu(0));
+        cmd.SetComputeRootShaderResourceView(1, table_resource.GetGPUVirtualAddress());
+        cmd.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+        cmd.SetPipelineState(&pso);
+        for (i, va) in [(low * 2) as u64, high as u64].into_iter().enumerate() {
+            let args = [va as u32, (va >> 32) as u32, (i * 16) as u32];
+            cmd.SetComputeRoot32BitConstants(3, 3, args.as_ptr().cast(), 0);
+            cmd.Dispatch(1, 1, 1);
+        }
+        cmd.ResourceBarrier(&[transition(
             a.buffer(),
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON,
         )]);
-        list.list
-            .CopyBufferRegion(&download, 0, a.buffer(), a.offset(), PAGE_BYTES);
-        list.list
-            .CopyBufferRegion(&download, PAGE_BYTES, b.buffer(), b.offset(), PAGE_BYTES);
     }
+    self::download(
+        &list,
+        &[
+            Transfer {
+                page: a,
+                staging: &download,
+                offset: 0,
+            },
+            Transfer {
+                page: b,
+                staging: &download,
+                offset: PAGE_BYTES,
+            },
+        ],
+    );
     list.close();
     host.execute(&[&list]);
+    // Descriptor pairs stay immutable through the same native queue fence.
+    for pair in pairs.into_iter().chain([null]) {
+        heap.raw_pair_at(pair, None, 0);
+        heap.free_pair(pair);
+    }
+    // SAFETY: the direct queue has completed both writes to mapped output.
+    assert!(
+        unsafe { std::slice::from_raw_parts(out_ptr, 32) }
+            .iter()
+            .all(|&byte| byte == 0x72)
+    );
     let signal = host.completed_fence().unwrap();
     assert!(signal > before);
-    slabs.submitted(a, signal, true, false);
-    slabs.submitted(b, signal, true, true);
+    batch.submitted(&mut slabs, signal, |page| (true, page == id.offset(1)));
     assert!(!slabs.retire(id, before), "fence protects clean slots");
     assert!(
         !slabs.retire(id.offset(1), signal),

@@ -453,7 +453,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The shader's lookup (`victory_shader` lowering) over a table's
@@ -531,7 +531,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    fn pipeline() -> (
+    pub(crate) fn pipeline() -> (
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
         windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
     ) {
