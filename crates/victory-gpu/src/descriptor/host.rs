@@ -692,6 +692,25 @@ impl HostHeap {
         }
     }
 
+    /// Installs a batch-owned explicit 2D SRV in a reserved dynamic slot.
+    pub(crate) fn paged_texture_at(
+        &self, index: u32, texture: Option<&ID3D12Resource>, format: DXGI_FORMAT,
+    ) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+            },
+        };
+        // SAFETY: a reserved view slot and a live single-mip texture, or a
+        // typed null descriptor on release.
+        unsafe { host.device.CreateShaderResourceView(texture, Some(&desc), self.cpu(index)) };
+        self.keep(index, texture.map(|t| (t.clone(), None)));
+    }
+
     /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
     /// resource view and a raw unordered access view of the first `bytes`
     /// (a multiple of 4) of `buffer`, which they hold; null views for no

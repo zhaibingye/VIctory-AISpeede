@@ -387,6 +387,15 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
+    /// A default SRV of a typed, explicitly linear title texture. Custom
+    /// SRV shapes and reinterpretation need separate lowering.
+    #[cfg(windows)]
+    #[allow(dead_code, reason = "title descriptor tables are not yet switched to page encoding")]
+    pub(crate) fn paged_linear_srv(&self) -> Option<crate::page_texture::LinearTexture> {
+        let Self::Shader(resource, None) = *self else { return None };
+        crate::resource::paged_linear_texture(resource as This)
+    }
+
     /// The resource objects the view names.
     fn resources(&self) -> [usize; 2] {
         match *self {

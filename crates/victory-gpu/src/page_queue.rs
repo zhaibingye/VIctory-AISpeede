@@ -46,22 +46,38 @@ struct Completion {
 
 /// One heap's reserved descriptor slots. They are released only after the
 /// direct-queue fence, or when a recording was never executed.
-struct Pairs<'a> {
-    heap: &'a HostHeap,
+pub(crate) struct PageDescriptors<'a> {
+    pub(crate) heap: &'a HostHeap,
     slots: Vec<u32>,
+    textures: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>,
 }
 
-impl Pairs<'_> {
+impl PageDescriptors<'_> {
     fn reserve(&mut self, slab: Option<&ID3D12Resource>, bytes: u64) -> Result<u32> {
         let slot = self.heap.pair().ok_or_else(oom)?;
         self.heap.raw_pair_at(slot, slab, bytes);
         self.slots.push(slot);
         Ok(slot)
     }
+
+    pub(crate) fn reserve_texture(
+        &mut self,
+        texture: &ID3D12Resource,
+        format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    ) -> Result<u32> {
+        let slot = self.heap.dynamic(1).ok_or_else(oom)?;
+        self.heap.paged_texture_at(slot, Some(texture), format);
+        self.textures.push((slot, format));
+        Ok(slot)
+    }
 }
 
-impl Drop for Pairs<'_> {
+impl Drop for PageDescriptors<'_> {
     fn drop(&mut self) {
+        for (slot, format) in self.textures.drain(..) {
+            self.heap.paged_texture_at(slot, None, format);
+            self.heap.release(slot, 1);
+        }
         for slot in self.slots.drain(..) {
             self.heap.raw_pair_at(slot, None, 0);
             self.heap.free_pair(slot);
@@ -86,7 +102,7 @@ impl Host {
         ranges: &[(u64, u64)],
         record: impl FnOnce(&HostList, PageRoots) -> Result<()>,
     ) -> std::result::Result<PageStats, BatchError> {
-        self.execute_paged_work(heap, backing, ranges, |list, roots, _, _| {
+        self.execute_paged_work(heap, backing, ranges, |list, roots, _, _, _| {
             record(list, roots).map_err(BatchError::Native)?;
             Ok(BTreeSet::new())
         })
@@ -143,7 +159,7 @@ impl Host {
                 PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
             }
         }
-        self.execute_paged_work(heap, backing, &ranges, |list, _, batch, pins| {
+        self.execute_paged_work(heap, backing, &ranges, |list, _, batch, pins, descriptors| {
             let scratch = if max_copy > 0 {
                 let buffer = self.default_buffer(max_copy as u64)
                     .ok_or_else(|| BatchError::Native(oom()))?;
@@ -165,7 +181,7 @@ impl Host {
                             .map_err(BatchError::Native)?;
                     }
                     PageOp::Input(input) => input.encode(self, list, batch)?,
-                    PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget)?,
+                    PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors)?,
                 }
             }
             Ok(dirty)
@@ -182,6 +198,7 @@ impl Host {
             PageRoots,
             &PinnedBatch,
             &BackingPins,
+            &mut PageDescriptors<'_>,
         ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
     ) -> std::result::Result<PageStats, BatchError> {
         let mut signal = self.direct_queue();
@@ -215,12 +232,14 @@ fn run(
         PageRoots,
         &PinnedBatch,
         &BackingPins,
+        &mut PageDescriptors<'_>,
     ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
 ) -> std::result::Result<Completion, BatchError> {
     let native = BatchError::Native;
-    let mut pairs = Pairs {
+    let mut pairs = PageDescriptors {
         heap,
         slots: Vec::new(),
+        textures: Vec::new(),
     };
     let mut raw = RawPageTable::new(pairs.reserve(None, 0).map_err(native)?);
     let leaves = batch.bind(&mut raw, |pin| {
@@ -261,7 +280,7 @@ fn run(
     };
     let uploaded = uploads.as_ref().map_or(0, |stage| stage.record(&list));
     barrier(&list, slabs.values().copied(), false);
-    let declared_dirty = record(&list, roots, batch, backing.pins())?;
+    let declared_dirty = record(&list, roots, batch, backing.pins(), &mut pairs)?;
     barrier(&list, slabs.values().copied(), true);
     list.close();
     let command = list.recording().cast().map_err(native)?;
@@ -679,7 +698,7 @@ fn paged_input_views_gather_cross_page_gpu_writes() {
     assert_eq!(view.range().unwrap(), indexed.range().unwrap());
     let [src, dst] = copy.ranges();
     let ranges = [src, dst, view.range().unwrap()];
-    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins| {
+    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins, _| {
         let scratch = host.default_buffer(copy.len as u64).unwrap();
         list.keep(&scratch);
         let mut dirty = BTreeSet::new();
@@ -732,7 +751,7 @@ fn paged_linear_texture_uses_ordered_gpu_writes_and_pitched_rows() {
     };
     let ranges: Vec<_> = copy.ranges().into_iter().chain(texture.rows().unwrap()).collect();
     let mut output = None;
-    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins| {
+    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins, _| {
         let scratch = host.default_buffer(copy.len as u64).unwrap();
         list.keep(&scratch);
         let mut dirty = BTreeSet::new();

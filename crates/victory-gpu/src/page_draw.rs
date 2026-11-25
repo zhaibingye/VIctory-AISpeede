@@ -160,13 +160,14 @@ impl ClosedDraw {
         list: &HostList,
         batch: &PinnedBatch,
         budget: &mut Option<ID3D12Resource>,
+        descriptors: &mut crate::page_queue::PageDescriptors<'_>,
     ) -> Result<(), BatchError> {
         let indirect = match self.call {
             DrawCall::Indirect(draw) => Some(draw.prepare(host, list, batch, budget)?),
             _ => None,
         };
         let sample = self.sample.as_ref()
-            .map(|input| input.prepare(host, list, batch)).transpose()?;
+            .map(|input| input.prepare(host, list, batch, descriptors)).transpose()?;
         for &input in &self.inputs {
             input.encode(host, list, batch)?;
         }
@@ -190,7 +191,7 @@ impl ClosedDraw {
             cmd.SetGraphicsRootSignature(&self.root);
             cmd.SetPipelineState(&self.pipeline);
             if let Some(sample) = &sample {
-                sample.bind(cmd);
+                sample.bind(cmd, descriptors);
             }
             for root in &self.constants {
                 cmd.SetGraphicsRoot32BitConstants(

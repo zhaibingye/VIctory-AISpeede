@@ -1395,6 +1395,62 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// Resolve only title-owned, explicitly linear, fully typed textures.
+#[cfg(windows)]
+#[allow(dead_code, reason = "used by paged descriptor admission")]
+pub(crate) fn paged_linear_texture(this: This) -> Option<crate::page_texture::LinearTexture> {
+    let (data, desc) = texture_memory(this)?;
+    let host = host_copy(this)?;
+    if host.host_written.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    page_texture_layout(data as u64, &desc)
+}
+
+#[cfg(windows)]
+fn page_texture_layout(address: u64, desc: &ResourceDesc) -> Option<crate::page_texture::LinearTexture> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    if desc.dimension != 3 || !matches!(desc.layout, 1 | 0x100)
+        || desc.depth_or_array_size != 1 || desc.mip_levels != 1
+        || desc.sample_count != 1 || desc.flags & 0xf != 0
+        || !matches!(desc.format, 28 | 87)
+    {
+        return None;
+    }
+    let layout = texture_layout(desc)?;
+    let [plane] = layout.planes.as_slice() else { return None };
+    let [mip] = plane.layout.mips.as_slice() else { return None };
+    if mip.tail.is_some() || mip.depth != 1 {
+        return None;
+    }
+    let input = crate::page_texture::LinearTexture {
+        address: address.checked_add(plane.offset)?.checked_add(mip.offset)?,
+        row_pitch: mip.pitch.checked_mul(4)?,
+        width: u32::try_from(desc.width).ok()?,
+        height: desc.height,
+        format: DXGI_FORMAT(desc.format as i32),
+    };
+    let _validated_rows = input.rows().ok()?;
+    Some(input)
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn paged_linear_texture_uses_title_layout_pitch() {
+    let mut desc = ResourceDesc {
+        dimension: 3, alignment: 0, width: 2, height: 2, depth_or_array_size: 1,
+        mip_levels: 1, format: 28, sample_count: 1, sample_quality: 0, layout: 1, flags: 0,
+    };
+    let texture = page_texture_layout(0x10000, &desc).unwrap();
+    assert_eq!(texture.row_pitch, 256);
+    assert_eq!(texture.rows().unwrap().collect::<Vec<_>>(), [(0x10000, 0x10008), (0x10100, 0x10108)]);
+    desc.layout = 0; // The default for 2D is tiled.
+    assert!(page_texture_layout(0x10000, &desc).is_none());
+    desc.layout = 1;
+    desc.flags = 4; // A writable texture is not a derived source.
+    assert!(page_texture_layout(0x10000, &desc).is_none());
+}
+
 /// A texture's format as the title gave it.
 pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)
