@@ -112,6 +112,23 @@ fn program() -> HostShader {
     w.push(v_mov_b32(7, 29));
     w.extend(buffer_store_dword(5, 8, 24));
     w.extend(buffer_store_dword(7, 8, 28));
+    // A pointer just before a page boundary: the second dword is in a
+    // different host resource and must take a separate descriptor lookup.
+    w.extend(s_load(1, 30, 0, 0x30));
+    w.push(S_WAITCNT_ALL);
+    w.extend(s_load(1, 32, 30, 0));
+    w.push(S_WAITCNT_ALL);
+    w.push(v_mov_b32(5, 32));
+    w.push(v_mov_b32(7, 33));
+    w.extend(buffer_store_dword(5, 8, 32));
+    w.extend(buffer_store_dword(7, 8, 36));
+    w.extend(global(13, 2, 1, 0, 30, 0)); // global_load_dwordx2
+    w.push(S_WAITCNT_ALL);
+    w.extend(buffer_store_dword(2, 8, 40));
+    w.extend(buffer_store_dword(3, 8, 44));
+    w.push(v_mov_b32(5, 2)); // v5 = s2 (value)
+    w.push(v_mov_b32(6, 3)); // v6 = s3 (operand)
+    w.extend(global(29, 0, 1, 5, 30, 0)); // global_store_dwordx2
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -175,7 +192,7 @@ fn program() -> HostShader {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
-    assert_eq!(memory, 11, "every access through the pointer is title memory");
+    assert_eq!(memory, 15, "every access through the pointer is title memory");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         native: &native,
@@ -225,6 +242,7 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
     }
     let entry = 4096 + 2 * (4096 + (lo >> 16 & 0xFFF) as usize);
     t[entry..entry + 2].copy_from_slice(&[view, lo]);
+    t[entry + 2..entry + 4].copy_from_slice(&[5, lo + 0x1_0000]);
     t
 }
 
@@ -234,13 +252,13 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut memory = vec![0u32; 256];
+    let mut memory = vec![0u32; 0x1_0000 / 4];
     memory[0] = 0x1111_1111;
     let pointer = TITLE + 0x100;
     memory[2] = pointer as u32;
     memory[3] = (pointer >> 32) as u32;
     // The next page (no copy) and another 256 MiB region (no block).
-    let (next, far) = (TITLE + 0x1_0010, 0x55_0000_0040u64);
+    let (next, far) = (TITLE + 0x2_0010, 0x55_0000_0040u64);
     memory[4..8].copy_from_slice(&[next as u32, (next >> 32) as u32, far as u32, (far >> 32) as u32]);
     memory[0x40] = 0x2222_2222;
     // The root UAV's address, and what it loads there.
@@ -248,6 +266,10 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     memory[(0x200 + 0x24) / 4] = 0x3333_3333;
     memory[0x80 / 4] = 1.0f32.to_bits();
     memory[0x84 / 4] = (-1.0f32).to_bits();
+    let boundary = TITLE + 0xfffc;
+    memory[0x30 / 4..0x38 / 4].copy_from_slice(&[boundary as u32, (boundary >> 32) as u32]);
+    *memory.last_mut().unwrap() = 0x1122_3344;
+    let second_page = [0x5566_7788];
     let value = 0xCAFE_F00D;
     // Heap index 1 (the memory's view) has the title address.
     let mut view_addresses = vec![0u32; 2 * (2 + 5)];
@@ -285,10 +307,12 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
-                            View::RawUav(8),
+                            View::RawUav(12),
                             View::Memory(&memory),
                             View::Pair,
                             View::NullPair,
+                            View::Pair,
+                            View::Memory(&second_page),
                             View::Pair,
                         ],
                         samplers: &[],
@@ -298,21 +322,23 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(
                 out[0],
-                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, 0, 0],
+                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, 0, 0, 0x1122_3344, 0x5566_7788, 0x1122_3344, 0x5566_7788],
                 "{label}: reads"
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
             assert_eq!(out[1][(0x200 + 0x20) / 4], value, "{label}: the root UAV store");
+            assert_eq!(*out[1].last().unwrap(), value, "{label}: first page store");
+            assert_eq!(out[2][0], operand.to_bits(), "{label}: second page store");
             let floats = [f32::from_bits(out[1][0x20]), f32::from_bits(out[1][0x21])];
             let want = [operand.min(1.0), operand.max(-1.0)];
             assert_eq!(floats, want, "{label}: float min and max");
-            // The far region by its level-1 index, the page written, the
-            // page missed after it; nothing else.
+            // The far region by its level-1 index, both written pages,
+            // and the missed page after them; nothing else.
             let entry = 4096 + (TITLE as u32 >> 16 & 0xFFF) as usize;
-            let marked: Vec<usize> = (0..out[2].len() * 32)
-                .filter(|&b| out[2][b / 32] >> (b % 32) & 1 != 0)
+            let marked: Vec<usize> = (0..out[3].len() * 32)
+                .filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0)
                 .collect();
-            assert_eq!(marked, [(far >> 28) as usize, entry, entry + 1], "{label}: pages");
+            assert_eq!(marked, [(far >> 28) as usize, entry, entry + 1, entry + 2], "{label}: pages");
         }
         ran += 1;
     }

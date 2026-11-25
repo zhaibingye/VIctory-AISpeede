@@ -804,6 +804,13 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
+        if a.param == MEMORY && sub.is_none() && n > 1 {
+            let (lo, hi) = self.global_address(inst)?;
+            for (k, x) in self.memory_dwords(lo, hi, n, guard).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let c = self.cur;
         let bytes = sub.map_or(4 * n, |(width, _)| width / 8);
         let (h, off) = if a.param == MEMORY {
@@ -824,6 +831,17 @@ impl<'a> Lower<'a> {
                     bits: 0,
                     words: [0, 0],
                 };
+                if sub.is_none() && n > 1
+                    && let Some((lo, hi)) = self.root_address(&src)
+                {
+                    let (lo, hi) = self.add64(lo, hi, off, false);
+                    let mask = self.s.m.i32(0xffff);
+                    let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
+                    for (k, x) in self.memory_dwords(lo, hi, n, guard).into_iter().enumerate() {
+                        self.write(inst, Reg::V(reg + k as u8), x, guard);
+                    }
+                    return Ok(());
+                }
                 let (h, off) = self.raw_view((b, i), &src, off, bytes, (11, 0), false, guard)?;
                 (Some(h), off)
             }
@@ -990,23 +1008,25 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        let (iu, void, i32t) = (self.s.m.undef(self.s.t.i32), self.s.t.void, self.s.t.i32);
+        let (iu, i32t) = (self.s.m.undef(self.s.t.i32), self.s.t.i32);
         // Title memory is looked up (and its pages marked written) only in
         // the lanes that write.
         let at = self.begin_guarded(guard);
+        if let Some((lo, hi)) = memory
+            && n > 1
+            && name.starts_with("global_store_")
+        {
+            self.store_memory_dwords(lo, hi, &vals);
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
         let (h, off) = match (memory, root) {
             (Some((lo, hi)), _) => self.memory(lo, hi, 4 * u32::from(n), true, None),
             (_, Some(r)) => r,
             _ => unreachable!(),
         };
         if name.starts_with("global_store_") {
-            let mut args = vec![h, off, iu];
-            args.extend(&vals);
-            args.resize(3 + 4, iu);
-            args.push(self.s.m.i8((1u8 << n) - 1));
-            args.push(self.s.m.i32(4));
-            self.s
-                .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            self.raw_store_dwords(h, off, &vals);
             self.mark_view_write(h, off, 4 * u32::from(n), None);
             self.end_guarded(at, &[]);
             return Ok(());
@@ -4343,14 +4363,88 @@ impl<'a> Lower<'a> {
         for (x, negative) in extra {
             (lo, hi) = self.add64(lo, hi, x, negative);
         }
-        let (h, off) = self.memory(lo, hi, 4 * count, false, None);
-        for k in 0..count {
-            let four = self.s.m.i32(4 * k);
-            let at = self.s.m.bin(self.cur, Bin::Add, off, four);
-            let x = self.raw_dword(h, at);
+        for (k, x) in self.memory_dwords(lo, hi, count, None).into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    /// Aligned scalar/global loads may straddle independently backed pages.
+    /// Keep one lookup on the common path; only a crossing needs separate
+    /// translation and miss tracking for the next page.
+    fn memory_dwords(&mut self, lo: V, hi: V, count: u32, active: Option<V>) -> Vec<V> {
+        if count == 1 {
+            let (h, at) = self.memory(lo, hi, 4, false, active);
+            return vec![self.raw_dword(h, at)];
+        }
+
+        let (fast, slow, join) = self.branch_by_page(lo, 4 * count);
+        self.cur = fast;
+        let (h, at) = self.memory(lo, hi, 4 * count, false, active);
+        let fast_values: Vec<V> = (0..count).map(|k| {
+            let delta = self.s.m.i32(4 * k);
+            let offset = self.s.m.bin(self.cur, Bin::Add, at, delta);
+            self.raw_dword(h, offset)
+        }).collect();
+        let fast_exit = self.cur;
+        self.s.m.terminate(fast_exit, Term::Br(join));
+
+        self.cur = slow;
+        let slow_values: Vec<V> = (0..count).map(|k| {
+            let delta = self.s.m.i32(4 * k);
+            let (lo, hi) = self.add64(lo, hi, delta, false);
+            let (h, at) = self.memory(lo, hi, 4, false, active);
+            self.raw_dword(h, at)
+        }).collect();
+        let slow_exit = self.cur;
+        self.s.m.terminate(slow_exit, Term::Br(join));
+
+        self.cur = join;
+        fast_values.into_iter().zip(slow_values).map(|(same, split)| {
+            let value = self.s.m.phi(join, self.s.t.i32);
+            self.s.m.set_phi(value, vec![(same, fast_exit), (split, slow_exit)]);
+            value
+        }).collect()
+    }
+
+    fn branch_by_page(&mut self, lo: V, bytes: u32) -> (usize, usize, usize) {
+        let c = self.cur;
+        let mask = self.s.m.i32(0xffff);
+        let room = self.s.m.i32(0x1_0000 - bytes);
+        let offset = self.s.m.bin(c, Bin::And, lo, mask);
+        let crosses = self.s.m.cmp(c, pred::IUGT, offset, room);
+        let (fast, slow, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(c, Term::CondBr(crosses, slow, fast));
+        (fast, slow, join)
+    }
+
+    fn store_memory_dwords(&mut self, lo: V, hi: V, values: &[V]) {
+        let bytes = values.len() as u32 * 4;
+        let (fast, slow, join) = self.branch_by_page(lo, bytes);
+        self.cur = fast;
+        let (h, at) = self.memory(lo, hi, bytes, true, None);
+        self.raw_store_dwords(h, at, values);
+        self.s.m.terminate(self.cur, Term::Br(join));
+
+        self.cur = slow;
+        for (k, &value) in values.iter().enumerate() {
+            let delta = self.s.m.i32(4 * k as u32);
+            let (lo, hi) = self.add64(lo, hi, delta, false);
+            let (h, at) = self.memory(lo, hi, 4, true, None);
+            self.raw_store_dwords(h, at, &[value]);
+        }
+        self.s.m.terminate(self.cur, Term::Br(join));
+        self.cur = join;
+    }
+
+    fn raw_store_dwords(&mut self, h: V, at: V, values: &[V]) {
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mut args = vec![h, at, iu];
+        args.extend(values);
+        args.resize(7, iu);
+        args.push(self.s.m.i8((1u8 << values.len()) - 1));
+        args.push(self.s.m.i32(4));
+        self.s.op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, self.s.t.void, 140, &args);
     }
 
     /// `(hi:lo) + x` with `x` zero-extended, or sign-extended when

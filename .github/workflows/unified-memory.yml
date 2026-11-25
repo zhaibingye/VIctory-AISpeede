@@ -10,6 +10,7 @@ on:
       - 'crates/victory-hle/src/modules/xmem.rs'
       - 'crates/victory-hle/src/modules/d3d12x.rs'
       - 'crates/victory-gpu/**'
+      - 'crates/victory-shader/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -38,3 +39,9 @@ jobs:
       - uses: actions/checkout@v5
       - run: cargo test -p victory-gpu --locked --lib submission_backing_merges_overlapping_and_touching_ranges_only
       - run: cargo test -p victory-gpu --locked --lib residency_com_charge_stays_until_last_graphics_reference
+  shader-pages:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo test -p victory-shader --features host --locked --lib title_memory_is_read_and_written_at_computed_addresses
