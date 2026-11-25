@@ -38,7 +38,7 @@ mod platform {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
     use std::time::{Duration, Instant};
-    use windows::Win32::Graphics::Dxgi::{DXGI_MEMORY_SEGMENT_GROUP_LOCAL, IDXGIAdapter3};
+    use windows::Win32::Graphics::Dxgi::{DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3};
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
     static PRESSURE: AtomicBool = AtomicBool::new(false);
@@ -48,14 +48,6 @@ mod platform {
     // the title has reallocated the range. Bound actual live leases.
     const MAPPING_LIMIT: u64 = 512 * MIB as u64;
     const MAX_MAPPING: u64 = 16 * MIB as u64;
-    static LOCAL_USES: AtomicU64 = AtomicU64::new(0);
-    static LOCAL_BUDGET: AtomicU64 = AtomicU64::new(0);
-
-    pub(crate) fn local_sample() -> Option<(u64, u64)> {
-        let budget = LOCAL_BUDGET.load(Relaxed);
-        (budget != 0).then(|| (LOCAL_USES.load(Relaxed), budget))
-    }
-
     static MAPPED: AtomicU64 = AtomicU64::new(0);
 
     pub(crate) struct MappingLease(u64);
@@ -115,6 +107,13 @@ mod platform {
         if PRESSURE.load(Relaxed) { 0 } else { cache.allowance(AVAILABLE.load(Relaxed)) }
     }
 
+    pub(crate) fn query_local(adapter: &IDXGIAdapter3) -> Option<DXGI_QUERY_VIDEO_MEMORY_INFO> {
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: live adapter, node zero, and initialized output storage.
+        unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }
+            .ok().map(|()| info)
+    }
+
     pub(crate) fn sample(adapter: Option<&IDXGIAdapter3>) {
         let Ok(mut state) = SAMPLES.try_lock() else { return };
         let now = Instant::now();
@@ -126,17 +125,7 @@ mod platform {
         AVAILABLE.store(s.ullAvailPhys, Relaxed);
         let used = s.ullTotalPhys.saturating_sub(s.ullAvailPhys);
         let ram_delta = used.saturating_sub(*state.baseline_ram_used.get_or_insert(used));
-        // SAFETY: the queried adapter is our D3D12 adapter, node 0, and the
-        // output receives the size expected by DXGI.
-        let local = adapter.and_then(|a| {
-            let mut info = Default::default();
-            unsafe { a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }
-                .ok().map(|()| info)
-        });
-        if let Some(info) = local {
-            LOCAL_USES.store(info.CurrentUsage, Relaxed);
-            LOCAL_BUDGET.store(info.Budget, Relaxed);
-        }
+        let local = adapter.and_then(query_local);
         let sum = local.map(|info| ram_delta.saturating_add(info.CurrentUsage));
         let ram_target = crate::console::UNIFIED_MEMORY as u64;
         let vram_target = crate::residency::LOCAL_LIMIT;
@@ -156,7 +145,7 @@ mod platform {
         let idle_upload = crate::host::trim_idle_upload();
         if state.last_log.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5)) {
             state.last_log = Some(now);
-            let (managed_local, routed_to_ram) = crate::residency::counters();
+            let (managed_local, managed_ram) = crate::residency::counters();
             tracing::info!(
                 ram_delta_mib = ram_delta / MIB as u64,
                 ram_available_mib = s.ullAvailPhys / MIB as u64,
@@ -164,7 +153,7 @@ mod platform {
                 local_budget_mib = ?local.map(|info| info.Budget / MIB as u64),
                 combined_sample_mib = ?sum.map(|n| n / MIB as u64),
                 managed_local_mib = managed_local / MIB as u64,
-                routed_to_ram_total_mib = routed_to_ram / MIB as u64,
+                managed_ram_reserved_mib = managed_ram / MIB as u64,
                 combined_peak_mib = ?sum.map(|_| state.peak_sum / MIB as u64),
                 idle_upload_mib = idle_upload / MIB,
                 mapped_title_mib = MAPPED.load(Relaxed) / MIB as u64,
@@ -179,7 +168,7 @@ mod platform {
 #[cfg(windows)]
 pub use platform::begin;
 #[cfg(windows)]
-pub(crate) use platform::{MappingLease, limit, local_sample, mapping_headroom, sample};
+pub(crate) use platform::{MappingLease, limit, mapping_headroom, query_local, sample};
 
 #[test]
 fn idle_cache_leaves_headroom_and_never_reserves_the_remainder() {

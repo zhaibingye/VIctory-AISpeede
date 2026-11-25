@@ -1115,9 +1115,8 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
-    pub(crate) fn execute(&self, runs: &[&HostList]) {
-        let adapter = self.memory_adapter.get_or_init(|| {
+    fn memory_adapter(&self) -> Option<&IDXGIAdapter3> {
+        self.memory_adapter.get_or_init(|| {
             // SAFETY: query the adapter that owns this live device.
             unsafe {
                 // Don't add a local GPU segment to physical RAM on UMA.
@@ -1134,8 +1133,17 @@ impl Host {
                     .and_then(|f| f.EnumAdapterByLuid(self.device.GetAdapterLuid()))
                     .ok()
             }
-        });
-        crate::working_set::sample(adapter.as_ref());
+        }).as_ref()
+    }
+
+    pub(crate) fn local_memory_for_admission(&self) -> Option<(u64, u64)> {
+        let info = crate::working_set::query_local(self.memory_adapter()?)?;
+        Some((info.CurrentUsage, info.Budget))
+    }
+
+    /// Runs closed lists and waits for them.
+    pub(crate) fn execute(&self, runs: &[&HostList]) {
+        crate::working_set::sample(self.memory_adapter());
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -2744,26 +2752,25 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: allocation info for a single initialized description.
+        let bytes = unsafe { self.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
         let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
+        let made = self.managed_system(bytes, || {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: live device, initialized description and output slot.
+            unsafe {
+                self.device.CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut buffer,
+                )?;
+            }
+            buffer.ok_or_else(windows::core::Error::empty)
+        }).and_then(|buffer| {
+            // SAFETY: the committed buffer is CPU-visible and the output is ours.
+            unsafe { buffer.Map(0, None, Some(&mut data))? };
+            Ok(buffer)
+        });
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(buffer) => Some((buffer, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
@@ -3557,26 +3564,25 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: allocation info for a single initialized description.
+        let bytes = unsafe { self.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
         let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
+        let made = self.managed_system(bytes, || {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: live device, initialized description and output slot.
+            unsafe {
+                self.device.CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer,
+                )?;
+            }
+            buffer.ok_or_else(windows::core::Error::empty)
+        }).and_then(|buffer| {
+            // SAFETY: the committed buffer is CPU-visible and the output is ours.
+            unsafe { buffer.Map(0, None, Some(&mut data))? };
+            Ok(buffer)
+        });
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(buffer) => Some((buffer, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None

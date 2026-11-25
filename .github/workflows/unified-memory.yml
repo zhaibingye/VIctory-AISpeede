@@ -37,3 +37,4 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: cargo test -p victory-gpu --locked --lib submission_backing_merges_overlapping_and_touching_ranges_only
+      - run: cargo test -p victory-gpu --locked --lib residency_com_charge_stays_until_last_graphics_reference

@@ -31,8 +31,9 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
+use victory_memory::budget::Pool;
 use victory_memory::physical::{
-    Aliases, BackingPins, PageNumbers, PhysicalPage, RamPool, RamReservation,
+    Aliases, BackingPins, HostBudget, PageNumbers, PhysicalPage, Reservation,
 };
 
 const MIB: usize = 1 << 20;
@@ -374,7 +375,7 @@ const PAGE: usize = victory_memory::PAGE_BYTES as usize;
 struct Section {
     handle: HANDLE,
     first: PhysicalPage,
-    _reservation: RamReservation,
+    _reservation: Reservation,
 }
 
 // SAFETY: a section handle may be used from any thread.
@@ -402,7 +403,6 @@ struct Slice {
 #[derive(Default)]
 struct Physical {
     numbers: PageNumbers,
-    ram: RamPool,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
@@ -503,11 +503,11 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    let ram = physical().ram.clone();
-    let reservation = match ram.reserve(size as u64) {
+    let ram = HostBudget::process();
+    let reservation = match ram.reserve_ram(size as u64) {
         Ok(reservation) => reservation,
         Err(error) => {
-            tracing::warn!(n, reserved = ram.used(), shortfall = error.shortfall, "XMem physical backing budget exhausted");
+            tracing::warn!(n, reserved = ram.used(Pool::Ram), shortfall = error.shortfall, "XMem physical backing budget exhausted");
             // SAFETY: checked non-null; this ABI reports no pages on failure.
             unsafe { count.write(0) };
             return 0;

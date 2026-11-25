@@ -8,43 +8,60 @@ use crate::{
     budget::{Budget, Charge, NoSpace, Pool},
 };
 
-/// Admission for CPU backing whose lifetime can extend beyond its page handles.
+/// Thread-safe ledger for the host's managed physical allocations. XMem and
+/// graphics use the same process ledger; isolated fixtures can own another.
 #[derive(Clone, Default)]
-pub struct RamPool(Arc<Mutex<Budget>>);
+pub struct HostBudget(Arc<Mutex<Budget>>);
 
-impl RamPool {
-    pub fn reserve(&self, bytes: u64) -> Result<RamReservation, NoSpace> {
-        let charge = self
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .charge(Pool::Ram, bytes)?;
-        Ok(RamReservation {
-            budget: Arc::clone(&self.0),
-            charge: Some(charge),
-        })
+impl HostBudget {
+    pub fn process() -> &'static Self {
+        static HOST: std::sync::LazyLock<HostBudget> =
+            std::sync::LazyLock::new(HostBudget::default);
+        &HOST
     }
 
-    pub fn used(&self) -> u64 {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .used(Pool::Ram)
+    pub fn reserve_ram(&self, bytes: u64) -> Result<Reservation, NoSpace> {
+        let charge = self.lock().charge(Pool::Ram, bytes)?;
+        Ok(self.reservation(charge))
+    }
+
+    /// DXGI reports our process's total local use, including managed
+    /// resources, so count excess over the ledger rather than adding both.
+    pub fn reserve_local(
+        &self, bytes: u64, observed: u64, dxgi_budget: u64, headroom: u64,
+    ) -> Result<Reservation, NoSpace> {
+        let mut budget = self.lock();
+        let outside = observed.saturating_sub(budget.used(Pool::Local));
+        budget.observe_local(dxgi_budget, outside.saturating_add(headroom));
+        let charge = budget.charge(Pool::Local, bytes)?;
+        Ok(self.reservation(charge))
+    }
+
+    pub fn used(&self, pool: Pool) -> u64 {
+        self.lock().used(pool)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Budget> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn reservation(&self, charge: Charge) -> Reservation {
+        Reservation {
+            budget: self.clone(),
+            charge: Some(charge),
+        }
     }
 }
 
-/// Retain this lease with the entire host allocation, not with individual views.
-pub struct RamReservation {
-    budget: Arc<Mutex<Budget>>,
+/// Retain this lease with the host allocation, not with individual views.
+pub struct Reservation {
+    budget: HostBudget,
     charge: Option<Charge>,
 }
 
-impl Drop for RamReservation {
+impl Drop for Reservation {
     fn drop(&mut self) {
-        self.budget
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .release(self.charge.take().expect("one charge per reservation"));
+        self.budget.lock().release(self.charge.take().expect("one charge per reservation"));
     }
 }
 
