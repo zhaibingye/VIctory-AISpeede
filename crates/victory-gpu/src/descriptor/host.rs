@@ -292,6 +292,10 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
+    pub(crate) fn dynamic_capacity(&self) -> u32 {
+        self.dynamic
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -324,7 +328,13 @@ impl HostHeap {
         }
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                let free = taken.iter().filter(|slot| !**slot).count();
+                tracing::warn!(
+                    requested = n, free, dynamic = self.dynamic, mirrored = self.count,
+                    "no contiguous dynamic descriptor range: a table is not made"
+                );
+            });
             return None;
         };
         taken[first..first + n].fill(true);

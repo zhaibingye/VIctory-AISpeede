@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
-use crate::descriptor::View;
+use crate::descriptor::{TableRecords, View, table_view};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -33,6 +33,22 @@ enum Root {
     Constants(Vec<u32>),
     /// A root view's GPU address.
     View(u64),
+}
+
+type FreshTables = std::collections::HashMap<usize, std::collections::HashMap<TableRecords, u32>>;
+
+#[cfg(test)]
+#[test]
+fn fresh_tables_share_by_view_generation_length_and_heap() {
+    let mut tables = FreshTables::new();
+    let original: TableRecords = Box::new([[4, 1], [0, 0], [7, 1]]);
+    tables.entry(42).or_default().insert(original, 300);
+    let moved = [[4, 1], [0, 0], [7, 1]];
+    assert_eq!(tables[&42].get(moved.as_slice()), Some(&300));
+    assert_eq!(tables[&42].get(&moved[..2]), None);
+    assert_eq!(tables[&42].get([[4, 2], [0, 0], [7, 1]].as_slice()), None);
+    assert_eq!(tables[&42].get([[0, 0], [0, 0], [7, 1]].as_slice()), None);
+    assert!(!tables.contains_key(&43));
 }
 
 #[repr(C)]
@@ -71,9 +87,9 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// The same immutable table can be referenced at different title
+    /// addresses. Reuse only a full, equal snapshot in the same bound heap.
+    fresh_tables: FreshTables,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -1131,58 +1147,49 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, h.finish())
-            };
-            if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view, true);
-                    }
-                }
-                made.push((slot, first * 32));
-                continue;
-            }
-            let Some(first) = host.dynamic(n) else {
-                // Without its fresh table the shader would read the title's
-                // slots, which for constant buffer tables hold no constant
-                // view: a texture or null descriptor read as a buffer gives
-                // a wild address on AMD and the device is removed (#59).
-                // The draw or dispatch is dropped instead.
+            let heap_id = std::ptr::from_ref(heap) as usize;
+            let Some(records) = (n <= host.dynamic_capacity())
+                .then(|| heap.table_records(table, n))
+                .flatten()
+            else {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
-            // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
-            for k in 0..n {
-                let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(view) => {
-                        host.make_at(index, &view);
-                        if let Some(u) = used {
-                            readable(list, u, &view, true);
-                        }
-                    }
-                    None => {
-                        host.make_null(index);
-                        if used.is_some() {
-                            once!(slot, "a table entry without a view");
-                        }
+            let tables = self.fresh_tables.entry(heap_id).or_default();
+            let mut allocated = false;
+            let first = if let Some(&first) = tables.get(records.as_ref()) {
+                first
+            } else {
+                let Some(first) = host.dynamic(n) else {
+                    // Never borrow another live list's slots or submit a
+                    // table whose descriptors were not initialized.
+                    self.table_failed = true;
+                    continue;
+                };
+                self.dynamic.push((heap_id, first, n));
+                allocated = true;
+                first
+            };
+            if allocated {
+                // Keep the full interval, including intervening array slots.
+                for (k, &record) in records.iter().enumerate() {
+                    let index = first + k as u32;
+                    match table_view(record) {
+                        Some(view) => host.make_at(index, &view),
+                        None => host.make_null(index),
                     }
                 }
+            }
+            // Stages can use different entries of an equal table. The slot
+            // range can be shared; resource preparation cannot be skipped.
+            for u in entries {
+                let k = (u.table_offset_dwords / 8) as usize;
+                if let Some(view) = table_view(records[k]) {
+                    readable(list, u, &view, true);
+                }
+            }
+            if allocated {
+                tables.insert(records, first);
             }
             made.push((slot, first * 32));
         }

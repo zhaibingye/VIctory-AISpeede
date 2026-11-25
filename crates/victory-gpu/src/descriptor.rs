@@ -459,6 +459,43 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     (*current == generation).then(|| view.clone())
 }
 
+/// Compact table snapshots reuse encoded view identities, not title
+/// addresses. Generation zero is reserved for a null/stale slot.
+#[cfg(windows)]
+pub(crate) type TableRecords = Box<[[u32; 2]]>;
+
+#[cfg(windows)]
+impl Heap {
+    pub(crate) fn table_records(&self, first: u64, count: u32) -> Option<TableRecords> {
+        if self.desc.kind != VIEWS_KIND || count == 0 {
+            return None;
+        }
+        let offset = first.checked_sub(self.start)?;
+        if offset % 32 != 0 {
+            return None;
+        }
+        self.index(first.checked_add(u64::from(count - 1) * 32)?)?;
+        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        Some((0..count).map(|i| {
+            // SAFETY: the entire interval is inside the bound title heap.
+            let at = first + u64::from(i) * 32;
+            let [tag, index, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+            if tag == VIEW_TAG && generation != 0
+                && views.list.get(index as usize).is_some_and(|v| v.1 == generation)
+            {
+                [index, generation]
+            } else {
+                [0, 0]
+            }
+        }).collect())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn table_view([index, generation]: [u32; 2]) -> Option<View> {
+    (generation != 0).then(|| view_at(index, generation)).flatten()
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
@@ -838,6 +875,32 @@ mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn table_snapshot_tracks_copies_range_and_stale_views() {
+        let null = std::ptr::null();
+        let desc = HeapDesc { kind: VIEWS_KIND, count: 6, flags: 0, nodes: 0 };
+        let mut h = null;
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+        let heap = heap(h);
+        let at = |i: u32| heap.start + u64::from(i) * 32;
+        let r = 0x7b77_0000usize as This;
+        create_srv(null, r, null.cast(), at(0));
+        create_cbv(null, null.cast(), at(1));
+        // SAFETY: two non-overlapping table intervals in the allocated heap.
+        unsafe { std::ptr::copy_nonoverlapping(at(0) as *const u8, at(3) as *mut u8, 64) };
+        let before = heap.table_records(at(0), 3).unwrap();
+        assert_eq!(heap.table_records(at(3), 3).unwrap(), before);
+        assert_eq!(table_view(before[1]), Some(View::NullConstant));
+        assert_eq!(before[2], [0, 0]);
+        assert!(heap.table_records(at(5), 2).is_none());
+        assert!(heap.table_records(at(0) + 4, 2).is_none());
+        forget(r as usize);
+        assert_eq!(heap.table_records(at(3), 3).unwrap()[0], [0, 0]);
+        assert!(table_view(before[0]).is_none());
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no
