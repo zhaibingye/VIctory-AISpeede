@@ -222,7 +222,9 @@ impl ConstantSpan {
     const BYTES: u64 = 65536;
 
     fn capture(address: u64) -> Option<Self> {
-        (address != 0 && address.is_multiple_of(256)
+        // The console root address is 16-byte aligned. D3D12 alignment
+        // applies to the separate native buffer, not the gathered source.
+        (address != 0 && address.is_multiple_of(16)
             && address.checked_add(Self::BYTES)? <= victory_memory::gpu_table::ADDRESS_LIMIT)
             .then_some(Self(address))
     }
@@ -347,7 +349,8 @@ impl ShaderBindings {
                     })?;
                     crate::page_view::gather_span(list, batch, span.range(), &buffer,
                         D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)?;
-                    // SAFETY: gather retains a full-sized aligned resource.
+                    // SAFETY: gather retains the resource. Its native base,
+                    // bound at offset zero, has D3D12 buffer alignment.
                     *e.insert(unsafe { buffer.GetGPUVirtualAddress() })
                 }
             };
