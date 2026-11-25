@@ -5,6 +5,7 @@ use victory_shader::{RootType, UsedResource};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnloweredShader {
+    GraphicsState,
     DynamicAddress,
     DescriptorHeap,
     RootView,

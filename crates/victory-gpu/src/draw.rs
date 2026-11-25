@@ -29,7 +29,7 @@ enum Root {
     None,
     /// A descriptor table's first descriptor (an address in a heap).
     Table(u64),
-    Constants(Vec<u32>),
+    Constants(Vec<Option<u32>>),
     /// A root view's GPU address.
     View(u64),
 }
@@ -66,6 +66,11 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    page_target: Option<crate::page_draw::ColorTarget>,
+    page_viewport: Option<D3D12_VIEWPORT>,
+    page_scissor: Option<RECT>,
+    page_blend: Option<[f32; 4]>,
+    page_state_opaque: bool,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -257,6 +262,7 @@ impl State {
     pub(crate) fn host_state_lost(&mut self) {
         // No title heaps (0) differ from what the host list has, too.
         (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        self.page_state_opaque = true;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -294,9 +300,11 @@ impl State {
         if let Root::Constants(c) = &mut roots[s] {
             let end = offset as usize + values.len();
             if c.len() < end {
-                c.resize(end, 0);
+                c.resize(end, None);
             }
-            c[offset as usize..end].copy_from_slice(values);
+            for (word, &value) in c[offset as usize..end].iter_mut().zip(values) {
+                *word = Some(value);
+            }
         }
     }
 
@@ -324,6 +332,7 @@ impl State {
             return;
         };
         self.targets.clear();
+        self.page_target = None;
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -339,7 +348,12 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            let desc = record.desc();
+            if handles.len() == 1 && depth == 0 {
+                self.page_target = crate::resource::host_copy(record.resource)
+                    .and_then(|copy| crate::page_draw::ColorTarget::capture(copy, desc));
+            }
+            rtvs.push(host.rtv(texture, desc.as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -358,6 +372,48 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+    }
+
+    #[allow(dead_code, reason = "used by the closed command recorder at cutover")]
+    pub(crate) fn capture_page_draw(
+        &self,
+        call: crate::page_draw::DrawCall,
+    ) -> Option<crate::page_draw::ClosedDraw> {
+        if self.page_state_opaque || self.depth != 0 || !matches!(self.topology, 1..=5) {
+            return None;
+        }
+        let target = self.page_target.clone()?;
+        let viewport = self.page_viewport?;
+        let scissor = self.page_scissor?;
+        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let mut inputs = Vec::new();
+        for (slot, &view) in self.vertex.iter().enumerate() {
+            if pipeline.slots & (1 << slot) != 0 {
+                let input = InputView::Vertex(slot as u32, view);
+                input.range().ok()?;
+                inputs.push(input);
+            }
+        }
+        if matches!(call, crate::page_draw::DrawCall::Indexed { .. }) {
+            let input = InputView::Index(self.index);
+            input.range().ok()?;
+            inputs.push(input);
+        }
+        let mut draw = crate::page_draw::ClosedDraw::from_translated(
+            pipeline,
+            |slot, dword| match self.graphics.get(slot as usize) {
+                Some(Root::Constants(words)) => words.get(dword as usize).copied().flatten(),
+                _ => None,
+            },
+            target,
+            D3D_PRIMITIVE_TOPOLOGY(self.topology as i32),
+            viewport,
+            scissor,
+            inputs,
+            call,
+        ).ok()?;
+        draw.set_blend_factor(self.page_blend.unwrap_or([1.0; 4]));
+        Some(draw)
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -379,7 +435,7 @@ impl State {
                 }
             },
             (Some(Root::Constants(c)), RootType::Constants) => {
-                c.get(dword as usize).copied().unwrap_or(0)
+                c.get(dword as usize).copied().flatten().unwrap_or(0)
             }
             _ => {
                 once!(
@@ -1842,20 +1898,24 @@ const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
-/// Fixed-function state, straight onto the host list.
-pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
-    // SAFETY: an open list.
-    unsafe { list.recording().RSSetViewports(viewports) };
-}
+impl State {
+    pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        self.page_viewport = match viewports { [v] => Some(*v), _ => None };
+        // SAFETY: an open list.
+        unsafe { list.recording().RSSetViewports(viewports) };
+    }
 
-pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
-    // SAFETY: an open list.
-    unsafe { list.recording().RSSetScissorRects(rects) };
-}
+    pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        self.page_scissor = match rects { [r] => Some(*r), _ => None };
+        // SAFETY: an open list.
+        unsafe { list.recording().RSSetScissorRects(rects) };
+    }
 
-pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
-    // SAFETY: an open list.
-    unsafe { list.recording().OMSetBlendFactor(factor) };
+    pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        self.page_blend = factor.copied();
+        // SAFETY: an open list.
+        unsafe { list.recording().OMSetBlendFactor(factor) };
+    }
 }
 
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {

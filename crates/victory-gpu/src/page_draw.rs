@@ -4,37 +4,72 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
 
-use crate::host::{Host, HostList};
+use std::sync::{Arc, atomic::Ordering};
+
+use crate::host::{Host, HostList, transition};
 use crate::page_shader::{RootWords, UnloweredShader};
 use crate::page_slabs::{BatchError, PinnedBatch};
 use crate::page_view::InputView;
+use crate::resource::HostTexture;
 
 pub(crate) enum DrawCall {
     Direct { vertices: u32, instances: u32, first: u32, first_instance: u32 },
     Indexed { indices: u32, instances: u32, first: u32, base: i32, first_instance: u32 },
 }
 
+#[derive(Clone)]
+pub(crate) struct ColorTarget {
+    copy: Arc<HostTexture>,
+    desc: Option<D3D12_RENDER_TARGET_VIEW_DESC>,
+}
+
+impl ColorTarget {
+    /// Only an already-authoritative host render target is admitted here.
+    /// Title-memory texture uploads, aliasing and sparse placement must
+    /// be lowered before they can participate in this form of draw.
+    pub(crate) fn capture(
+        copy: Arc<HostTexture>,
+        desc: Option<D3D12_RENDER_TARGET_VIEW_DESC>,
+    ) -> Option<Self> {
+        // SAFETY: the retained COM object is live.
+        let tex = unsafe { copy.texture.GetDesc() };
+        if copy.sparse.is_some()
+            || !copy.host_written.load(Ordering::Acquire)
+            || tex.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || tex.SampleDesc.Count != 1
+            || tex.DepthOrArraySize != 1
+            || tex.MipLevels != 1
+            || tex.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0
+            || desc.as_ref().is_some_and(|d| d.ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D)
+        {
+            return None;
+        }
+        Some(Self { copy, desc })
+    }
+}
+
 pub(crate) struct ClosedDraw {
     pipeline: ID3D12PipelineState,
     root: ID3D12RootSignature,
-    target: ID3D12Resource,
+    target: ColorTarget,
     topology: D3D_PRIMITIVE_TOPOLOGY,
     viewport: D3D12_VIEWPORT,
     scissor: RECT,
     inputs: Vec<InputView>,
     call: DrawCall,
     constants: Vec<RootWords>,
+    blend_factor: [f32; 4],
 }
 
 impl ClosedDraw {
     // The trusted producer must prove that the pipeline has no shader
     // memory dependencies, that all its input slots are represented,
-    // and that target is already in RENDER_TARGET for this interval.
+    // and that the target view is compatible with the pipeline.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_proven_native(
         pipeline: ID3D12PipelineState,
         root: ID3D12RootSignature,
-        target: ID3D12Resource,
+        target: ColorTarget,
         topology: D3D_PRIMITIVE_TOPOLOGY,
         viewport: D3D12_VIEWPORT,
         scissor: RECT,
@@ -44,6 +79,7 @@ impl ClosedDraw {
         Self {
             pipeline, root, target, topology, viewport, scissor, inputs, call,
             constants: Vec::new(),
+            blend_factor: [1.0; 4],
         }
     }
 
@@ -54,7 +90,7 @@ impl ClosedDraw {
     pub(crate) fn from_translated(
         pipeline: &crate::pipeline::host::HostPipeline,
         values: impl Fn(u8, u32) -> Option<u32>,
-        target: ID3D12Resource,
+        target: ColorTarget,
         topology: D3D_PRIMITIVE_TOPOLOGY,
         viewport: D3D12_VIEWPORT,
         scissor: RECT,
@@ -63,6 +99,13 @@ impl ClosedDraw {
     ) -> Result<Self, UnloweredShader> {
         if pipeline.compute || pipeline.mesh || pipeline.rectangles || pipeline.marks.is_some() {
             return Err(UnloweredShader::UnknownUserData);
+        }
+        // SAFETY: query the retained native target description.
+        let format = target.desc.as_ref().map_or_else(
+            || unsafe { target.copy.texture.GetDesc() }.Format, |d| d.Format,
+        );
+        if pipeline.closed_color_format != Some(format) {
+            return Err(UnloweredShader::GraphicsState);
         }
         let mut constants = Vec::new();
         for stage in &pipeline.stages {
@@ -76,7 +119,12 @@ impl ClosedDraw {
         Ok(Self {
             pipeline: pipeline.pso.clone(), root: pipeline.root.clone(),
             target, topology, viewport, scissor, inputs, call, constants,
+            blend_factor: [1.0; 4],
         })
+    }
+
+    pub(crate) fn set_blend_factor(&mut self, factor: [f32; 4]) {
+        self.blend_factor = factor;
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -97,12 +145,21 @@ impl ClosedDraw {
         }
         list.keep(&self.pipeline);
         list.keep(&self.root);
-        list.keep(&self.target);
-        let rtv = host.rtv(&self.target, None);
+        let texture = &self.target.copy.texture;
+        let before = D3D12_RESOURCE_STATES(self.target.copy.state.load(Ordering::Acquire) as i32);
+        let render_target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        list.keep(texture);
+        let rtv = host.rtv(texture, self.target.desc.as_ref());
         // SAFETY: the proven draw owns its pipeline, root and target. The
         // inputs were gathered in this same list from admitted pages.
         unsafe {
             let cmd = list.recording();
+            // This encoder runs under the direct queue submission lock.
+            // Restore the prior state in this list without speculative
+            // changes to global state if a later operation rejects it.
+            if before != render_target {
+                cmd.ResourceBarrier(&[transition(texture, before, render_target)]);
+            }
             cmd.SetGraphicsRootSignature(&self.root);
             cmd.SetPipelineState(&self.pipeline);
             for root in &self.constants {
@@ -113,6 +170,7 @@ impl ClosedDraw {
             cmd.IASetPrimitiveTopology(self.topology);
             cmd.RSSetViewports(&[self.viewport]);
             cmd.RSSetScissorRects(&[self.scissor]);
+            cmd.OMSetBlendFactor(Some(&self.blend_factor));
             cmd.OMSetRenderTargets(1, Some(&rtv), false, None);
             match self.call {
                 DrawCall::Direct { vertices, instances, first, first_instance } => {
@@ -121,6 +179,9 @@ impl ClosedDraw {
                 DrawCall::Indexed { indices, instances, first, base, first_instance } => {
                     cmd.DrawIndexedInstanced(indices, instances, first, base, first_instance);
                 }
+            }
+            if before != render_target {
+                cmd.ResourceBarrier(&[transition(texture, render_target, before)]);
             }
         }
         Ok(())
@@ -137,7 +198,6 @@ fn paged_title_draw_reads_gpu_copied_vertices_and_renders_pixels() {
     use windows::Win32::Graphics::Dxgi::Common::*;
     use windows::core::s;
 
-    use crate::host::transition;
     use crate::page_view::VertexView;
 
     let host = crate::host::host().expect("D3D12 renderer host (CI selects WARP)");
@@ -244,6 +304,9 @@ float4 pixel() : SV_Target0 { return green; }
     // SAFETY: the target starts in render-target state.
     unsafe {
         clear.recording().ClearRenderTargetView(host.rtv(&target, None), &[1., 0., 0., 1.], None);
+        clear.recording().ResourceBarrier(&[transition(
+            &target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
     }
     clear.close();
     host.execute(&[&clear]);
@@ -261,10 +324,16 @@ float4 pixel() : SV_Target0 { return green; }
             slot.copy_from_slice(&value.to_le_bytes());
         }
     }
+    let target_state = Arc::new(HostTexture::new(
+        target.clone(), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32, Vec::new(),
+    ));
+    assert!(ColorTarget::capture(target_state.clone(), None).is_none());
+    target_state.host_written.store(true, Ordering::Release);
+    let color = ColorTarget::capture(target_state.clone(), None).unwrap();
     let title = host.new_list().unwrap();
     title.defer_copy(VA as *mut u8, (ALIAS + 32) as *const u8, 24);
     let mut draw = ClosedDraw::from_proven_native(
-        pso, root, target.clone(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+        pso, root, color, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
         D3D12_VIEWPORT { Width: 4.0, Height: 4.0, MaxDepth: 1.0, ..Default::default() },
         RECT { left: 0, top: 0, right: 4, bottom: 4 },
         vec![InputView::Vertex(0, VertexView { address: VA as u64, size: 24, stride: 8 })],
@@ -278,14 +347,10 @@ float4 pixel() : SV_Target0 { return green; }
     title.close();
     let stats = host.execute_paged_title(heap, &mut backing, &[&title]).unwrap();
     assert_eq!((stats.uploaded, stats.downloaded), (1, 1));
+    assert_eq!(target_state.state.load(Ordering::Acquire), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
 
+    // The completed draw must have restored the recorded copy-source state.
     let read = host.new_list().unwrap();
-    // SAFETY: the completed draw leaves the retained texture in RT state.
-    unsafe {
-        read.recording().ResourceBarrier(&[transition(
-            &target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE,
-        )]);
-    }
     let (readback, footprint) = crate::capture::read_back(device, read.recording(), &target).unwrap();
     read.close();
     host.execute(&[&read]);
