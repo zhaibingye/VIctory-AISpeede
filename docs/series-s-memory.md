@@ -53,3 +53,17 @@ This is opt-in. In particular, a GPU write made directly into shared pages
 cannot be intercepted and withheld like a write made into a shadow, so the
 default path remains preferable if rendering regresses. Unset the variable
 to return to it. Neither path has been verified to stay under 15 GiB.
+
+## VNME submission counters
+
+A build with the experimental `paged-title` feature can log one line per
+retired native submission with `VICTORY_VNME_TIMING=1`. The
+`victory_gpu::vnme_timing` target reports CPU command encoding/enqueue/wait
+and retirement time, whether the submission used the overlap window,
+transferred canonical page bytes, and current RAM/local VRAM ledger use.
+
+CPU wait is not GPU time or frame time. Retirement can include an extra
+readback fence for low-level bitmap-tracked diagnostics. Page bytes exclude native texture
+transfers and descriptor/scratch traffic. Ledger samples are managed
+allocation readings at retirement, not process/driver usage or global peaks.
+The option is off by default.

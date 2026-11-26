@@ -524,6 +524,26 @@ impl InFlightPages<'_> {
     }
 }
 
+/// Opt-in CPU-side counters. These do not bracket GPU work; queue wait
+/// overlaps earlier submissions and is not a GPU frame-time estimate.
+struct SubmissionProfile {
+    encode_us: u64,
+    enqueue_us: u64,
+    queued: std::time::Instant,
+    window: bool,
+}
+
+fn profile_clock() -> Option<std::time::Instant> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    (cfg!(feature = "paged-title") && *ENABLED.get_or_init(|| {
+        std::env::var_os("VICTORY_VNME_TIMING").is_some_and(|value| value == "1")
+    })).then(std::time::Instant::now)
+}
+
+fn micros(duration: std::time::Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
 /// GPU work, descriptors and byte publication retained to the native fence.
 #[must_use]
 struct SubmittedRender<'a> {
@@ -537,6 +557,7 @@ struct SubmittedRender<'a> {
     uploads: Option<CapturedUploads>,
     uploaded: usize,
     reusable: bool,
+    profile: Option<SubmissionProfile>,
 }
 
 struct BitmapTracking {
@@ -954,7 +975,8 @@ impl Host {
             },
         );
         match render {
-            Ok(render) => {
+            Ok(mut render) => {
+                if let Some(profile) = &mut render.profile { profile.window = true; }
                 render.targets.advance_submitted_tail(tail);
                 let upload_leases = ops.iter().filter_map(|op| match op {
                     PageOp::UploadLease(lease) => Some(lease.clone()),
@@ -1058,6 +1080,7 @@ fn submit_work<'a>(
         &mut crate::page_resource::ResourcePlan,
     ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
 ) -> std::result::Result<SubmittedRender<'a>, BatchError> {
+    let started = profile_clock();
     let native = BatchError::Native;
     let mut pairs = PageDescriptors {
         heap,
@@ -1128,12 +1151,22 @@ fn submit_work<'a>(
     };
     list.close();
     let command = list.recording().cast().map_err(native)?;
+    let encoded = started.map(|_| std::time::Instant::now());
     let rendered = host
         .submit_native_group(signal, &[Some(command)])
         .unwrap_or_else(|e| fail(format_args!("native paged render submission: {e}")));
+    let profile = started.zip(encoded).map(|(started, encoded)| {
+        let queued = std::time::Instant::now();
+        SubmissionProfile {
+            encode_us: micros(encoded.duration_since(started)),
+            enqueue_us: micros(queued.duration_since(encoded)),
+            queued,
+            window: false,
+        }
+    });
     Ok(SubmittedRender {
         fence: rendered, list, descriptors: pairs, targets, tracking,
-        declared_dirty, planned, uploads, uploaded, reusable,
+        declared_dirty, planned, uploads, uploaded, reusable, profile,
     })
 }
 
@@ -1141,8 +1174,10 @@ impl SubmittedRender<'_> {
     fn retire(
         self, host: &Host, signal: &mut u64, backing: &SubmissionBacking, batch: &PinnedBatch,
     ) -> Completion {
+        let wait_started = self.profile.as_ref().map(|_| std::time::Instant::now());
         let observed = host.await_native_group(self.fence)
             .unwrap_or_else(|e| fail(format_args!("native paged render fence: {e}")));
+        let fence_observed = wait_started.map(|_| std::time::Instant::now());
         let mut dirty = self.declared_dirty;
         if let Some(tracking) = self.tracking {
             // SAFETY: the fence has completed, and the retained list
@@ -1192,6 +1227,25 @@ impl SubmittedRender<'_> {
         drop(self.descriptors);
         if self.reusable {
             host.recycle_paged_list(self.list, self.fence, observed);
+        }
+        if let Some(((profile, wait_started), fence_observed)) =
+            self.profile.zip(wait_started).zip(fence_observed)
+        {
+            use victory_memory::budget::Pool;
+            let budget = HostBudget::process();
+            let retire_us = micros(fence_observed.elapsed());
+            tracing::info!(target: "victory_gpu::vnme_timing",
+                native_fence = self.fence.0, completed_fence = completed.0,
+                window = profile.window, pinned_pages = batch.pages().count(),
+                cpu_encode_us = profile.encode_us, cpu_enqueue_us = profile.enqueue_us,
+                before_wait_us = micros(wait_started.duration_since(profile.queued)),
+                cpu_wait_us = micros(fence_observed.duration_since(wait_started)),
+                cpu_retire_us = retire_us,
+                page_upload_bytes = stats.uploaded as u64 * PAGE_BYTES,
+                page_readback_bytes = stats.downloaded as u64 * PAGE_BYTES,
+                managed_ram_bytes = budget.used(Pool::Ram),
+                managed_local_bytes = budget.used(Pool::Local),
+                "VNME submission retired");
         }
         Completion { fence: completed, stats, digests }
     }
