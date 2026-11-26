@@ -1062,6 +1062,23 @@ mod tests {
         assert_eq!(l.offset(0, 0, 16, 0), Ok(8192));
     }
 
+    /// 启动诊断遇到的 256B D 型 RGBA32F：四个通道的整个像素
+    /// 占 16 字节；不能把整个 256B 块当作四个可见像素。
+    #[test]
+    fn display_microtile_rgba32f_two_by_two_has_exact_active_texels() {
+        let l = Layout::new(&desc(2, 2, 1, 16, Swizzle::SW_256B_D)).unwrap();
+        assert_eq!(l.block, [4, 4, 1]);
+        assert_eq!(l.size, 256);
+        assert_eq!(l.offset(0, 0, 0, 0), Ok(0));
+        assert_eq!(l.offset(0, 1, 0, 0), Ok(16));
+        assert_eq!(l.offset(0, 0, 1, 0), Ok(32));
+        assert_eq!(l.offset(0, 1, 1, 0), Ok(48));
+        // 更大的资源使用同一张表时，第二行不一定紧跟第一行。
+        let wide = Layout::new(&desc(4, 2, 1, 16, Swizzle::SW_256B_D)).unwrap();
+        assert_eq!(wide.offset(0, 2, 0, 0), Ok(64));
+        assert_eq!(wide.offset(0, 0, 1, 0), Ok(32));
+    }
+
     #[test]
     fn layouts_share_identical_swizzle_tables() {
         for (swizzle, kind, dimension, block_log2) in [
