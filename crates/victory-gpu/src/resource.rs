@@ -2389,6 +2389,112 @@ extern "system" fn unmap(_this: This, _sub: u32, _written: *const c_void) {
         }
     }
 }
+// These CPU copy APIs do not hand the application a persistent pointer.
+// All layout validation and queue ordering live in one coherency boundary.
+#[cfg(all(windows, feature = "paged-title"))]
+extern "system" fn write_subresource(
+    this: This, sub: u32, area: *const [u32; 6], source: *const u8,
+    row_pitch: u32, _depth_pitch: u32,
+) -> HRESULT {
+    cpu_texture_copy(this, sub, area, source.cast_mut(), row_pitch, true)
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+extern "system" fn read_subresource(
+    this: This, destination: *mut u8, row_pitch: u32, _depth_pitch: u32,
+    sub: u32, area: *const [u32; 6],
+) -> HRESULT {
+    cpu_texture_copy(this, sub, area, destination, row_pitch, false)
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+fn cpu_texture_copy(
+    this: This, sub: u32, area: *const [u32; 6], data: *mut u8,
+    row_pitch: u32, write: bool,
+) -> HRESULT {
+    use crate::object::E_NOTIMPL;
+    let resource = resource(this);
+    if sub != 0 {
+        return E_NOTIMPL;
+    }
+    // CPU-visible custom heaps, not default GPU-only storage. The
+    // compatible storage strategy currently admits exact committed 2D data.
+    if !matches!(resource.backing, Backing::Committed(_))
+        || resource.heap.kind != 4 || !matches!(resource.heap.cpu_pages, 2 | 3)
+    {
+        return E_NOTIMPL;
+    }
+    let Some(texture) = &resource.host else { return E_NOTIMPL; };
+    let Some(host) = crate::host::host() else { return E_NOTIMPL; };
+    // As in Unmap, take the mapping mutex before the direct-queue lock.
+    let mut mapped = texture.mapped_pointers.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ordered = host.direct_queue();
+    let Some(layout) = texture.exact_committed_bytes() else { return E_NOTIMPL; };
+    // SAFETY: the resource ABI supplies six UINTs or a null box.
+    let [left, top, front, right, bottom, back] = if area.is_null() {
+        [0, 0, 0, layout.width, layout.height, 1]
+    } else {
+        unsafe { area.read_unaligned() }
+    };
+    if left >= right || top >= bottom || front >= back {
+        return S_OK;
+    }
+    let copied = ((right - left) as usize) * 4;
+    let pitch = row_pitch as usize;
+    if data.is_null() || front != 0 || back != 1
+        || right > layout.width || bottom > layout.height
+        || pitch < copied
+    {
+        return E_INVALIDARG;
+    }
+    let rows = (bottom - top) as usize;
+    let tex_pitch = layout.row_pitch as usize;
+    let tex_start = layout.address as usize + top as usize * tex_pitch + left as usize * 4;
+    let tex_end = tex_start + (rows - 1) * tex_pitch + copied;
+    let Some(data_len) = (rows - 1).checked_mul(pitch).and_then(|n| n.checked_add(copied))
+        .filter(|&n| n <= isize::MAX as usize)
+    else { return E_INVALIDARG; };
+    let Some(data_end) = (data as usize).checked_add(data_len) else { return E_INVALIDARG; };
+    if (data as usize) < tex_end && tex_start < data_end {
+        return E_INVALIDARG;
+    }
+    // Leave the actual public D3D12 resource state unchanged by any
+    // internal transfer. The title still owns synchronization with fences.
+    if texture.state.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return E_INVALIDARG;
+    }
+    let replaces_all = write && left == 0 && top == 0 && right == layout.width && bottom == layout.height;
+    if let Some(version) = texture.completed_native_version() {
+        if mapped.active != 0 && mapped.materialized != Some(version) {
+            return E_NOTIMPL;
+        }
+        if mapped.active == 0 && !replaces_all {
+            let Some(heap) = crate::memory::heap() else { return E_NOTIMPL; };
+            if let Err(error) = host.materialize_texture_bytes_locked(&mut ordered, heap, texture.clone(), layout) {
+                tracing::warn!(?error, "VNME CPU texture copy could not preserve native bytes");
+                return E_NOTIMPL;
+            }
+        }
+    }
+    // SAFETY: the title provides a valid pitched input/output buffer.
+    // The compatible texture layout and non-overlapping row spans were checked.
+    unsafe {
+        let tex = tex_start as *mut u8;
+        for row in 0..rows {
+            if write {
+                std::ptr::copy_nonoverlapping(data.add(row * pitch), tex.add(row * tex_pitch), copied);
+            } else {
+                std::ptr::copy_nonoverlapping(tex.add(row * tex_pitch), data.add(row * pitch), copied);
+            }
+        }
+    }
+    if write {
+        texture.record_cpu_bytes();
+        mapped.materialized = None;
+    }
+    S_OK
+}
+
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
@@ -2497,6 +2603,11 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[9] = unmap as *const (); // 0x48
     f[10] = resource_desc as *const (); // 0x50
     f[11] = gpu_address as *const (); // 0x58
+    #[cfg(all(windows, feature = "paged-title"))]
+    {
+        f[12] = write_subresource as *const (); // 0x60
+        f[13] = read_subresource as *const (); // 0x68
+    }
     f[14] = heap_properties as *const (); // 0x70
     Table(f)
 };

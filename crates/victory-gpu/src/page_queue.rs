@@ -474,6 +474,15 @@ impl Host {
         target: crate::page_texture::LinearTexture,
     ) -> std::result::Result<(), BatchError> {
         let mut signal = self.direct_queue();
+        self.materialize_texture_bytes_locked(&mut signal, heap, source, target)
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn materialize_texture_bytes_locked(
+        &self, signal: &mut u64, heap: &HostHeap,
+        source: std::sync::Arc<crate::resource::HostTexture>,
+        target: crate::page_texture::LinearTexture,
+    ) -> std::result::Result<(), BatchError> {
         let ranges: Vec<_> = target.rows()?.collect();
         if source.reusable_byte_mirror(&ranges) {
             return Ok(());
@@ -481,7 +490,7 @@ impl Host {
         let readback = std::sync::Arc::new(crate::page_resource::TextureReadback::capture(source, target)
             .ok_or(BatchError::UnsupportedTextureMap)?);
         let mut backing = SubmissionBacking::default();
-        self.execute_paged_ops_locked(&mut signal, heap, &mut backing, &[PageOp::ReadbackTexture(readback.clone())])?;
+        self.execute_paged_ops_locked(signal, heap, &mut backing, &[PageOp::ReadbackTexture(readback.clone())])?;
         readback.publish_mirror(&ranges, &backing);
         Ok(())
     }

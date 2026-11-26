@@ -279,8 +279,10 @@ impl TextureReadback {
         if !plan.authoritative(&self.source) {
             return Err(BatchError::TargetNotInitialized);
         }
+        let before = plan.state(&self.source);
         plan.transition_texture(list, &self.source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)?;
-        self.target.copy_from(host, list, batch, &self.source.texture, dirty)
+        self.target.copy_from(host, list, batch, &self.source.texture, dirty)?;
+        plan.transition_texture(list, &self.source, before.0 as u32)
     }
 }
 
