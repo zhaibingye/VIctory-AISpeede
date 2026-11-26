@@ -863,6 +863,24 @@ impl HostTexture {
         )
     }
 
+    #[cfg(feature = "paged-title")]
+    fn has_completed_native_bytes(&self) -> bool {
+        use victory_memory::authority::Representation;
+        self.native_authority.lock().unwrap_or_else(|e| e.into_inner())
+            .as_ref().is_some_and(|v| v.version.representation == Representation::NativeGpu)
+    }
+
+    #[cfg(feature = "paged-title")]
+    fn record_cpu_bytes(&self) {
+        use victory_memory::{authority::{CompletedVersion, Representation, Version}, coherence::Fence};
+        let mut completed = self.native_authority.lock().unwrap_or_else(|e| e.into_inner());
+        let old = *completed;
+        let version = Version::successor(old.map(|v| v.version), Representation::CompatibleBytes,
+            self.byte_observation()).unwrap_or_else(|| crate::host::fail(format_args!("VNME version exhausted")));
+        *completed = Some(CompletedVersion { version, fence: old.map_or(Fence(0), |v| v.fence) });
+        self.host_written.store(false, std::sync::atomic::Ordering::Release);
+    }
+
     /// A host texture made outside the title's resources (twins).
     pub(crate) fn new(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -1440,10 +1458,18 @@ pub(crate) fn paged_linear_texture(this: This) -> Option<crate::page_texture::Li
 
 #[cfg(windows)]
 fn page_texture_layout(address: u64, desc: &ResourceDesc) -> Option<crate::page_texture::LinearTexture> {
+    if desc.flags & 0xf != 0 {
+        return None;
+    }
+    linear_texture_bytes(address, desc)
+}
+
+#[cfg(windows)]
+fn linear_texture_bytes(address: u64, desc: &ResourceDesc) -> Option<crate::page_texture::LinearTexture> {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     if desc.dimension != 3 || !matches!(desc.layout, 1 | 0x100)
         || desc.depth_or_array_size != 1 || desc.mip_levels != 1
-        || desc.sample_count != 1 || desc.flags & 0xf != 0
+        || desc.sample_count != 1
         || !matches!(desc.format, 28 | 87)
     {
         return None;
@@ -2128,22 +2154,59 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
 pub(crate) extern "system" fn resource_release(this: This) -> u32 {
     object::release_boxed::<Resource>(this)
 }
-/// Memory is always mapped (subresources are not told apart yet); a null
-/// `out` only asks for residency.
+/// A null range means the entire resource, an empty range no access.
+#[cfg(all(windows, feature = "paged-title"))]
+fn accesses_bytes(range: *const c_void) -> Option<bool> {
+    if range.is_null() { return Some(true); }
+    // SAFETY: the guest Map/Unmap ABI supplies a readable D3D12_RANGE.
+    let [start, end] = unsafe { range.cast::<[usize; 2]>().read_unaligned() };
+    (start <= end).then_some(start != end)
+}
+
+/// Map is a CPU byte demand, not proof that a submitted GPU write has
+/// completed. The title must still use the corresponding queue fence.
 extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
     if !out.is_null() {
         let resource = resource(this);
         #[cfg(windows)]
         if let Some(texture) = &resource.host {
-            // Map hands out a pointer; Unmap does not prove it was forgotten.
             texture.expose_bytes(victory_memory::authority::ByteExposure::MappedPointer);
+            #[cfg(feature = "paged-title")]
+            if texture.has_completed_native_bytes() {
+                let Some(reads) = accesses_bytes(_read) else { return E_INVALIDARG; };
+                if reads {
+                    // Imported/overlapping placement and non-linear layout
+                    // cannot yet expose an exact compatible-byte view.
+                    if _sub != 0 || !matches!(resource.backing, Backing::Committed(_)) {
+                        return crate::object::E_NOTIMPL;
+                    }
+                    let Some(destination) = linear_texture_bytes(resource.data() as u64, &resource.desc)
+                        else { return crate::object::E_NOTIMPL; };
+                    let Some((host, heap)) = crate::host::host().zip(crate::memory::heap())
+                        else { return crate::object::E_NOTIMPL; };
+                    if let Err(error) = host.materialize_texture_bytes(heap, texture.clone(), destination) {
+                        tracing::warn!(?error, "VNME texture Map could not materialize bytes");
+                        return crate::object::E_NOTIMPL;
+                    }
+                }
+            }
         }
-        // SAFETY: checked non-null; the title passes room for a pointer.
+        // SAFETY: checked non-null; the guest provides room for a pointer.
         unsafe { out.write(resource.data()) };
     }
     S_OK
 }
-extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
+
+extern "system" fn unmap(_this: This, _sub: u32, _written: *const c_void) {
+    #[cfg(all(windows, feature = "paged-title"))]
+    if accesses_bytes(_written) != Some(false)
+        && let Some(texture) = &resource(_this).host
+        && let Some(host) = crate::host::host()
+    {
+        let _ordered = host.direct_queue();
+        texture.record_cpu_bytes();
+    }
+}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.

@@ -257,6 +257,8 @@ pub(crate) enum BatchError {
     TargetNotInitialized,
     UnsupportedDepth,
     UnsupportedBarrier,
+    #[cfg(feature = "paged-title")]
+    UnsupportedTextureMap,
     Range(u64, u64),
     NotCaptured(u64),
     Native(Error),

@@ -301,6 +301,20 @@ impl Host {
         ClosedTitleBatch::capture(lists)?.execute(self, heap, backing)
     }
 
+    /// Materialize a completed native texture at an actual CPU Map
+    /// demand, using the same physical-page writeback as title work.
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn materialize_texture_bytes(
+        &self, heap: &HostHeap, source: std::sync::Arc<crate::resource::HostTexture>,
+        target: crate::page_texture::LinearTexture,
+    ) -> std::result::Result<(), BatchError> {
+        let readback = crate::page_resource::TextureReadback::capture(source, target)
+            .ok_or(BatchError::UnsupportedTextureMap)?;
+        let mut backing = SubmissionBacking::default();
+        self.execute_paged_ops(heap, &mut backing, &[PageOp::ReadbackTexture(std::sync::Arc::new(readback))])?;
+        Ok(())
+    }
+
     /// Run a closed sequence of buffer copies against one capture and
     /// perform a single dirty-page merge after the whole sequence.
     pub(crate) fn execute_paged_copies(

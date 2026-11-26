@@ -28,7 +28,10 @@ impl ResourcePlan {
     }
 
     pub(crate) fn authoritative(&self, copy: &Arc<HostTexture>) -> bool {
-        self.version(copy).is_some() || copy.host_written.load(Ordering::Acquire)
+        self.version(copy).map_or_else(
+            || copy.host_written.load(Ordering::Acquire),
+            |version| version.representation == Representation::NativeGpu,
+        )
     }
 
     pub(crate) fn record_write(&mut self, copy: &Arc<HostTexture>) -> Result<(), BatchError> {
