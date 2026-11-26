@@ -223,6 +223,7 @@ pub(crate) struct ShaderBindings {
 
 enum ClosedView {
     Texture(TextureInput),
+    TextureUav(crate::page_uav::ShaderTextureUav),
     Raw(BoundedRawView),
     Structured(BoundedRawView, u32),
 }
@@ -355,7 +356,7 @@ impl ShaderBindings {
                 &t.host, &t.used, stage.user_data, &values,
                 |root| slots.iter().any(|s| s.slot.root == root),
                 |root| pipeline.compute && slots.iter().any(|s| {
-                    s.slot.root == root && matches!(s.access, StaticViewAccess::RawUav { .. })
+                    s.slot.root == root && matches!(s.access, StaticViewAccess::RawUav { .. } | StaticViewAccess::TextureWrite { .. })
                 }),
                 |slot| stage.root_cbvs.iter().any(|&(bound, _)| bound == slot),
             )? {
@@ -371,6 +372,9 @@ impl ShaderBindings {
                         let bound = match proof.access {
                             StaticViewAccess::TextureRead => ClosedView::Texture(
                                 actual.paged_texture_srv().ok_or(UnloweredShader::DescriptorTable)?),
+                            StaticViewAccess::TextureWrite { .. } if pipeline.compute => {
+                                ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).ok_or(reject)?)
+                            }
                             StaticViewAccess::RawSrv { .. } => {
                                 let (start, end) = crate::descriptor::host::paged_raw_srv_range(&actual)
                                     .ok_or(UnloweredShader::DescriptorTable)?;
@@ -394,6 +398,9 @@ impl ShaderBindings {
                     }
                     match (table.get_mut(&slot.index), proof.access) {
                         (Some(ClosedView::Texture(_)), StaticViewAccess::TextureRead) => {},
+                        (Some(ClosedView::TextureUav(view)), StaticViewAccess::TextureWrite { x, y }) => {
+                            if !view.allows(x, y) { return Err(reject); }
+                        }
                         (Some(ClosedView::Raw(raw)), StaticViewAccess::RawSrv { offset, bytes }) if !raw.unordered() => {
                             raw.allow_access(offset, bytes, false).ok_or(UnloweredShader::DescriptorTable)?;
                         }
@@ -413,6 +420,23 @@ impl ShaderBindings {
                 return Err(UnloweredShader::DescriptorTable);
             }
         }
+        let mut destinations = Vec::<&crate::resource::HostTexture>::new();
+        for view in tables.values().flat_map(|table| table.values()) {
+            if let ClosedView::TextureUav(uav) = view {
+                let target = uav.target().as_ref();
+                if destinations.iter().any(|other| other.texture == target.texture) {
+                    return Err(UnloweredShader::DescriptorTable);
+                }
+                destinations.push(target);
+            }
+        }
+        for view in tables.values().flat_map(|table| table.values()) {
+            if let ClosedView::Texture(source) = view
+                && destinations.iter().any(|target| source.aliases_target(target))
+            {
+                return Err(UnloweredShader::DescriptorTable);
+            }
+        }
         Ok(Self { constants, tables, cbvs })
     }
 
@@ -422,6 +446,8 @@ impl ShaderBindings {
             for view in table.values() {
                 match view {
                     ClosedView::Texture(texture) => texture.ranges(ranges)?,
+                    // The queue footprint records writable native textures separately.
+                    ClosedView::TextureUav(_) => {},
                     ClosedView::Raw(raw) | ClosedView::Structured(raw, _) => ranges.push(raw.range()),
                 }
             }
@@ -434,9 +460,19 @@ impl ShaderBindings {
             .any(|view| matches!(view, ClosedView::Texture(tex) if tex.aliases_target(target)))
     }
 
-    pub(crate) fn uses_raw_uav(&self) -> bool {
+    pub(crate) fn uses_uav(&self) -> bool {
         self.tables.values().flat_map(|table| table.values())
-            .any(|view| matches!(view, ClosedView::Raw(raw) if raw.unordered()))
+            .any(|view| matches!(view, ClosedView::TextureUav(_))
+                || matches!(view, ClosedView::Raw(raw) if raw.unordered()))
+    }
+
+    pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
+        out.extend(self.tables.values().flat_map(|table| table.values()).filter_map(|view| {
+            match view {
+                ClosedView::TextureUav(uav) => Some(uav.target()),
+                _ => None,
+            }
+        }));
     }
 
     pub(crate) fn prepare(
@@ -464,6 +500,7 @@ impl ShaderBindings {
                         let (resource, format) = texture.encode(host, list, batch, plan)?;
                         TableDescriptor::Texture(resource, format)
                     }
+                    ClosedView::TextureUav(view) => view.prepare(host, list, batch, plan)?,
                     ClosedView::Raw(raw) if raw.unordered() => raw.prepare_uav(batch, &mut shader_dirty)?,
                     ClosedView::Raw(raw) => {
                         let span = raw.range();

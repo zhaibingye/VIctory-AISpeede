@@ -77,35 +77,22 @@ impl RawClear {
     }
 }
 
-/// A clear of a single typed native texture subresource. No guest
-/// temporary texture or copy is needed to perform the clear.
-pub(crate) struct TextureClear {
-    target: std::sync::Arc<crate::resource::HostTexture>,
-    format: DXGI_FORMAT,
-    values: [u32; 4],
-    float: bool,
-    rects: Vec<RECT>,
-    replaces_all: bool,
-}
-
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
 
-impl TextureClear {
-    pub(crate) fn capture(
-        target: std::sync::Arc<crate::resource::HostTexture>,
-        view: Option<DXGI_FORMAT>, values: [u32; 4], float: bool, rects: &[RECT],
-    ) -> Option<Self> {
+/// Common native descriptor identity and shape for clear and shader writes.
+struct NativeTextureUav {
+    target: std::sync::Arc<crate::resource::HostTexture>,
+    format: DXGI_FORMAT,
+    width: u32,
+    height: u32,
+}
+
+impl NativeTextureUav {
+    fn capture(target: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT) -> Option<Self> {
         // SAFETY: the retained native allocation is live.
         let desc = unsafe { target.texture.GetDesc() };
-        let format = view.unwrap_or(desc.Format);
-        let typed = if float {
-            matches!(format, DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R16G16B16A16_FLOAT
-                | DXGI_FORMAT_R8G8B8A8_UNORM)
-        } else {
-            matches!(format, DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8B8A8_UINT)
-        };
-        if !typed || desc.Format != format || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        if desc.Format != format || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
             || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
             || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
             || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
@@ -115,30 +102,11 @@ impl TextureClear {
         {
             return None;
         }
-        let (w, h) = (i32::try_from(desc.Width).ok()?, i32::try_from(desc.Height).ok()?);
-        if rects.iter().any(|r| r.left < 0 || r.top < 0 || r.left >= r.right || r.top >= r.bottom
-            || r.right > w || r.bottom > h)
-        {
-            return None;
-        }
-        let replaces_all = rects.is_empty() || rects.iter().any(|r| {
-            r.left == 0 && r.top == 0 && r.right == w && r.bottom == h
-        });
-        Some(Self { target, format, values, float, rects: rects.to_vec(), replaces_all })
+        let (width, height) = (u32::try_from(desc.Width).ok()?, desc.Height);
+        Some(Self { target, format, width, height })
     }
 
-    pub(crate) fn target(&self) -> &std::sync::Arc<crate::resource::HostTexture> {
-        &self.target
-    }
-
-    pub(crate) fn preserves_color(&self) -> Option<&std::sync::Arc<crate::resource::HostTexture>> {
-        (!self.replaces_all).then_some(&self.target)
-    }
-
-    pub(crate) fn encode(
-        &self, host: &Host, list: &HostList, pages: &PinnedBatch,
-        descriptors: &mut PageDescriptors<'_>, resources: &mut ResourcePlan,
-    ) -> Result<(), BatchError> {
+    fn check_native(&self, host: &Host) -> Result<(), BatchError> {
         if self.target.uses_unproven_alias_backing() || self.target.twin.get().is_some_and(Option::is_some) {
             return Err(BatchError::UnsupportedTextureMap);
         }
@@ -154,16 +122,100 @@ impl TextureClear {
         {
             return Err(BatchError::UnsupportedTextureMap);
         }
-        if !self.replaces_all {
-            resources.require_native(host, list, pages, &self.target)?;
+        Ok(())
+    }
+
+}
+
+/// Exact shader UAV that names an ordered native version. It conserves
+/// existing contents: a bounded shader store is not a full overwrite proof.
+pub(crate) struct ShaderTextureUav(NativeTextureUav);
+
+impl ShaderTextureUav {
+    pub(crate) fn capture(target: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT) -> Option<Self> {
+        if !matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            return None;
         }
-        resources.transition_texture(list, &self.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32)?;
-        PageBarrier::Uav.encode(list, resources)?;
-        let texture = &self.target.texture;
+        NativeTextureUav::capture(target, format).map(Self)
+    }
+
+    pub(crate) fn target(&self) -> &std::sync::Arc<crate::resource::HostTexture> {
+        &self.0.target
+    }
+
+    pub(crate) fn allows(&self, x: u32, y: u32) -> bool {
+        x < self.0.width && y < self.0.height
+    }
+
+    pub(crate) fn prepare(
+        &self, host: &Host, list: &HostList, pages: &PinnedBatch, resources: &mut ResourcePlan,
+    ) -> Result<crate::page_queue::TableDescriptor, BatchError> {
+        self.0.check_native(host)?;
+        resources.require_native(host, list, pages, self.target())?;
+        resources.transition_texture(list, self.target(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32)?;
+        let texture = &self.target().texture;
         list.keep(texture);
-        let slot = descriptors.reserve_texture_uav(texture, self.format).map_err(BatchError::Native)?;
+        Ok(crate::page_queue::TableDescriptor::TextureUav(texture.clone(), self.0.format))
+    }
+}
+
+/// A clear of a single typed native texture subresource.
+pub(crate) struct TextureClear {
+    view: NativeTextureUav,
+    values: [u32; 4],
+    float: bool,
+    rects: Vec<RECT>,
+    replaces_all: bool,
+}
+
+impl TextureClear {
+    pub(crate) fn capture(
+        target: std::sync::Arc<crate::resource::HostTexture>,
+        format: DXGI_FORMAT, values: [u32; 4], float: bool, rects: &[RECT],
+    ) -> Option<Self> {
+        let typed = if float {
+            matches!(format, DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R16G16B16A16_FLOAT
+                | DXGI_FORMAT_R8G8B8A8_UNORM)
+        } else {
+            matches!(format, DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8B8A8_UINT)
+        };
+        if !typed { return None; }
+        let view = NativeTextureUav::capture(target, format)?;
+        let (w, h) = (i32::try_from(view.width).ok()?, i32::try_from(view.height).ok()?);
+        if rects.iter().any(|r| r.left < 0 || r.top < 0 || r.left >= r.right || r.top >= r.bottom
+            || r.right > w || r.bottom > h)
+        {
+            return None;
+        }
+        let replaces_all = rects.is_empty() || rects.iter().any(|r| {
+            r.left == 0 && r.top == 0 && r.right == w && r.bottom == h
+        });
+        Some(Self { view, values, float, rects: rects.to_vec(), replaces_all })
+    }
+
+    pub(crate) fn target(&self) -> &std::sync::Arc<crate::resource::HostTexture> {
+        &self.view.target
+    }
+
+    pub(crate) fn preserves_color(&self) -> Option<&std::sync::Arc<crate::resource::HostTexture>> {
+        (!self.replaces_all).then_some(self.target())
+    }
+
+    pub(crate) fn encode(
+        &self, host: &Host, list: &HostList, pages: &PinnedBatch,
+        descriptors: &mut PageDescriptors<'_>, resources: &mut ResourcePlan,
+    ) -> Result<(), BatchError> {
+        self.view.check_native(host)?;
+        if !self.replaces_all {
+            resources.require_native(host, list, pages, self.target())?;
+        }
+        resources.transition_texture(list, self.target(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32)?;
+        PageBarrier::Uav.encode(list, resources)?;
+        let texture = &self.target().texture;
+        list.keep(texture);
+        let slot = descriptors.reserve_texture_uav(texture, self.view.format).map_err(BatchError::Native)?;
         let cpu = host.cpu_view();
-        let view = crate::descriptor::host::paged_texture_uav_desc(self.format);
+        let view = crate::descriptor::host::paged_texture_uav_desc(self.view.format);
         // SAFETY: both descriptors describe the same retained texture
         // in UNORDERED_ACCESS and every rectangle fits its subresource.
         unsafe {
@@ -178,7 +230,7 @@ impl TextureClear {
             }
         }
         PageBarrier::Uav.encode(list, resources)?;
-        resources.record_write(&self.target)
+        resources.record_write(self.target())
     }
 }
 

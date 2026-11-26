@@ -19,6 +19,7 @@ pub struct StaticTextureSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StaticViewAccess {
     TextureRead,
+    TextureWrite { x: u32, y: u32 },
     /// A statically bounded aligned byte window on a raw UAV, as used by DXIL.
     RawUav { offset: u32, bytes: u32, write: bool },
     RawSrv { offset: u32, bytes: u32 },
@@ -70,7 +71,9 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
             continue;
         }
         let name = inst.name();
-        let access = if matches!(inst.fields, Fields::Image { dim: 1, .. })
+        let access = if let Some(access) = bounded_texture_write(inst, &mut bounds) {
+            AccessProof::Native(access)
+        } else if matches!(inst.fields, Fields::Image { dim: 1, .. })
             && (name.starts_with("image_sample") || matches!(name, "image_load" | "image_load_mip"))
         {
             AccessProof::Native(StaticViewAccess::TextureRead)
@@ -165,6 +168,22 @@ fn bounded_raw_access(inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<
         .then_some(StaticViewAccess::RawUav { offset, bytes: span, write })
 }
 
+fn bounded_texture_write(
+    inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>,
+) -> Option<StaticViewAccess> {
+    let Fields::Image {
+        addr, dim: 1, dmask: 15, a16: false, d16: false, tfe: false, lwe: false, ..
+    } = &inst.fields else { return None; };
+    if inst.name() != "image_store" { return None; }
+    let mut regs = addr.iter().flat_map(|operand| match *operand {
+        Operand::Vector { reg, dwords } => reg..reg.saturating_add(dwords),
+        _ => 0..0,
+    });
+    let x = bounds.unsigned_upper_bound(inst.read(crate::ir::Reg::V(regs.next()?))?)?;
+    let y = bounds.unsigned_upper_bound(inst.read(crate::ir::Reg::V(regs.next()?))?)?;
+    Some(StaticViewAccess::TextureWrite { x, y })
+}
+
 enum AccessProof {
     Native(StaticViewAccess),
     StructuredRead { elements: u32, last_byte: u32 },
@@ -236,6 +255,8 @@ fn proven_slot(
         {
             StaticViewAccess::StructuredSrv { stride: used.stride, elements }
         }
+        AccessProof::Native(access @ StaticViewAccess::TextureWrite { .. })
+            if native.stage == HwStage::Cs && unique() && used.kind == ResourceType::Uav && used.dwords == 8 => access,
         AccessProof::Native(access @ StaticViewAccess::TextureRead) if used.kind == ResourceType::Srv && used.dwords == 8 => access,
         AccessProof::Native(StaticViewAccess::RawUav { offset, bytes, write: false })
             if used.kind == ResourceType::Srv && used.dwords == 4 && used.stride == 0 && unique() =>

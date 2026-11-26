@@ -58,6 +58,10 @@ impl ClosedDispatch {
         Ok(())
     }
 
+    pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
+        self.shader.written_targets(out);
+    }
+
     pub(crate) fn encode(
         &self, host: &Host, list: &HostList, batch: &PinnedBatch,
         budget: &mut Option<ID3D12Resource>, descriptors: &mut PageDescriptors<'_>,
@@ -70,7 +74,7 @@ impl ClosedDispatch {
             None
         };
         let words = self.shader.prepare(host, list, batch, descriptors, plan, dirty)?;
-        if self.shader.uses_raw_uav() {
+        if self.shader.uses_uav() {
             crate::page_resource::PageBarrier::Uav.encode(list, plan)?;
         }
         list.keep(&self.pipeline);
@@ -87,6 +91,12 @@ impl ClosedDispatch {
                 DispatchCall::Direct(x, y, z) => cmd.Dispatch(x, y, z),
                 DispatchCall::Indirect(_) => args.as_ref().expect("indirect args prepared").execute(cmd),
             }
+        }
+        let mut outputs = Vec::new();
+        self.written_targets(&mut outputs);
+        if !outputs.is_empty() {
+            crate::page_resource::PageBarrier::Uav.encode(list, plan)?;
+            for target in outputs { plan.record_write(target)?; }
         }
         Ok(())
     }

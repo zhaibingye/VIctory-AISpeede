@@ -944,9 +944,7 @@ pub(crate) fn paged_texture_uav_desc(format: DXGI_FORMAT) -> D3D12_UNORDERED_ACC
     }
 }
 
-pub(crate) fn paged_texture_clear(
-    view: &View, values: [u32; 4], float: bool, rects: &[windows::Win32::Foundation::RECT],
-) -> Option<crate::page_uav::TextureClear> {
+fn exact_texture_uav(view: &View) -> Option<(std::sync::Arc<crate::resource::HostTexture>, DXGI_FORMAT)> {
     let View::Unordered(resource, 0, words) = view else { return None; };
     let resource = *resource as crate::object::This;
     if crate::resource::stands_in(resource) {
@@ -962,13 +960,23 @@ pub(crate) fn paged_texture_clear(
         if tex.MipSlice != 0 || tex.PlaneSlice != 0 {
             return None;
         }
-        Some(desc.Format)
+        desc.Format
     } else {
-        Some(DXGI_FORMAT(crate::resource::title_format(resource)? as i32))
+        DXGI_FORMAT(crate::resource::title_format(resource)? as i32)
     };
-    crate::page_uav::TextureClear::capture(
-        crate::resource::host_copy(resource)?, format, values, float, rects,
-    )
+    Some((crate::resource::host_copy(resource)?, format))
+}
+
+pub(crate) fn paged_shader_texture_uav(view: &View) -> Option<crate::page_uav::ShaderTextureUav> {
+    let (target, format) = exact_texture_uav(view)?;
+    crate::page_uav::ShaderTextureUav::capture(target, format)
+}
+
+pub(crate) fn paged_texture_clear(
+    view: &View, values: [u32; 4], float: bool, rects: &[windows::Win32::Foundation::RECT],
+) -> Option<crate::page_uav::TextureClear> {
+    let (target, format) = exact_texture_uav(view)?;
+    crate::page_uav::TextureClear::capture(target, format, values, float, rects)
 }
 
 pub(crate) fn raw_uav_desc(first: u64, elements: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
