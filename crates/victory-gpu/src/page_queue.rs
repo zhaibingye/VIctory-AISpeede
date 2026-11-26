@@ -285,7 +285,7 @@ impl ClosedTitleBatch {
         self.0.iter().all(|op| matches!(op,
             PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
             | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Draw(_)
-            | PageOp::Dispatch(_) | PageOp::Input(_) | PageOp::UploadTexture(_)))
+            | PageOp::Dispatch(_) | PageOp::Input(_) | PageOp::UploadTexture(_) | PageOp::UploadLease(_)))
     }
 
     #[cfg(feature = "paged-title")]
@@ -332,9 +332,10 @@ impl ClosedFootprint {
     fn permits_read_window(&self, ops: &[PageOp]) -> bool {
         self.preserved.is_empty() && self.visible.is_empty() && ops.iter().all(|op| match op {
             PageOp::Draw(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
-            | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Input(_) | PageOp::UploadTexture(_) => true,
+            | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Input(_) | PageOp::UploadTexture(_)
+            | PageOp::UploadLease(_) => true,
             PageOp::Dispatch(dispatch) => dispatch.reads_guest_only(),
-            PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) | PageOp::Timestamp(_) | PageOp::PipeWrite(_) | PageOp::UploadLease(_) => false,
+            PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) | PageOp::Timestamp(_) | PageOp::PipeWrite(_) => false,
         })
     }
 
@@ -464,6 +465,9 @@ struct Completion {
 struct InFlightPages<'a> {
     batch: PinnedBatch,
     render: SubmittedRender<'a>,
+    /// Only the overlapping window outlives its operation slice.
+    #[cfg(feature = "paged-title")]
+    _upload_leases: Vec<std::sync::Arc<crate::list::Upload>>,
 }
 
 impl InFlightPages<'_> {
@@ -905,7 +909,11 @@ impl Host {
         match render {
             Ok(render) => {
                 render.targets.advance_submitted_tail(tail);
-                Ok(Some((InFlightPages { batch, render }, backing)))
+                let upload_leases = ops.iter().filter_map(|op| match op {
+                    PageOp::UploadLease(lease) => Some(lease.clone()),
+                    _ => None,
+                }).collect();
+                Ok(Some((InFlightPages { batch, render, _upload_leases: upload_leases }, backing)))
             }
             Err(error) => {
                 batch.cancel(&mut slabs);
@@ -978,7 +986,11 @@ impl Host {
         };
         // Keep retirement ordered here until the scheduler has separate
         // submitted resource state and byte-publication dependency gates.
-        Ok(InFlightPages { batch, render }.retire(self, signal, backing, &mut slabs))
+        Ok(InFlightPages {
+            batch, render,
+            #[cfg(feature = "paged-title")]
+            _upload_leases: Vec::new(),
+        }.retire(self, signal, backing, &mut slabs))
     }
 }
 
