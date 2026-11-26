@@ -428,11 +428,8 @@ impl State {
         let targets = self.page_targets.clone().ok_or(DrawState(Reason::TargetsNotCaptured))?;
         let viewport = self.page_viewport.ok_or(DrawState(Reason::ViewportNotCaptured))?;
         let scissor = self.page_scissor.ok_or(DrawState(Reason::ScissorNotCaptured))?;
-        if self.pipeline == 0 {
-            return Err(DrawState(Reason::PipelineNotBound));
-        }
-        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)
-            .ok_or(DrawState(Reason::PipelineUnavailable))?;
+        let pipeline = crate::pipeline::require_host_pipeline(self.pipeline as This)
+            .map_err(crate::page_shader::UnloweredShader::Pipeline)?;
         let mut inputs = Vec::new();
         for (slot, &view) in self.vertex.iter().enumerate() {
             if pipeline.slots & (1 << slot) != 0 {
@@ -1035,16 +1032,18 @@ impl State {
     }
 
     fn record_strict_dispatch(&self, list: &HostList, call: crate::page_dispatch::DispatchCall) -> bool {
-        let ready = (!self.page_state_opaque)
-            .then(|| crate::pipeline::host_pipeline(self.pipeline as This)).flatten()
-            .ok_or(crate::page_shader::UnloweredShader::GraphicsState)
-            .and_then(|pipeline| crate::page_dispatch::ClosedDispatch::capture(
-                pipeline,
-                |slot, dword| self.page_word(true, slot, dword),
-                |root, index| self.page_view(true, root, index),
-                |slot| self.page_address(true, slot),
-                call,
-            ));
+        use crate::page_shader::UnloweredShader;
+        let ready = if self.page_state_opaque {
+            Err(UnloweredShader::GraphicsState)
+        } else {
+            crate::pipeline::require_host_pipeline(self.pipeline as This).map_err(UnloweredShader::Pipeline)
+        }.and_then(|pipeline| crate::page_dispatch::ClosedDispatch::capture(
+            pipeline,
+            |slot, dword| self.page_word(true, slot, dword),
+            |root, index| self.page_view(true, root, index),
+            |slot| self.page_address(true, slot),
+            call,
+        ));
         match ready {
             Ok(dispatch) => { list.record_page_dispatch(dispatch); true }
             Err(reason) => {

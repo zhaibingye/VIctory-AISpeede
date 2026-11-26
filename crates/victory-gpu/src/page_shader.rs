@@ -22,6 +22,7 @@ use victory_shader::{RootType, UsedResource};
 pub(crate) enum UnloweredShader {
     GraphicsState,
     DrawState(DrawState),
+    Pipeline(crate::pipeline::RequiredPipeline),
     DynamicAddress,
     DescriptorHeap,
     RootView,
@@ -39,8 +40,6 @@ pub(crate) enum DrawState {
     TargetsNotCaptured,
     ViewportNotCaptured,
     ScissorNotCaptured,
-    PipelineNotBound,
-    PipelineUnavailable,
     VertexInput { slot: u32 },
     IndexInput,
     PipelineAttachments,

@@ -257,6 +257,23 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// VNME 区分未绑定、编译被拒绝和等待超时。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequiredPipeline {
+    Unbound,
+    Refused,
+    CompileTimeout,
+}
+
+#[cfg(windows)]
+pub(crate) fn require_host_pipeline<'a>(this: This) -> Result<&'a host::HostPipeline, RequiredPipeline> {
+    if this.is_null() {
+        return Err(RequiredPipeline::Unbound);
+    }
+    make::required(&pipeline(this).host)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

@@ -172,11 +172,8 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
-/// The host pipeline if it is made (or is made within the frame's budget);
-/// queues it on first use.
-pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    // Listed for an early start in later runs from its first use, made or
-    // not: one a run never got made is the one it should start early.
+/// 记录管线的首次使用并将未完成的工作放进高优先级队列。
+fn demand(p: &Arc<Pending>) {
     if !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
         #[cfg(feature = "diagnostics")]
@@ -184,9 +181,30 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, true);
+    }
+}
+
+/// 旧渲染路径仍使用共享帧预算。
+pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    demand(p);
+    if p.made.get().is_none() {
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+/// VNME 的封闭命令列表不能丢弃等待编译的命令。独立等待必需的管线，
+/// 同时为驱动或编译器不返回的情况保留上限。
+pub(crate) fn required(p: &Arc<Pending>) -> Result<&HostPipeline, super::RequiredPipeline> {
+    demand(p);
+    if p.made.get().is_none() {
+        wait_for(p, Duration::from_secs(5));
+    }
+    match p.made.get() {
+        Some(Some(pipeline)) => Ok(pipeline),
+        Some(None) => Err(super::RequiredPipeline::Refused),
+        None => Err(super::RequiredPipeline::CompileTimeout),
+    }
 }
 
 /// Queues `p` for the workers: once, and once more ahead of the early
@@ -231,17 +249,20 @@ fn wait(p: &Pending, frame: u64) {
         WAITED_US.store(0, Ordering::Relaxed);
     }
     let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let elapsed = wait_for(p, left);
+    WAITED_US.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+}
+
+fn wait_for(p: &Pending, budget: Duration) -> Duration {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
-        if rest.is_zero() {
-            break;
-        }
+        let rest = budget.saturating_sub(started.elapsed());
+        if rest.is_zero() { break; }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    started.elapsed()
 }
 
 /// Pipelines for the workers: those draws wait for, then those started
