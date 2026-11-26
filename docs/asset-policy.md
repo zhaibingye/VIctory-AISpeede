@@ -36,9 +36,8 @@ accepted.
 
 ## Where data lives
 
-Outside the repository, configured in `victory.toml`: `game_dir` (the
-user's dump), `test_titles`, and `cache_dir` for everything derived
-(default `%LOCALAPPDATA%\victory\cache`).
+游戏、测试标题、缓存和存档必须位于仓库外。可在 `victory.toml` 配置路径。
+未指定缓存或存档路径时，默认在游戏目录的上一级创建 `cache` 和 `data`。
 
 ## Enforcement
 

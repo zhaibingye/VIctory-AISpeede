@@ -1,8 +1,5 @@
-//! Where the user's files live.
-//!
-//! Resolution order for each value: environment variable, then the config
-//! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
-//! See `victory.example.toml` at the repository root.
+//! 用户文件路径的解析。
+//! 优先使用环境变量，其次是配置文件，最后才按选中的游戏目录推导默认值。
 
 use std::path::{Path, PathBuf};
 
@@ -48,8 +45,18 @@ struct FilePaths {
 }
 
 impl Config {
-    /// Loads configuration from the environment and the config file.
+    /// 从环境变量和配置文件读取路径，没有命令行选中的游戏时使用配置中的游戏目录。
     pub fn load() -> Result<Self> {
+        Self::load_with_title_dir(None)
+    }
+
+    /// 启动与预编译以选中的游戏 EXE 为准，不以程序的运行目录为准。
+    pub fn load_for_title(exe: &Path) -> Result<Self> {
+        let dir = exe.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        Self::load_with_title_dir(Some(dir))
+    }
+
+    fn load_with_title_dir(title_dir: Option<&Path>) -> Result<Self> {
         let explicit = explicit_config_path(|k| std::env::var_os(k));
         let path = explicit
             .clone()
@@ -74,13 +81,14 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed.paths, source, |k| std::env::var_os(k), title_dir)
     }
 
     fn resolve(
         file: FilePaths,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
+        title_dir: Option<&Path>,
     ) -> Result<Self> {
         let env_path = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         let test_titles = match env("VICTORY_TEST_TITLES") {
@@ -89,16 +97,22 @@ impl Config {
                 .collect(),
             _ => file.test_titles,
         };
-        let cache_dir = env_path("VICTORY_CACHE_DIR")
-            .or(file.cache_dir)
-            .map_or_else(|| default_dir("cache"), Ok)?;
-        let data_dir = env_path("VICTORY_DATA_DIR")
-            .or(file.data_dir)
-            .map_or_else(|| default_dir("data"), Ok)?;
+        let game_dir = env_path("VICTORY_GAME_DIR").or(file.game_dir);
+        let cache_dir = env_path("VICTORY_CACHE_DIR").or(file.cache_dir);
+        let data_dir = env_path("VICTORY_DATA_DIR").or(file.data_dir);
+        let game_parent = if cache_dir.is_none() || data_dir.is_none() {
+            title_dir.or(game_dir.as_deref()).map(game_parent).transpose()?.flatten()
+        } else {
+            None
+        };
+        let resolve_dir = |override_path: Option<PathBuf>, name| {
+            override_path.or_else(|| game_parent.as_ref().map(|dir| dir.join(name)))
+                .map_or_else(|| default_dir(name), Ok)
+        };
         Ok(Config {
-            game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
-            cache_dir,
-            data_dir,
+            game_dir,
+            cache_dir: resolve_dir(cache_dir, "cache")?,
+            data_dir: resolve_dir(data_dir, "data")?,
             test_titles,
             fidelityfx_dir: env_path("VICTORY_FIDELITYFX_DIR").or(file.fidelityfx_dir),
             source,
@@ -139,7 +153,15 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
+/// 已存在的目录先解析真实路径；相对路径也要先转换，避免误取当前目录。
+fn game_parent(dir: &Path) -> Result<Option<PathBuf>> {
+    let resolved = std::fs::canonicalize(dir)
+        .or_else(|_| std::path::absolute(dir))
+        .with_context(|| format!("无法解析游戏目录 {}", dir.display()))?;
+    Ok(resolved.parent().map(Path::to_path_buf))
+}
+
+/// 未选游戏目录或游戏直接位于磁盘根目录时，才使用系统用户目录。
 fn default_dir(name: &str) -> Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
@@ -162,7 +184,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, None, env, None).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
     }
@@ -174,7 +196,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, None, env, None).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
     }
 
@@ -185,7 +207,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, None, env, None).unwrap();
         assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
     }
 
@@ -194,7 +216,7 @@ mod tests {
         let value = std::env::join_paths(["first", "second"]).unwrap();
         let file = FilePaths::default();
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, None, env, None).unwrap();
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]

@@ -323,8 +323,18 @@ pub fn run(
 /// then the shader pack's pipelines go into the pipeline library
 /// (`prebuild`).
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+    // 只有一个明确选中的游戏目录时，预编译和启动才使用同一套默认缓存。
+    let mut titles = paths.iter().filter(|path| {
+        path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    });
+    let selected = titles.next().filter(|first| titles.all(|path| path.parent() == first.parent()));
+    let cfg = if let Some(exe) = selected {
+        victory_core::Config::load_for_title(exe)?
+    } else {
+        victory_core::Config::load()?
+    };
     let paths = crate::default_paths(paths)?;
-    let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
+    let shaders = cfg.cache_subdir("shaders")?;
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
         anyhow::bail!("no shader cache in {}", shaders.display());
     };
@@ -332,7 +342,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     // The pre-build's key listing (diagnostics) translates nothing.
     if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
-        return crate::prebuild::run(&paths, threads);
+        return crate::prebuild::run(&paths, threads, &cfg);
     }
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
@@ -425,7 +435,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         started.elapsed().as_secs_f64()
     );
     if pipelines {
-        crate::prebuild::run(&paths, threads)?;
+        crate::prebuild::run(&paths, threads, &cfg)?;
     }
     Ok(())
 }

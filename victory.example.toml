@@ -7,11 +7,10 @@
 # Your own dump of Grand Theft Auto VI.     env: VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'
 
-# Derived data. Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR
+# 默认在游戏 EXE 所在目录的上一级创建 cache。环境变量：VICTORY_CACHE_DIR
 # cache_dir = 'D:\victory-data\cache'
 
-# What titles save (persistent local storage), kept apart from the cache.
-# Default: %LOCALAPPDATA%\victory\data.   env: VICTORY_DATA_DIR
+# 默认在同一父目录创建 data，单独保存存档等持久数据。环境变量：VICTORY_DATA_DIR
 # data_dir = 'D:\victory-data\data'
 
 # AMD FidelityFX for PC: the folder with amd_fidelityfx_upscaler_dx12.dll

@@ -36,9 +36,9 @@ enum Job {
     Compute(usize),
 }
 
-pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
+pub fn run(paths: &[PathBuf], threads: usize, cfg: &victory_core::Config) -> Result<()> {
     let started = Instant::now();
-    pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
+    pipeline::use_pipeline_cache(cfg.cache_subdir("pipelines")?);
     // The files that hold shaders (or the pack itself).
     let files: Vec<(PathBuf, Vec<u8>)> = paths
         .iter()

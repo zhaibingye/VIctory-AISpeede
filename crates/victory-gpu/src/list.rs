@@ -1132,28 +1132,27 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
-/// Records a global UAV barrier on `this`'s host list so earlier shader
-/// writes finish before later GPU work starts.
+/// 全局 UAV 屏障：让后续 GPU 命令看到先前的着色器写入。
 fn wait_for_shader_writes(this: This) {
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
+        if cfg!(feature = "paged-title") {
+            // 屏障必须和其前后的命令一起进入 VNME，不能写进旧命令列表。
+            list.record_page_barrier(crate::page_resource::PageBarrier::Uav);
+            return;
+        }
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // SAFETY: `Barrier` matches `D3D12_RESOURCE_BARRIER` in layout, and
-        // `UAV_BARRIER` names no resource (`first` is null).
+        // SAFETY: Barrier 与 D3D12 的布局一致，空资源指针表示全局 UAV 屏障。
         let barrier =
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: `list.recording()` is an open host command list.
+        // SAFETY: 此处仍在录制宿主命令列表。
         unsafe { list.recording().ResourceBarrier(&[barrier]) };
     }
     #[cfg(not(windows))]
     let _ = this;
 }
 
-/// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Within a single
-/// command list, earlier shader writes must finish before later dispatches
-/// or draws read or write the same resources, so record a UAV barrier on
-/// the host list.
+/// 管线两端的同步点沿用全局 UAV 顺序，不宣称复现 Xbox 专用缓存控制。
 extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
     wait_for_shader_writes(this);
 }
