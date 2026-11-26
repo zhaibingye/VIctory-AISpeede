@@ -10,20 +10,25 @@ use windows::core::Error;
 use crate::host::{Host, HostList, transition};
 use crate::page_slabs::{BatchError, PinnedBatch};
 
-/// One admitted shader view. Linear views source exactly the captured
-/// title pages; native views consume the ordered attachment authority.
+/// One admitted shader view. A native-capable view can use exact byte
+/// backing before its first GPU write; selection follows ordered authority.
 pub(crate) enum TextureInput {
-    Linear(LinearTexture),
+    Linear {
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        input: LinearTexture,
+    },
     Native {
         copy: std::sync::Arc<crate::resource::HostTexture>,
         format: DXGI_FORMAT,
         depth_plane: bool,
+        compatible_input: Option<LinearTexture>,
     },
 }
 
 impl TextureInput {
     pub(crate) fn native(
         copy: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT,
+        compatible_input: Option<LinearTexture>,
     ) -> Option<Self> {
         // SAFETY: the resource is retained by the view.
         let desc = unsafe { copy.texture.GetDesc() };
@@ -31,13 +36,17 @@ impl TextureInput {
             || desc.Format != format || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
             || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
             || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
-            || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+            || desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0
             || desc.Flags.0 & (D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0) != 0
             || copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
         {
             return None;
         }
-        Some(Self::Native { copy, format, depth_plane: false })
+        let compatible_input = compatible_input.filter(|input| {
+            input.format == format && u64::from(input.width) == desc.Width
+                && input.height == desc.Height && !copy.uses_unproven_alias_backing()
+        });
+        Some(Self::Native { copy, format, depth_plane: false, compatible_input })
     }
 
     pub(crate) fn native_depth(
@@ -60,18 +69,31 @@ impl TextureInput {
         {
             return None;
         }
-        Some(Self::Native { copy, format, depth_plane: true })
+        Some(Self::Native { copy, format, depth_plane: true, compatible_input: None })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
         match self {
-            Self::Linear(input) => { ranges.extend(input.rows()?); Ok(()) }
-            Self::Native { copy, .. } => crate::page_resource::collect_compatible_source(copy, ranges),
+            Self::Linear { input, .. } => ranges.extend(input.rows()?),
+            Self::Native { copy, compatible_input: Some(input), .. } => {
+                // A queued earlier operation can establish native
+                // authority, but it cannot create a newer CPU version.
+                if !crate::page_resource::ResourcePlan::default().authoritative(copy) {
+                    ranges.extend(input.rows()?);
+                }
+            }
+            Self::Native { copy, .. } => {
+                crate::page_resource::collect_compatible_source(copy, ranges)?;
+            }
         }
+        Ok(())
     }
 
     pub(crate) fn aliases_target(&self, target: &crate::resource::HostTexture) -> bool {
-        matches!(self, Self::Native { copy, .. } if copy.texture == target.texture)
+        let copy = match self {
+            Self::Linear { copy, .. } | Self::Native { copy, .. } => copy,
+        };
+        copy.texture == target.texture
     }
 
     pub(crate) fn encode(
@@ -79,12 +101,22 @@ impl TextureInput {
         plan: &mut crate::page_resource::ResourcePlan,
     ) -> Result<(ID3D12Resource, DXGI_FORMAT), BatchError> {
         match self {
-            Self::Linear(input) => Ok((input.encode(host, list, batch)?, input.format)),
-            Self::Native { copy, format, depth_plane } => {
-                if *depth_plane && (copy.uses_unproven_alias_backing()
+            Self::Linear { copy, input } => {
+                if plan.authoritative(copy) {
+                    return Err(BatchError::UnsupportedTextureMap);
+                }
+                Ok((input.encode(host, list, batch)?, input.format))
+            }
+            Self::Native { copy, format, depth_plane, compatible_input } => {
+                if (*depth_plane || compatible_input.is_some()) && (copy.uses_unproven_alias_backing()
                     || copy.twin.get().is_some_and(Option::is_some))
                 {
                     return Err(BatchError::UnsupportedTextureMap);
+                }
+                if let Some(input) = compatible_input
+                    && !plan.authoritative(copy)
+                {
+                    return Ok((input.encode(host, list, batch)?, input.format));
                 }
                 plan.require_native(host, list, batch, copy)?;
                 let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;

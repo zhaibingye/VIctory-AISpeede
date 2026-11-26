@@ -399,11 +399,16 @@ impl View {
             let format = host::paged_depth_srv_format(&words)?;
             return TextureInput::native_depth(crate::resource::host_copy(resource)?, format);
         }
-        if let Some(input) = crate::resource::paged_linear_texture(resource) {
-            return Some(TextureInput::Linear(input));
-        }
+        let copy = crate::resource::host_copy(resource)?;
+        let plain_linear = crate::resource::paged_linear_texture(resource);
+        #[cfg(feature = "paged-title")]
+        let compatible = copy.exact_committed_bytes();
+        #[cfg(not(feature = "paged-title"))]
+        let compatible = None;
         let format = DXGI_FORMAT(crate::resource::title_format(resource)? as i32);
-        TextureInput::native(crate::resource::host_copy(resource)?, format)
+        TextureInput::native(copy.clone(), format, compatible).or_else(|| {
+            plain_linear.map(|input| TextureInput::Linear { copy, input })
+        })
     }
 
     /// The resource objects the view names.

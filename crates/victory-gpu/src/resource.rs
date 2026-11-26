@@ -891,7 +891,7 @@ impl HostTexture {
     }
 
     #[cfg(feature = "paged-title")]
-    fn exact_committed_bytes(&self) -> Option<crate::page_texture::LinearTexture> {
+    pub(crate) fn exact_committed_bytes(&self) -> Option<crate::page_texture::LinearTexture> {
         if self.uses_unproven_alias_backing() {
             return None;
         }
@@ -1601,10 +1601,6 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
 #[allow(dead_code, reason = "used by paged descriptor admission")]
 pub(crate) fn paged_linear_texture(this: This) -> Option<crate::page_texture::LinearTexture> {
     let (data, desc) = texture_memory(this)?;
-    let host = host_copy(this)?;
-    if host.host_written.load(std::sync::atomic::Ordering::Acquire) {
-        return None;
-    }
     page_texture_layout(data as u64, &desc)
 }
 
