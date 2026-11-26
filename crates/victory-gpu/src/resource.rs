@@ -817,6 +817,13 @@ struct Resource {
     host: Option<std::sync::Arc<HostTexture>>,
 }
 
+#[cfg(all(windows, feature = "paged-title"))]
+#[derive(Default)]
+struct MapEpoch {
+    active: usize,
+    materialized: Option<u64>,
+}
+
 /// A title texture's host copy and the state it is in. The title's barriers
 /// name console states (looser than the host's), so we transition from this
 /// one. Lists that use the texture hold it until they are reset: the title
@@ -839,6 +846,8 @@ pub(crate) struct HostTexture {
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
     byte_exposure: std::sync::atomic::AtomicU8,
+    #[cfg(feature = "paged-title")]
+    mapped_pointers: std::sync::Mutex<MapEpoch>,
     pub(crate) native_authority: std::sync::Mutex<Option<victory_memory::authority::CompletedVersion>>,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
@@ -864,10 +873,11 @@ impl HostTexture {
     }
 
     #[cfg(feature = "paged-title")]
-    fn has_completed_native_bytes(&self) -> bool {
+    fn completed_native_version(&self) -> Option<u64> {
         use victory_memory::authority::Representation;
         self.native_authority.lock().unwrap_or_else(|e| e.into_inner())
-            .as_ref().is_some_and(|v| v.version.representation == Representation::NativeGpu)
+            .as_ref().filter(|v| v.version.representation == Representation::NativeGpu)
+            .map(|v| v.version.number)
     }
 
     #[cfg(feature = "paged-title")]
@@ -915,6 +925,8 @@ impl HostTexture {
             castable,
             host_written: false.into(),
             byte_exposure: 0.into(),
+            #[cfg(feature = "paged-title")]
+            mapped_pointers: std::sync::Mutex::default(),
             native_authority: std::sync::Mutex::new(None),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
@@ -2172,23 +2184,37 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
         if let Some(texture) = &resource.host {
             texture.expose_bytes(victory_memory::authority::ByteExposure::MappedPointer);
             #[cfg(feature = "paged-title")]
-            if texture.has_completed_native_bytes() {
-                let Some(reads) = accesses_bytes(_read) else { return E_INVALIDARG; };
-                if reads {
-                    // Imported/overlapping placement and non-linear layout
-                    // cannot yet expose an exact compatible-byte view.
+            {
+                // The read range says what the CPU intends to read, not
+                // that it will replace every byte. A writable pointer must
+                // start with current bytes even for an empty read range.
+                if accesses_bytes(_read).is_none() {
+                    return E_INVALIDARG;
+                }
+                let mut mapped = texture.mapped_pointers.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(version) = texture.completed_native_version() {
                     if _sub != 0 || !matches!(resource.backing, Backing::Committed(_)) {
                         return crate::object::E_NOTIMPL;
                     }
                     let Some(destination) = linear_texture_bytes(resource.data() as u64, &resource.desc)
                         else { return crate::object::E_NOTIMPL; };
-                    let Some((host, heap)) = crate::host::host().zip(crate::memory::heap())
-                        else { return crate::object::E_NOTIMPL; };
-                    if let Err(error) = host.materialize_texture_bytes(heap, texture.clone(), destination) {
-                        tracing::warn!(?error, "VNME texture Map could not materialize bytes");
+                    // Nested maps share the current compatible bytes. Do
+                    // not replace possible CPU edits with another copy.
+                    if mapped.active != 0 && mapped.materialized != Some(version) {
                         return crate::object::E_NOTIMPL;
                     }
+                    if mapped.active == 0 {
+                        let Some((host, heap)) = crate::host::host().zip(crate::memory::heap())
+                            else { return crate::object::E_NOTIMPL; };
+                        if let Err(error) = host.materialize_texture_bytes(heap, texture.clone(), destination) {
+                            tracing::warn!(?error, "VNME texture Map could not materialize bytes");
+                            return crate::object::E_NOTIMPL;
+                        }
+                        mapped.materialized = Some(version);
+                    }
                 }
+                let Some(next) = mapped.active.checked_add(1) else { return E_INVALIDARG; };
+                mapped.active = next;
             }
         }
         // SAFETY: checked non-null; the guest provides room for a pointer.
@@ -2199,12 +2225,18 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 
 extern "system" fn unmap(_this: This, _sub: u32, _written: *const c_void) {
     #[cfg(all(windows, feature = "paged-title"))]
-    if accesses_bytes(_written) != Some(false)
-        && let Some(texture) = &resource(_this).host
-        && let Some(host) = crate::host::host()
-    {
-        let _ordered = host.direct_queue();
-        texture.record_cpu_bytes();
+    if let Some(texture) = &resource(_this).host {
+        let mut mapped = texture.mapped_pointers.lock().unwrap_or_else(|e| e.into_inner());
+        mapped.active = mapped.active.saturating_sub(1);
+        if mapped.active == 0 {
+            mapped.materialized = None;
+        }
+        if accesses_bytes(_written) != Some(false)
+            && let Some(host) = crate::host::host()
+        {
+            let _ordered = host.direct_queue();
+            texture.record_cpu_bytes();
+        }
     }
 }
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
