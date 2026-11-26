@@ -342,7 +342,7 @@ pub(crate) struct HostPipeline {
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
-    pub(crate) closed_color_format: Option<DXGI_FORMAT>,
+    pub(crate) closed_color_formats: Option<Vec<DXGI_FORMAT>>,
     pub(crate) closed_depth_format: Option<DXGI_FORMAT>,
     /// A graphics pipeline of the console's rectangle lists whose geometry
     /// shader completes each rectangle (`victory_shader::emit::rectangle_gs`):
@@ -618,7 +618,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
-                closed_color_format: None,
+                closed_color_formats: None,
                 closed_depth_format: None,
                 name: format!("{shaders:?}"),
                 rectangles: false,
@@ -654,7 +654,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
-                closed_color_format: None,
+                closed_color_formats: None,
                 closed_depth_format: None,
                 name: format!("{shaders:?}"),
                 rectangles: false,
@@ -741,11 +741,11 @@ impl HostPipeline {
             pso,
             root,
             stages: bound,
-            closed_color_format: (g.targets.NumRenderTargets == 1
+            closed_color_formats: ((1..=8).contains(&g.targets.NumRenderTargets)
                 && g.samples.Count == 1
                 && (!(g.depth.DepthEnable.as_bool() || g.depth.StencilEnable.as_bool())
                     || g.depth_format != DXGI_FORMAT_UNKNOWN))
-                .then_some(g.targets.RTFormats[0]),
+                .then(|| g.targets.RTFormats[..g.targets.NumRenderTargets as usize].to_vec()),
             closed_depth_format: (g.depth_format != DXGI_FORMAT_UNKNOWN).then_some(g.depth_format),
             name: format!("{shaders:?}"),
             rectangles: !gs.is_empty(),

@@ -243,7 +243,7 @@ impl DepthClear {
 pub(crate) struct ClosedDraw {
     pipeline: ID3D12PipelineState,
     root: ID3D12RootSignature,
-    target: ColorTarget,
+    targets: Vec<ColorTarget>,
     depth: Option<DepthTarget>,
     stencil_ref: u32,
     topology: D3D_PRIMITIVE_TOPOLOGY,
@@ -258,11 +258,13 @@ pub(crate) struct ClosedDraw {
 
 impl ClosedDraw {
     #[cfg(feature = "paged-title")]
-    pub(crate) fn preserves_color(&self) -> &Arc<HostTexture> { &self.target.copy }
+    pub(crate) fn preserved_colors<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
+        out.extend(self.targets.iter().map(|target| &target.copy));
+    }
 
     #[cfg(feature = "paged-title")]
     pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
-        out.push(&self.target.copy);
+        self.preserved_colors(out);
         if let Some(depth) = &self.depth { out.push(&depth.copy); }
     }
 
@@ -281,7 +283,7 @@ impl ClosedDraw {
         call: DrawCall,
     ) -> Self {
         Self {
-            pipeline, root, target, depth: None, stencil_ref: 0, topology, viewport, scissor, inputs, call,
+            pipeline, root, targets: vec![target], depth: None, stencil_ref: 0, topology, viewport, scissor, inputs, call,
             shader: ShaderBindings::default(),
             blend_factor: [1.0; 4],
             sample: None,
@@ -297,7 +299,7 @@ impl ClosedDraw {
         values: impl Fn(u8, u32) -> Option<u32>,
         view: impl Fn(u8, u32) -> Option<crate::descriptor::View>,
         address: impl Fn(u8) -> Option<u64>,
-        target: ColorTarget,
+        targets: Vec<ColorTarget>,
         depth: Option<DepthTarget>,
         stencil_ref: u32,
         topology: D3D_PRIMITIVE_TOPOLOGY,
@@ -309,22 +311,43 @@ impl ClosedDraw {
         if pipeline.compute || pipeline.mesh || pipeline.rectangles || pipeline.marks.is_some() {
             return Err(UnloweredShader::UnknownUserData);
         }
-        // SAFETY: query the retained native target description.
-        let format = target.desc.as_ref().map_or_else(
-            || unsafe { target.copy.texture.GetDesc() }.Format, |d| d.Format,
-        );
-        if pipeline.closed_color_format != Some(format)
+        let formats = pipeline.closed_color_formats.as_ref().ok_or(UnloweredShader::GraphicsState)?;
+        if formats.len() != targets.len()
             || pipeline.closed_depth_format != depth.as_ref().map(|d| d.format)
         {
             return Err(UnloweredShader::GraphicsState);
         }
         let shader = ShaderBindings::capture(pipeline, values, view, address)?;
-        if shader.samples_target(&target.copy) {
+        if depth.as_ref().is_some_and(|d| shader.samples_target(&d.copy)) {
             return Err(UnloweredShader::GraphicsState);
+        }
+        let extent = |desc: D3D12_RESOURCE_DESC| (desc.Width, desc.Height);
+        let mut first_extent = None;
+        for (index, (target, &format)) in targets.iter().zip(formats).enumerate() {
+            // SAFETY: target and depth both retain their native objects.
+            let desc = unsafe { target.copy.texture.GetDesc() };
+            let view_format = target.desc.as_ref().map_or(desc.Format, |d| d.Format);
+            if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN
+                || view_format != format
+                || shader.samples_target(&target.copy)
+                || depth.as_ref().is_some_and(|d| d.copy.texture == target.copy.texture)
+            {
+                return Err(UnloweredShader::GraphicsState);
+            }
+            if targets.len() > 1 {
+                if target.copy.uses_unproven_alias_backing()
+                    || targets[..index].iter().any(|other| other.copy.texture == target.copy.texture)
+                    || *first_extent.get_or_insert_with(|| extent(desc)) != extent(desc)
+                    || depth.as_ref().is_some_and(|d| d.copy.uses_unproven_alias_backing()
+                        || extent(unsafe { d.copy.texture.GetDesc() }) != extent(desc))
+                {
+                    return Err(UnloweredShader::GraphicsState);
+                }
+            }
         }
         Ok(Self {
             pipeline: pipeline.pso.clone(), root: pipeline.root.clone(),
-            target, depth, stencil_ref, topology, viewport, scissor, inputs, call, shader,
+            targets, depth, stencil_ref, topology, viewport, scissor, inputs, call, shader,
             blend_factor: [1.0; 4],
             sample: None,
         })
@@ -361,7 +384,17 @@ impl ClosedDraw {
         if self.depth.as_ref().is_some_and(|d| !d.authoritative(initialized)) {
             return Err(BatchError::TargetNotInitialized);
         }
-        initialized.require_native(host, list, batch, &self.target.copy)?;
+        // New guest views of a native allocation can be created after
+        // list capture. Recheck backing restrictions under the queue lock.
+        if self.targets.len() > 1
+            && (self.targets.iter().any(|t| t.copy.uses_unproven_alias_backing())
+                || self.depth.as_ref().is_some_and(|d| d.copy.uses_unproven_alias_backing()))
+        {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
+        for target in &self.targets {
+            initialized.require_native(host, list, batch, &target.copy)?;
+        }
         let indirect = match self.call {
             DrawCall::Indirect(draw) => Some(draw.prepare(host, list, batch, budget)?),
             _ => None,
@@ -374,11 +407,15 @@ impl ClosedDraw {
         }
         list.keep(&self.pipeline);
         list.keep(&self.root);
-        let texture = &self.target.copy.texture;
-        let before = initialized.state(&self.target.copy);
         let render_target = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        list.keep(texture);
-        let rtv = host.rtv(texture, self.target.desc.as_ref());
+        let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+        let mut states = [render_target; 8];
+        for (slot, target) in self.targets.iter().enumerate() {
+            let texture = &target.copy.texture;
+            states[slot] = initialized.state(&target.copy);
+            list.keep(texture);
+            rtvs[slot] = host.rtv(texture, target.desc.as_ref());
+        }
         let dsv = self.depth.as_ref().map(|d| d.begin(host, list, initialized));
         // SAFETY: the proven draw owns its pipeline, root and target. The
         // inputs were gathered in this same list from admitted pages.
@@ -387,8 +424,10 @@ impl ClosedDraw {
             // This encoder runs under the direct queue submission lock.
             // Restore the prior state in this list without speculative
             // changes to global state if a later operation rejects it.
-            if before != render_target {
-                cmd.ResourceBarrier(&[transition(texture, before, render_target)]);
+            for (target, before) in self.targets.iter().zip(states) {
+                if before != render_target {
+                    cmd.ResourceBarrier(&[transition(&target.copy.texture, before, render_target)]);
+                }
             }
             cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
             cmd.SetGraphicsRootSignature(&self.root);
@@ -402,7 +441,7 @@ impl ClosedDraw {
             cmd.RSSetScissorRects(&[self.scissor]);
             cmd.OMSetBlendFactor(Some(&self.blend_factor));
             cmd.OMSetStencilRef(self.stencil_ref);
-            cmd.OMSetRenderTargets(1, Some(&rtv), false, dsv.as_ref().map(|(h, _)| std::ptr::from_ref(h)));
+            cmd.OMSetRenderTargets(self.targets.len() as u32, Some(rtvs.as_ptr()), false, dsv.as_ref().map(|(h, _)| std::ptr::from_ref(h)));
             match self.call {
                 DrawCall::Direct { vertices, instances, first, first_instance } => {
                     cmd.DrawInstanced(vertices, instances, first, first_instance);
@@ -412,15 +451,19 @@ impl ClosedDraw {
                 }
                 DrawCall::Indirect(_) => indirect.as_ref().expect("indirect arguments prepared").execute(cmd),
             }
-            if before != render_target {
-                cmd.ResourceBarrier(&[transition(texture, render_target, before)]);
+            for (target, before) in self.targets.iter().zip(states) {
+                if before != render_target {
+                    cmd.ResourceBarrier(&[transition(&target.copy.texture, render_target, before)]);
+                }
             }
         }
         if let (Some(depth), Some((_, before))) = (&self.depth, dsv) {
             depth.end(list, before);
             initialized.record_write(&depth.copy)?;
         }
-        initialized.record_write(&self.target.copy)?;
+        for target in &self.targets {
+            initialized.record_write(&target.copy)?;
+        }
         Ok(())
     }
 }

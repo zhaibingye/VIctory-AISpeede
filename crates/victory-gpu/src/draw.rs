@@ -66,7 +66,7 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
-    page_target: Option<crate::page_draw::ColorTarget>,
+    page_targets: Option<Vec<crate::page_draw::ColorTarget>>,
     page_depth: Option<crate::page_draw::DepthTarget>,
     page_stencil: u32,
     page_viewport: Option<D3D12_VIEWPORT>,
@@ -337,7 +337,8 @@ impl State {
             return;
         };
         self.targets.clear();
-        self.page_target = None;
+        self.page_targets = None;
+        let mut page_targets = Vec::new();
         self.page_depth = None;
         let mut rtvs = Vec::new();
         for &h in handles {
@@ -355,16 +356,23 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
             let desc = record.desc();
-            if handles.len() == 1 {
-                self.page_target = crate::resource::host_copy(record.resource)
-                    .and_then(|copy| crate::page_draw::ColorTarget::capture_candidate(copy, desc));
-            }
-            if !cfg!(feature = "paged-title") {
+            if cfg!(feature = "paged-title") {
+                if let Some(target) = crate::resource::host_copy(record.resource)
+                    .and_then(|copy| crate::page_draw::ColorTarget::capture_candidate(copy, desc))
+                {
+                    page_targets.push(target);
+                }
+            } else {
                 rtvs.push(host.rtv(texture, desc.as_ref()));
             }
         }
         self.depth = 0;
         if cfg!(feature = "paged-title") {
+            // Reject the whole binding on a missing slot; never shift the
+            // shader's output indices to fit the descriptors we found.
+            if (1..=8).contains(&handles.len()) && page_targets.len() == handles.len() {
+                self.page_targets = Some(page_targets);
+            }
             if depth != 0 {
                 let depth_record = crate::descriptor::dsv_record(depth);
                 self.page_depth = depth_record.and_then(|record| {
@@ -412,7 +420,7 @@ impl State {
         if self.page_state_opaque || !matches!(self.topology, 1..=5) {
             return None;
         }
-        let target = self.page_target.clone()?;
+        let targets = self.page_targets.clone()?;
         let viewport = self.page_viewport?;
         let scissor = self.page_scissor?;
         let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
@@ -434,7 +442,7 @@ impl State {
             |slot, dword| self.page_word(false, slot, dword),
             |root, index| self.page_view(false, root, index),
             |slot| self.page_address(false, slot),
-            target,
+            targets,
             self.page_depth.clone(),
             self.page_stencil,
             D3D_PRIMITIVE_TOPOLOGY(self.topology as i32),

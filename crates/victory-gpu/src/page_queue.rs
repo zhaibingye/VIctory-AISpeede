@@ -64,14 +64,15 @@ fn physical_footprint(
 
 #[cfg(feature = "paged-title")]
 impl PageOp {
-    fn preserves_color(&self) -> Option<&std::sync::Arc<crate::resource::HostTexture>> {
-        match self {
+    fn preserved_colors<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
+        let target = match self {
             Self::CopyTexture(copy) => copy.preserves_color(),
             Self::UploadTexture(upload) => upload.preserves_color(),
-            Self::Draw(draw) => Some(draw.preserves_color()),
+            Self::Draw(draw) => return draw.preserved_colors(out),
             Self::Clear(clear) => clear.preserves_color(),
             _ => None,
-        }
+        };
+        out.extend(target);
     }
 
     fn writes_native<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
@@ -425,10 +426,12 @@ impl Host {
         let (ordinary_count, preserved, visible) = {
             let ordinary_count = ranges.len();
             let mut preserved = BTreeMap::new();
+            let mut preserve_targets = Vec::new();
             for op in ops {
-                if let Some(target) = op.preserves_color()
-                    && let Some(layout) = target.compatible_texture_source()
-                {
+                op.preserved_colors(&mut preserve_targets);
+            }
+            for target in preserve_targets {
+                if let Some(layout) = target.compatible_texture_source() {
                     let key = std::sync::Arc::as_ptr(target) as usize;
                     if let std::collections::btree_map::Entry::Vacant(entry) = preserved.entry(key) {
                         let start = ranges.len();

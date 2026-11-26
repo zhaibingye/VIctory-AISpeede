@@ -885,11 +885,15 @@ impl HostTexture {
         )
     }
 
+    pub(crate) fn uses_unproven_alias_backing(&self) -> bool {
+        use victory_memory::authority::ByteExposure::*;
+        self.byte_exposure.load(std::sync::atomic::Ordering::Acquire)
+            & ((SharedHeap as u8) | (ExternalAddress as u8)) != 0
+    }
+
     #[cfg(feature = "paged-title")]
     fn exact_committed_bytes(&self) -> Option<crate::page_texture::LinearTexture> {
-        use victory_memory::authority::ByteExposure::*;
-        let flags = self.byte_exposure.load(std::sync::atomic::Ordering::Acquire);
-        if flags & ((SharedHeap as u8) | (ExternalAddress as u8)) != 0 {
+        if self.uses_unproven_alias_backing() {
             return None;
         }
         self.committed_linear.get().copied()
