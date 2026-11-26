@@ -19,8 +19,8 @@ pub struct StaticTextureSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StaticViewAccess {
     TextureRead,
-    /// An immediate aligned write relative to the raw buffer descriptor.
-    RawWrite { offset: u32, bytes: u32 },
+    /// An immediate aligned byte window on a raw UAV, as used by DXIL.
+    RawUav { offset: u32, bytes: u32, write: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,7 +37,7 @@ pub fn static_texture_slots(container: &[u8]) -> Result<Option<Vec<StaticTexture
     }))
 }
 
-/// Prove descriptor operands and raw store byte windows from native
+/// Prove descriptor operands and raw access byte windows from native
 /// instructions, not inferred from resource declarations. Excludes
 /// arbitrary addresses and does not by itself admit a host shader.
 pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>, ShaderError> {
@@ -70,7 +70,7 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
             && (name.starts_with("image_sample") || matches!(name, "image_load" | "image_load_mip"))
         {
             StaticViewAccess::TextureRead
-        } else if let Some(access) = immediate_raw_store(name, &inst.fields) {
+        } else if let Some(access) = immediate_raw_access(name, &inst.fields) {
             access
         } else {
             return Ok(None);
@@ -89,12 +89,18 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
     Ok(Some(slots.into_iter().collect()))
 }
 
-fn immediate_raw_store(name: &str, fields: &Fields) -> Option<StaticViewAccess> {
-    let bytes = match name {
-        "buffer_store_dword" => 4,
-        "buffer_store_dwordx2" => 8,
-        "buffer_store_dwordx3" => 12,
-        "buffer_store_dwordx4" => 16,
+fn immediate_raw_access(name: &str, fields: &Fields) -> Option<StaticViewAccess> {
+    let (operation, width) = name.strip_prefix("buffer_")?.split_once('_')?;
+    let write = match operation {
+        "store" => true,
+        "load" => false,
+        _ => return None,
+    };
+    let bytes = match width {
+        "dword" => 4,
+        "dwordx2" => 8,
+        "dwordx3" => 12,
+        "dwordx4" => 16,
         _ => return None,
     };
     let Fields::Buffer {
@@ -105,7 +111,7 @@ fn immediate_raw_store(name: &str, fields: &Fields) -> Option<StaticViewAccess> 
     {
         return None;
     }
-    Some(StaticViewAccess::RawWrite { offset: u32::from(*offset), bytes })
+    Some(StaticViewAccess::RawUav { offset: u32::from(*offset), bytes, write })
 }
 
 fn table_slot(address: Address, first: u8) -> Option<u32> {
@@ -130,14 +136,19 @@ fn proven_slot(
     if param.root != RootType::Table {
         return None;
     }
+    // Match the translator's used-kind selection first; skipping a
+    // mismatched declaration here can otherwise prove the wrong DXIL view.
     let relevant = native.used.iter().filter(|u| {
         u.root == RootType::Table && u.user_data == param.user_data
-            && u.slot == param.slot && u.table_offset_dwords <= index * 8
+            && u.table_offset_dwords <= index * 8
     });
     let used = relevant.clone().max_by_key(|u| u.table_offset_dwords)?;
+    if used.slot != param.slot {
+        return None;
+    }
     let admitted = match access {
         StaticViewAccess::TextureRead => used.kind == ResourceType::Srv && used.dwords == 8,
-        StaticViewAccess::RawWrite { .. } => {
+        StaticViewAccess::RawUav { .. } => {
             used.kind == ResourceType::Uav && used.dwords == 4 && used.stride == 0
                 && relevant.filter(|u| u.table_offset_dwords == used.table_offset_dwords).count() == 1
         }

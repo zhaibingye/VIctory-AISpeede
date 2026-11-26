@@ -304,7 +304,7 @@ impl ShaderBindings {
                 &t.host, &t.used, stage.user_data, &values,
                 |root| slots.iter().any(|s| s.slot.root == root),
                 |root| pipeline.compute && slots.iter().any(|s| {
-                    s.slot.root == root && matches!(s.access, StaticViewAccess::RawWrite { .. })
+                    s.slot.root == root && matches!(s.access, StaticViewAccess::RawUav { .. })
                 }),
                 |slot| stage.root_cbvs.iter().any(|&(bound, _)| bound == slot),
             )? {
@@ -320,7 +320,7 @@ impl ShaderBindings {
                         let bound = match proof.access {
                             StaticViewAccess::TextureRead => ClosedView::Texture(
                                 actual.paged_texture_srv().ok_or(UnloweredShader::DescriptorTable)?),
-                            StaticViewAccess::RawWrite { .. } if pipeline.compute => {
+                            StaticViewAccess::RawUav { .. } if pipeline.compute => {
                                 let (start, end) = crate::descriptor::host::paged_raw_range(&actual)
                                     .ok_or(UnloweredShader::DescriptorTable)?;
                                 ClosedView::Raw(BoundedRawUav::new(start, end)
@@ -332,8 +332,8 @@ impl ShaderBindings {
                     }
                     match (table.get_mut(&slot.index), proof.access) {
                         (Some(ClosedView::Texture(_)), StaticViewAccess::TextureRead) => {},
-                        (Some(ClosedView::Raw(raw)), StaticViewAccess::RawWrite { offset, bytes }) => {
-                            raw.allow_write(offset, bytes).ok_or(UnloweredShader::DescriptorTable)?;
+                        (Some(ClosedView::Raw(raw)), StaticViewAccess::RawUav { offset, bytes, write }) => {
+                            raw.allow_access(offset, bytes, write).ok_or(UnloweredShader::DescriptorTable)?;
                         }
                         _ => return Err(reject),
                     }
@@ -364,7 +364,7 @@ impl ShaderBindings {
             .any(|view| matches!(view, ClosedView::Texture(tex) if tex.aliases_target(target)))
     }
 
-    pub(crate) fn writes_raw(&self) -> bool {
+    pub(crate) fn uses_raw_uav(&self) -> bool {
         self.tables.values().flat_map(|table| table.values())
             .any(|view| matches!(view, ClosedView::Raw(_)))
     }

@@ -77,7 +77,7 @@ impl RawClear {
     }
 }
 
-/// A captured descriptor prefix and its independently proven store windows.
+/// A captured descriptor prefix and its independently proven access windows.
 /// Keeping the prefix preserves byte offsets in the translated shader.
 pub(crate) struct BoundedRawUav {
     start: u64,
@@ -92,14 +92,16 @@ impl BoundedRawUav {
             .then_some(Self { start, limit, end: start, writes: Vec::new() })
     }
 
-    pub(crate) fn allow_write(&mut self, offset: u32, bytes: u32) -> Option<()> {
+    pub(crate) fn allow_access(&mut self, offset: u32, bytes: u32, write: bool) -> Option<()> {
         let start = self.start.checked_add(u64::from(offset))?;
         let end = start.checked_add(u64::from(bytes))?;
         if bytes == 0 || !offset.is_multiple_of(4) || !bytes.is_multiple_of(4) || end > self.limit {
             return None;
         }
         self.end = self.end.max(end);
-        self.writes.push((start, end));
+        if write {
+            self.writes.push((start, end));
+        }
         Some(())
     }
 

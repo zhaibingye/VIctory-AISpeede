@@ -70,7 +70,7 @@ impl ClosedDispatch {
             None
         };
         let words = self.shader.prepare(host, list, batch, descriptors, plan, dirty)?;
-        if self.shader.writes_raw() {
+        if self.shader.uses_raw_uav() {
             crate::page_resource::PageBarrier::Uav.encode(list, plan)?;
         }
         list.keep(&self.pipeline);
