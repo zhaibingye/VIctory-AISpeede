@@ -45,6 +45,7 @@ pub(crate) enum PageOp {
     ClearDepth(std::sync::Arc<crate::page_draw::DepthClear>),
     Barrier(std::sync::Arc<crate::page_resource::PageBarrier>),
     ClearRaw(std::sync::Arc<crate::page_uav::RawClear>),
+    ClearUavTexture(std::sync::Arc<crate::page_uav::TextureClear>),
 }
 
 #[cfg(feature = "paged-title")]
@@ -70,6 +71,7 @@ impl PageOp {
             Self::UploadTexture(upload) => upload.preserves_color(),
             Self::Draw(draw) => return draw.preserved_colors(out),
             Self::Clear(clear) => clear.preserves_color(),
+            Self::ClearUavTexture(clear) => clear.preserves_color(),
             _ => None,
         };
         out.extend(target);
@@ -82,6 +84,7 @@ impl PageOp {
             Self::Draw(draw) => draw.written_targets(out),
             Self::Clear(clear) => clear.written_targets(out),
             Self::ClearDepth(clear) => clear.written_targets(out),
+            Self::ClearUavTexture(clear) => out.push(clear.target()),
             _ => {},
         }
     }
@@ -120,7 +123,7 @@ impl ClosedTitleBatch {
         let mut outputs = Vec::new();
         for op in &self.0 {
             if !matches!(op,
-                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_)
+                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_) | PageOp::Barrier(_)
                 | PageOp::CopyTexture(_) | PageOp::Draw(_))
             {
                 return false;
@@ -201,7 +204,7 @@ impl ClosedFootprint {
                 PageOp::ClearRaw(clear) => ranges.push(clear.range()?),
                 PageOp::Dispatch(dispatch) => dispatch.ranges(&mut ranges)?,
                 PageOp::CopyTexture(copy) => copy.ranges(&mut ranges)?,
-                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
+                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_) | PageOp::Barrier(_) => {},
             }
         }
         #[cfg(feature = "paged-title")]
@@ -342,6 +345,7 @@ pub(crate) struct PageDescriptors<'a> {
     textures: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>,
     raw_views: Vec<(u32, bool)>,
     structured_views: Vec<(u32, u32)>,
+    texture_uavs: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>,
 }
 
 pub(crate) enum TableDescriptor {
@@ -398,6 +402,15 @@ impl PageDescriptors<'_> {
         Ok(first)
     }
 
+    pub(crate) fn reserve_texture_uav(
+        &mut self, texture: &ID3D12Resource, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    ) -> Result<u32> {
+        let slot = self.heap.dynamic(1).ok_or_else(oom)?;
+        self.heap.paged_texture_uav_at(slot, Some(texture), format);
+        self.texture_uavs.push((slot, format));
+        Ok(slot)
+    }
+
     pub(crate) fn reserve_texture(
         &mut self,
         texture: &ID3D12Resource,
@@ -412,6 +425,10 @@ impl PageDescriptors<'_> {
 
 impl Drop for PageDescriptors<'_> {
     fn drop(&mut self) {
+        for (slot, format) in self.texture_uavs.drain(..) {
+            self.heap.paged_texture_uav_at(slot, None, format);
+            self.heap.release(slot, 1);
+        }
         for (slot, stride) in self.structured_views.drain(..) {
             self.heap.paged_structured_at(slot, None, 0, 1, stride);
             self.heap.release(slot, 1);
@@ -615,6 +632,7 @@ impl Host {
                 PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,
                 PageOp::Barrier(barrier) => barrier.encode(list, targets)?,
                 PageOp::ClearRaw(clear) => clear.encode(self, list, batch, descriptors, targets, &mut dirty)?,
+                PageOp::ClearUavTexture(clear) => clear.encode(self, list, batch, descriptors, targets)?,
             }
         }
         Ok(dirty)
@@ -740,6 +758,7 @@ fn submit_work<'a>(
         textures: Vec::new(),
         raw_views: Vec::new(),
         structured_views: Vec::new(),
+        texture_uavs: Vec::new(),
     };
     let reusable = matches!(writes, WriteSet::Declared);
     let list = if reusable { host.acquire_paged_list() } else { host.new_list() }.map_err(native)?;

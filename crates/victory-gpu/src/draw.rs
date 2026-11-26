@@ -963,13 +963,19 @@ impl State {
         rects: &[RECT],
     ) {
         if cfg!(feature = "paged-title") {
-            let clear = (!float && rects.is_empty()).then(|| crate::descriptor::view(cpu)).flatten()
-                .and_then(|view| crate::descriptor::host::paged_raw_clear(&view, values));
-            if let Some(clear) = clear {
-                list.record_page_raw_clear(clear);
-            } else {
-                list.mark_unlowered();
+            if let Some(view) = crate::descriptor::view(cpu) {
+                if !float && rects.is_empty()
+                    && let Some(clear) = crate::descriptor::host::paged_raw_clear(&view, values)
+                {
+                    list.record_page_raw_clear(clear);
+                    return;
+                }
+                if let Some(clear) = crate::descriptor::host::paged_texture_clear(&view, values, float, rects) {
+                    list.record_page_texture_clear(clear);
+                    return;
+                }
             }
+            list.mark_unlowered();
             return;
         }
         let Some(view) = crate::descriptor::view(cpu) else {

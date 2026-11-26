@@ -700,6 +700,16 @@ impl HostHeap {
         self.keep(index, texture.map(|t| (t.clone(), None)));
     }
 
+    pub(crate) fn paged_texture_uav_at(
+        &self, index: u32, texture: Option<&ID3D12Resource>, format: DXGI_FORMAT,
+    ) {
+        let Some(host) = host() else { return; };
+        let desc = paged_texture_uav_desc(format);
+        // SAFETY: this slot is owned by the reservation and retains the texture.
+        unsafe { host.device.CreateUnorderedAccessView(texture, None, Some(&desc), self.cpu(index)) };
+        self.keep(index, texture.map(|resource| (resource.clone(), None)));
+    }
+
     /// Installs a bounded structured buffer SRV in a dynamic table slot.
     pub(crate) fn paged_structured_at(
         &self, index: u32, resource: Option<&ID3D12Resource>, offset: u64, elements: u32, stride: u32,
@@ -922,6 +932,43 @@ pub(super) fn paged_depth_srv_format(words: &[u32; 10]) -> Option<DXGI_FORMAT> {
     let view = unsafe { desc.Anonymous.Texture2D };
     (view.MostDetailedMip == 0 && view.MipLevels == 1 && view.PlaneSlice == 0
         && view.ResourceMinLODClamp == 0.0).then_some(desc.Format)
+}
+
+pub(crate) fn paged_texture_uav_desc(format: DXGI_FORMAT) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 },
+        },
+    }
+}
+
+pub(crate) fn paged_texture_clear(
+    view: &View, values: [u32; 4], float: bool, rects: &[windows::Win32::Foundation::RECT],
+) -> Option<crate::page_uav::TextureClear> {
+    let View::Unordered(resource, 0, words) = view else { return None; };
+    let resource = *resource as crate::object::This;
+    if crate::resource::stands_in(resource) {
+        return None;
+    }
+    let format = if let Some(words) = words {
+        let desc = uav_desc(words);
+        if desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D {
+            return None;
+        }
+        // SAFETY: the dimension selects Texture2D.
+        let tex = unsafe { desc.Anonymous.Texture2D };
+        if tex.MipSlice != 0 || tex.PlaneSlice != 0 {
+            return None;
+        }
+        Some(desc.Format)
+    } else {
+        Some(DXGI_FORMAT(crate::resource::title_format(resource)? as i32))
+    };
+    crate::page_uav::TextureClear::capture(
+        crate::resource::host_copy(resource)?, format, values, float, rects,
+    )
 }
 
 pub(crate) fn raw_uav_desc(first: u64, elements: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {

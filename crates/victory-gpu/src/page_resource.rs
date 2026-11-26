@@ -181,7 +181,6 @@ fn single_color(d: D3D12_RESOURCE_DESC) -> bool {
     d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
         && d.MipLevels == 1 && d.DepthOrArraySize == 1
         && d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0
-        && d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
         && !d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
 }
 
@@ -212,7 +211,8 @@ impl TextureUpload {
         let end_y = y.checked_add(source.height)?;
         // SAFETY: the retained resource is live.
         let desc = unsafe { target.texture.GetDesc() };
-        if !single_color(desc) || target.sparse.is_some()
+        if !single_color(desc) || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+            || target.sparse.is_some()
             || target.twin.get().is_some_and(Option::is_some)
             || end_x > desc.Width || end_y > desc.Height
             || desc.Format != source.format
@@ -251,7 +251,9 @@ impl TextureReadback {
     pub(crate) fn capture(source: Arc<HostTexture>, target: crate::page_texture::LinearTexture) -> Option<Self> {
         // SAFETY: the retained resource is live.
         let desc = unsafe { source.texture.GetDesc() };
-        if !single_color(desc) || source.sparse.is_some()
+        if !single_color(desc)
+            || desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0
+            || source.sparse.is_some()
             || source.twin.get().is_some_and(Option::is_some)
             || desc.Width != u64::from(target.width) || desc.Height != target.height
             || desc.Format != target.format
@@ -328,6 +330,8 @@ impl TextureCopy {
         let (a, b) = unsafe { (src.texture.GetDesc(), dst.texture.GetDesc()) };
         if Arc::ptr_eq(&src, &dst) || src.texture == dst.texture
             || !single_color(a) || !single_color(b)
+            || !a.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+            || !b.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
             || a.Format != b.Format
             || src.sparse.is_some() || dst.sparse.is_some()
             || src.twin.get().is_some_and(Option::is_some)

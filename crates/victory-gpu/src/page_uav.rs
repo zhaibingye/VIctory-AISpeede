@@ -77,6 +77,111 @@ impl RawClear {
     }
 }
 
+/// A clear of a single typed native texture subresource. No guest
+/// temporary texture or copy is needed to perform the clear.
+pub(crate) struct TextureClear {
+    target: std::sync::Arc<crate::resource::HostTexture>,
+    format: DXGI_FORMAT,
+    values: [u32; 4],
+    float: bool,
+    rects: Vec<RECT>,
+    replaces_all: bool,
+}
+
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
+
+impl TextureClear {
+    pub(crate) fn capture(
+        target: std::sync::Arc<crate::resource::HostTexture>,
+        view: Option<DXGI_FORMAT>, values: [u32; 4], float: bool, rects: &[RECT],
+    ) -> Option<Self> {
+        // SAFETY: the retained native allocation is live.
+        let desc = unsafe { target.texture.GetDesc() };
+        let format = view.unwrap_or(desc.Format);
+        let typed = if float {
+            matches!(format, DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R16G16B16A16_FLOAT
+                | DXGI_FORMAT_R8G8B8A8_UNORM)
+        } else {
+            matches!(format, DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8B8A8_UINT)
+        };
+        if !typed || desc.Format != format || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
+            || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
+            || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+            || desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+            || target.sparse.is_some() || target.twin.get().is_some_and(Option::is_some)
+            || target.uses_unproven_alias_backing()
+        {
+            return None;
+        }
+        let (w, h) = (i32::try_from(desc.Width).ok()?, i32::try_from(desc.Height).ok()?);
+        if rects.iter().any(|r| r.left < 0 || r.top < 0 || r.left >= r.right || r.top >= r.bottom
+            || r.right > w || r.bottom > h)
+        {
+            return None;
+        }
+        let replaces_all = rects.is_empty() || rects.iter().any(|r| {
+            r.left == 0 && r.top == 0 && r.right == w && r.bottom == h
+        });
+        Some(Self { target, format, values, float, rects: rects.to_vec(), replaces_all })
+    }
+
+    pub(crate) fn target(&self) -> &std::sync::Arc<crate::resource::HostTexture> {
+        &self.target
+    }
+
+    pub(crate) fn preserves_color(&self) -> Option<&std::sync::Arc<crate::resource::HostTexture>> {
+        (!self.replaces_all).then_some(&self.target)
+    }
+
+    pub(crate) fn encode(
+        &self, host: &Host, list: &HostList, pages: &PinnedBatch,
+        descriptors: &mut PageDescriptors<'_>, resources: &mut ResourcePlan,
+    ) -> Result<(), BatchError> {
+        if self.target.uses_unproven_alias_backing() || self.target.twin.get().is_some_and(Option::is_some) {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: self.format, ..Default::default() };
+        // SAFETY: the feature query writes this exact structure.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut support).cast(), size_of_val(&support) as u32,
+            )
+        }.map_err(BatchError::Native)?;
+        if !support.Support1.contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
+            || !support.Support2.contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)
+        {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
+        if !self.replaces_all {
+            resources.require_native(host, list, pages, &self.target)?;
+        }
+        resources.transition_texture(list, &self.target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32)?;
+        PageBarrier::Uav.encode(list, resources)?;
+        let texture = &self.target.texture;
+        list.keep(texture);
+        let slot = descriptors.reserve_texture_uav(texture, self.format).map_err(BatchError::Native)?;
+        let cpu = host.cpu_view();
+        let view = crate::descriptor::host::paged_texture_uav_desc(self.format);
+        // SAFETY: both descriptors describe the same retained texture
+        // in UNORDERED_ACCESS and every rectangle fits its subresource.
+        unsafe {
+            host.device.CreateUnorderedAccessView(texture, None, Some(&view), cpu);
+            let cmd = list.recording();
+            cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
+            let gpu = descriptors.heap.gpu(slot);
+            if self.float {
+                cmd.ClearUnorderedAccessViewFloat(gpu, cpu, texture, &self.values.map(f32::from_bits), &self.rects);
+            } else {
+                cmd.ClearUnorderedAccessViewUint(gpu, cpu, texture, &self.values, &self.rects);
+            }
+        }
+        PageBarrier::Uav.encode(list, resources)?;
+        resources.record_write(&self.target)
+    }
+}
+
 /// A captured descriptor prefix and its independently proven access windows.
 /// Keeping the prefix preserves byte offsets in the translated shader.
 pub(crate) struct BoundedRawView {
