@@ -26,6 +26,7 @@ struct NativeWriteTrace {
     pages: std::collections::BTreeSet<PhysicalPage>,
     without_layout: usize,
     without_mapping: usize,
+    known_private_heap: usize,
     truncated: bool,
 }
 
@@ -36,19 +37,26 @@ static NATIVE_WRITES: std::sync::LazyLock<std::sync::Mutex<NativeWriteTrace>> = 
 impl NativeWriteTrace {
     const MAX_PAGES: usize = 32_768;
 
-    fn capture(spans: impl Iterator<Item = Option<(u64, u64)>> + Clone) -> Self {
+    fn capture(spans: impl Iterator<Item = Option<(u64, u64)>>) -> Self {
         let mut backing = crate::title_backing::SubmissionBacking::default();
-        for (start, end) in spans.clone().flatten() {
-            backing.include(start as usize, end as usize);
-        }
-        backing.flush();
         let mut result = Self::default();
+        let mut pinned_spans = Vec::new();
         for span in spans {
             let Some((start, end)) = span else {
                 result.without_layout += 1;
                 continue;
             };
-            let Some(runs) = backing.pins().physical_runs(start as usize, end as usize) else {
+            let (start, end) = (start as usize, end as usize);
+            if crate::title_backing::is_private_heap_span(start, end) {
+                result.known_private_heap += 1;
+            } else {
+                backing.include(start, end);
+                pinned_spans.push((start, end));
+            }
+        }
+        backing.flush();
+        for (start, end) in pinned_spans {
+            let Some(runs) = backing.pins().physical_runs(start, end) else {
                 result.without_mapping += 1;
                 continue;
             };
@@ -72,6 +80,7 @@ impl NativeWriteTrace {
     fn merge(&mut self, other: Self) {
         self.without_layout = self.without_layout.saturating_add(other.without_layout);
         self.without_mapping = self.without_mapping.saturating_add(other.without_mapping);
+        self.known_private_heap = self.known_private_heap.saturating_add(other.known_private_heap);
         self.truncated |= other.truncated;
         for id in other.pages {
             if self.pages.len() == Self::MAX_PAGES && !self.pages.contains(&id) {
@@ -93,10 +102,11 @@ pub(crate) fn trace_rejected_shared_read(span: Option<(u64, u64)>) {
         known_overlap = !writers.pages.is_disjoint(&read.pages),
         read_pages = read.pages.len(),
         completed_write_pages = writers.pages.len(),
-        incomplete_read = read.incomplete(),
+        incomplete_read = read.incomplete() || read.known_private_heap != 0,
         incomplete_history = writers.incomplete(),
         writers_without_layout = writers.without_layout,
         writers_without_mapping = writers.without_mapping,
+        writers_on_default_private_heap = writers.known_private_heap,
         history_truncated = writers.truncated,
         "共享纹理拒绝：已完成原生写入与读取物理范围对比"
     );
