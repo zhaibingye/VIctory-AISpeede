@@ -162,10 +162,16 @@ impl SubmissionBacking {
         // changed byte. Publish their spans without reading or rewriting
         // neighboring CPU bytes, even if they changed during retirement.
         let exact_only = !overwrites.is_empty() && changes_contained(before, gpu, overwrites);
+        let mut mixed = [const { 0..0 }; SMALL_WRITEBACK];
+        let spans = if exact_only {
+            Some(overwrites)
+        } else {
+            sparse_writeback(before, gpu, overwrites, &mut mixed).map(|count| &mixed[..count])
+        };
         self.write_delta(va, PAGE, |target| {
-            if exact_only {
+            if let Some(spans) = spans {
                 let _writing = target.original_va.then(|| crate::watch::writing(va, PAGE));
-                return overwrites.iter().all(|span| crate::host::write_mapped_exact(
+                return spans.iter().all(|span| crate::host::write_mapped_exact(
                     (target.address + span.start) as *mut u8, &gpu[span.clone()],
                 ));
             }
@@ -236,6 +242,38 @@ fn changes_contained(before: &[u8], gpu: &[u8], overwrites: &[std::ops::Range<us
     before[cursor..] == gpu[cursor..]
 }
 
+/// Bound extra kernel copies for pages with fragmented shader writes.
+const SMALL_WRITEBACK: usize = 8;
+
+/// Combine declared intervals and observed differences. A gap is never
+/// included in a direct store just to stay under the syscall budget.
+fn sparse_writeback(
+    before: &[u8], gpu: &[u8], overwrites: &[std::ops::Range<usize>],
+    output: &mut [std::ops::Range<usize>],
+) -> Option<usize> {
+    let mut count = 0;
+    let mut next = overwrites.iter().peekable();
+    let mut at = 0;
+    while at < before.len() {
+        let end = if let Some(span) = next.next_if(|span| span.start == at) {
+            span.end
+        } else if before[at] != gpu[at] {
+            at + 1
+        } else {
+            at += 1;
+            continue;
+        };
+        if count > 0 && output[count - 1].end == at {
+            output[count - 1].end = end;
+        } else {
+            *output.get_mut(count)? = at..end;
+            count += 1;
+        }
+        at = end;
+    }
+    Some(count)
+}
+
 fn merge_page_delta(cpu: &mut [u8], before: &[u8], gpu: &[u8]) -> bool {
     let mut changed = 0u8;
     for ((current, &original), &result) in cpu.iter_mut().zip(before).zip(gpu) {
@@ -245,6 +283,15 @@ fn merge_page_delta(cpu: &mut [u8], before: &[u8], gpu: &[u8]) -> bool {
         changed |= delta;
     }
     changed != 0
+}
+
+#[cfg(test)]
+#[test]
+fn sparse_writeback_keeps_gaps_and_adjacent_writes_exact() {
+    let mut output = [0..0, 0..0];
+    assert_eq!(sparse_writeback(&[0; 8], &[0, 1, 0, 0, 0, 0, 1, 0], &[2..3], &mut output), Some(2));
+    assert_eq!(output, [1..3, 6..7]);
+    assert_eq!(sparse_writeback(&[0; 8], &[0, 1, 0, 1, 0, 1, 0, 0], &[], &mut output), None);
 }
 
 #[cfg(test)]
