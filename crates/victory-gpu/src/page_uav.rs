@@ -105,6 +105,8 @@ pub(crate) enum TextureUavReject {
     Alias { external: bool, sparse: bool, twin: bool, pointer: bool },
     VolumeShape { dimension: i32, mip: u32, mip_count: u16, depth: u16, samples: u32 },
     ViewRange { first: u32, count: u32, depth: u16 },
+    #[cfg(feature = "paged-title")]
+    ExternalVolumeLayout { layout: Option<u32> },
     Subresource,
 }
 
@@ -116,7 +118,9 @@ struct NativeTextureUav {
 }
 
 impl NativeTextureUav {
-    fn capture(target: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT, selection: Option<TextureUavSelection>) -> Result<Self, TextureUavReject> {
+    fn capture(target: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT,
+        selection: Option<TextureUavSelection>, byte_backed: bool,
+    ) -> Result<Self, TextureUavReject> {
         use TextureUavReject::*;
         // SAFETY: the retained native allocation is live.
         let desc = unsafe { target.texture.GetDesc() };
@@ -127,7 +131,7 @@ impl NativeTextureUav {
             target.uses_unproven_alias_backing(), target.sparse.is_some(),
             target.twin.get().is_some_and(Option::is_some), target.has_pointer_exposure(),
         );
-        if external || sparse || twin {
+        if external && !byte_backed || sparse || twin {
             return Err(Alias { external, sparse, twin, pointer });
         }
         if selection.is_none() && desc.MipLevels != 1 { return Err(ViewShape); }
@@ -153,7 +157,7 @@ impl NativeTextureUav {
                 .ok_or(ViewRange { first: depth.first, count: depth.count, depth: desc.DepthOrArraySize })?);
             return Ok(Self { target, format, selection, subresources: vec![sub] });
         }
-        if selection.slices.is_none() && desc.DepthOrArraySize != 1 {
+        if byte_backed || selection.slices.is_none() && desc.DepthOrArraySize != 1 {
             return Err(ViewShape);
         }
         let slices = selection.slices.unwrap_or(MipSelection::SINGLE);
@@ -168,8 +172,8 @@ impl NativeTextureUav {
         Ok(Self { target, format, selection, subresources })
     }
 
-    fn check_native(&self, host: &Host) -> Result<(), BatchError> {
-        if !self.subresources.iter().all(|sub| sub.allows(&self.target)) || self.target.uses_unproven_alias_backing()
+    fn check_native(&self, host: &Host, byte_backed: bool) -> Result<(), BatchError> {
+        if !self.subresources.iter().all(|sub| sub.allows(&self.target)) || (self.target.uses_unproven_alias_backing() && !byte_backed)
             || self.target.twin.get().is_some_and(Option::is_some)
             || self.selection.volume.is_some() && self.target.has_pointer_exposure()
         {
@@ -195,15 +199,38 @@ impl NativeTextureUav {
 
 /// Exact shader UAV that names an ordered native version. It conserves
 /// existing contents: a bounded shader store is not a full overwrite proof.
-pub(crate) struct ShaderTextureUav(NativeTextureUav);
+pub(crate) struct ShaderTextureUav(
+    NativeTextureUav,
+    #[cfg(feature = "paged-title")] Option<crate::page_texture::LinearVolume>,
+);
 
 impl ShaderTextureUav {
-    pub(crate) fn capture(target: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT, selection: Option<TextureUavSelection>) -> Result<Self, TextureUavReject> {
+    pub(crate) fn capture(target: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT,
+        selection: Option<TextureUavSelection>, resource: crate::object::This,
+    ) -> Result<Self, TextureUavReject> {
         if selection.is_some_and(|view| view.slices.is_some()) { return Err(TextureUavReject::ViewShape); }
         if !matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R16G16B16A16_FLOAT) {
             return Err(TextureUavReject::UnsupportedFormat);
         }
-        NativeTextureUav::capture(target, format, selection).map(Self)
+        #[cfg(feature = "paged-title")]
+        let backing = if target.uses_unproven_alias_backing() && selection.is_some_and(|s| s.volume.is_some()) {
+            Some(crate::resource::address_linear_volume(resource)
+                .filter(|v| v.plane.format == format)
+                .ok_or_else(|| TextureUavReject::ExternalVolumeLayout {
+                    layout: crate::resource::title_texture_layout(resource),
+                })?)
+        } else { None };
+        #[cfg(feature = "paged-title")]
+        {
+            let native = NativeTextureUav::capture(target, format, selection, backing.is_some())?;
+            // 原生体纹理必须与字节后备尺寸完全相同；整个 W 范围仍由视图约束。
+            return Ok(Self(native, backing));
+        }
+        #[cfg(not(feature = "paged-title"))]
+        {
+            let _ = resource;
+            NativeTextureUav::capture(target, format, selection, false).map(Self)
+        }
     }
 
     pub(crate) fn target(&self) -> &std::sync::Arc<crate::resource::HostTexture> {
@@ -223,7 +250,22 @@ impl ShaderTextureUav {
             }
     }
 
-    pub(crate) fn record_write(&self, resources: &mut ResourcePlan) -> Result<(), BatchError> {
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn byte_backing(&self) -> Option<crate::page_texture::LinearVolume> { self.1 }
+
+    pub(crate) fn finish_write(
+        &self, host: &Host, list: &HostList, pages: &PinnedBatch, resources: &mut ResourcePlan,
+        dirty: &mut BTreeSet<PhysicalPage>,
+    ) -> Result<(), BatchError> {
+        #[cfg(feature = "paged-title")]
+        if let Some(backing) = self.byte_backing() {
+            self.0.check_native(host, true)?;
+            resources.transition_texture(list, self.target(), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)?;
+            // 页池仍是权威。先散回同一组固定物理页，交给现有 Fence 发布。
+            return backing.transfer(host, list, pages, &self.target().texture, Some(dirty));
+        }
+        #[cfg(not(feature = "paged-title"))]
+        let _ = (host, list, pages, dirty);
         resources.record_color_write(self.target(), self.subresource())
     }
 
@@ -231,7 +273,23 @@ impl ShaderTextureUav {
         &self, host: &Host, list: &HostList, pages: &PinnedBatch, resources: &mut ResourcePlan,
         shared: Option<&mut crate::page_texture::ScopedTextureAccess>,
     ) -> Result<crate::page_queue::TableDescriptor, BatchError> {
-        self.0.check_native(host)?;
+        #[cfg(feature = "paged-title")]
+        let backing = self.byte_backing();
+        #[cfg(feature = "paged-title")]
+        self.0.check_native(host, backing.is_some())?;
+        #[cfg(not(feature = "paged-title"))]
+        self.0.check_native(host, false)?;
+        #[cfg(feature = "paged-title")]
+        if let Some(backing) = backing {
+            if shared.is_some() || resources.authoritative(self.target()) {
+                return Err(BatchError::UnsupportedTextureMap);
+            }
+            resources.transition_texture(list, self.target(), D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
+            backing.transfer(host, list, pages, &self.target().texture, None)?;
+        } else {
+            resources.require_color_subresource(host, list, pages, self.target(), self.subresource())?;
+        }
+        #[cfg(not(feature = "paged-title"))]
         resources.require_color_subresource(host, list, pages, self.target(), self.subresource())?;
         let texture = &self.target().texture;
         let wanted = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -266,7 +324,7 @@ impl TextureClear {
             matches!(format, DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8B8A8_UINT)
         };
         if !typed { return None; }
-        let view = NativeTextureUav::capture(target, format, selection).ok()?;
+        let view = NativeTextureUav::capture(target, format, selection, false).ok()?;
         if view.selection.volume.is_some() { return None; }
         let sub = view.subresources[0];
         let (w, h) = (i32::try_from(sub.width).ok()?, i32::try_from(sub.height).ok()?);
@@ -293,7 +351,7 @@ impl TextureClear {
         &self, host: &Host, list: &HostList, pages: &PinnedBatch,
         descriptors: &mut PageDescriptors<'_>, resources: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
-        self.view.check_native(host)?;
+        self.view.check_native(host, false)?;
         let subs = &self.view.subresources;
         if !self.replaces_all {
             for &sub in subs {

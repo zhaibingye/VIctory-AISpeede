@@ -83,6 +83,8 @@ impl ClosedDispatch {
         plan: &mut crate::page_resource::ResourcePlan,
         dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
     ) -> Result<(), BatchError> {
+        #[cfg(feature = "paged-title")]
+        self.shader.verify_shared_volume(batch, matches!(self.call, DispatchCall::Indirect(_)))?;
         let args = if let DispatchCall::Indirect(args) = self.call {
             Some(args.prepare(host, list, batch, budget)?)
         } else {
@@ -112,7 +114,7 @@ impl ClosedDispatch {
             }
         }
         slab_reads.transition(list.recording(), true);
-        self.shader.finish_texture_writes(list, plan)?;
+        self.shader.finish_texture_writes(host, list, batch, plan, dirty)?;
         words.shared_access.transition(list.recording(), true);
         Ok(())
     }

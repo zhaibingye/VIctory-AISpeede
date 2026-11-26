@@ -612,6 +612,15 @@ impl ShaderBindings {
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
+        self.ordinary_ranges(ranges)?;
+        #[cfg(feature = "paged-title")]
+        for volume in self.texture_outputs().filter_map(|uav| uav.byte_backing()) {
+            ranges.extend(volume.rows()?);
+        }
+        Ok(())
+    }
+
+    fn ordinary_ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
         ranges.extend(self.cbvs.iter().map(|(_, span)| span.range()));
         ranges.extend(self.root_srvs.values().copied());
         for table in self.tables.values() {
@@ -654,8 +663,48 @@ impl ShaderBindings {
     }
 
     #[cfg(feature = "paged-title")]
+    pub(crate) fn verify_shared_volume(
+        &self, batch: &PinnedBatch, indirect: bool,
+    ) -> Result<(), BatchError> {
+        let mut outputs = self.texture_outputs();
+        let Some(volume) = outputs.find_map(|uav| uav.byte_backing()) else { return Ok(()); };
+        // 暂只接纳单一体纹理写者和能证明字节跨度的读取。间接参数另有别名语义。
+        if indirect || self.texture_outputs().count() != 1
+            || self.tables.values().flat_map(|table| table.values()).any(|view| {
+                matches!(view, ClosedView::Texture(t) if !t.has_exact_guest_bytes())
+            })
+        {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
+        let mut pages = BTreeSet::new();
+        let mut add_range = |start, end| -> Result<(), BatchError> {
+            let mut at = start & !(PAGE_BYTES - 1);
+            while at < end {
+                let page = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?;
+                pages.insert(page.physical());
+                at += PAGE_BYTES;
+            }
+            Ok(())
+        };
+        for (start, end) in volume.rows()? { add_range(start, end)?; }
+        let mut ordinary = Vec::new();
+        self.ordinary_ranges(&mut ordinary)?;
+        for (start, end) in ordinary {
+            if start == end { continue; }
+            let mut at = start & !(PAGE_BYTES - 1);
+            while at < end {
+                let id = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?.physical();
+                if pages.contains(&id) { return Err(BatchError::Range(start, end)); }
+                at += PAGE_BYTES;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "paged-title")]
     pub(crate) fn uses_guest_uav(&self) -> bool {
-        self.tables.values().flat_map(|table| table.values())
+        self.texture_outputs().any(|uav| uav.byte_backing().is_some())
+            || self.tables.values().flat_map(|table| table.values())
             .any(|view| matches!(view, ClosedView::Raw(raw) | ClosedView::Structured(raw, _) if raw.unordered()))
     }
 
@@ -677,13 +726,14 @@ impl ShaderBindings {
     }
 
     pub(crate) fn finish_texture_writes(
-        &self, list: &HostList, plan: &mut crate::page_resource::ResourcePlan,
+        &self, host: &Host, list: &HostList, batch: &PinnedBatch,
+        plan: &mut crate::page_resource::ResourcePlan, dirty: &mut BTreeSet<PhysicalPage>,
     ) -> Result<(), BatchError> {
         let mut outputs = self.texture_outputs().peekable();
         if outputs.peek().is_some() {
             crate::page_resource::PageBarrier::Uav.encode(list, plan)?;
             for output in outputs {
-                output.record_write(plan)?;
+                output.finish_write(host, list, batch, plan, dirty)?;
             }
         }
         Ok(())

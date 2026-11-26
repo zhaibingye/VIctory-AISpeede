@@ -207,6 +207,9 @@ impl TextureInput {
         Some(Self::Scoped { copy, format, selection: TextureSelection { mips, slices } })
     }
 
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn has_exact_guest_bytes(&self) -> bool { matches!(self, Self::Linear { .. }) }
+
     pub(crate) fn selection(&self) -> TextureSelection {
         match self { Self::Scoped { selection, .. } => *selection, _ => TextureSelection::SINGLE }
     }

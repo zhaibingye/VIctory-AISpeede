@@ -1776,9 +1776,13 @@ fn one_texel_reads_only_its_proven_bytes() {
     assert!(single_texel_bytes(0x1_0000, &ResourceDesc { flags: 4, ..desc }).is_none());
 }
 
+#[cfg(all(windows, feature = "paged-title"))]
+pub(crate) fn title_texture_layout(this: This) -> Option<u32> {
+    texture_memory(this).map(|(_, desc)| desc.layout)
+}
+
 /// 从地址式资源自身的布局推导体纹理行距与层距；这里不授予写入权威。
 #[cfg(all(windows, feature = "paged-title"))]
-#[allow(dead_code, reason = "等待写入路径完成物理页别名检查")]
 pub(crate) fn address_linear_volume(this: This) -> Option<crate::page_texture::LinearVolume> {
     use crate::page_texture::{LinearTexture, LinearVolume};
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;

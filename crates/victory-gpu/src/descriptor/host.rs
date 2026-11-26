@@ -1060,7 +1060,8 @@ pub(crate) fn paged_uav_format(view: &View) -> (Option<u32>, Option<i32>, Option
 pub(crate) fn paged_shader_texture_uav(view: &View)
     -> Result<crate::page_uav::ShaderTextureUav, crate::page_uav::TextureUavReject> {
     let (target, format, selection) = exact_texture_uav(view)?;
-    crate::page_uav::ShaderTextureUav::capture(target, format, selection)
+    let View::Unordered(resource, _, _) = view else { return Err(crate::page_uav::TextureUavReject::ViewKind); };
+    crate::page_uav::ShaderTextureUav::capture(target, format, selection, *resource as crate::object::This)
 }
 
 pub(crate) fn paged_texture_clear(
