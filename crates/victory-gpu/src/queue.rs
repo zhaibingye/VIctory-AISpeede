@@ -219,8 +219,15 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(all(windows, feature = "paged-title"))]
+    let frequency = match crate::host::host().and_then(|host| host.timestamp_frequency().ok()) {
+        Some(value) if value != 0 => value,
+        _ => return E_INVALIDARG,
+    };
+    #[cfg(not(all(windows, feature = "paged-title")))]
+    let frequency = TIMESTAMP_FREQUENCY;
     // SAFETY: checked non-null.
-    unsafe { out.write(TIMESTAMP_FREQUENCY) };
+    unsafe { out.write(frequency) };
     S_OK
 }
 const TIMESTAMP_FREQUENCY: u64 = 100_000_000;

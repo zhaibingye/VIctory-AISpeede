@@ -46,6 +46,61 @@ pub(crate) enum PageOp {
     Barrier(std::sync::Arc<crate::page_resource::PageBarrier>),
     ClearRaw(std::sync::Arc<crate::page_uav::RawClear>),
     ClearUavTexture(std::sync::Arc<crate::page_uav::TextureClear>),
+    #[cfg(feature = "paged-title")]
+    Timestamp(std::sync::Arc<TimestampOp>),
+}
+
+#[cfg(feature = "paged-title")]
+pub(crate) enum TimestampOp {
+    End { heap: std::sync::Arc<crate::query::TimestampHeap>, index: u32 },
+    Resolve { heap: std::sync::Arc<crate::query::TimestampHeap>, first: u32, count: u32, span: (u64, u64) },
+}
+
+#[cfg(feature = "paged-title")]
+impl TimestampOp {
+    pub(crate) fn resolve(
+        heap: std::sync::Arc<crate::query::TimestampHeap>, first: u32, count: u32,
+        base: u64, buffer_size: u64, offset: u64,
+    ) -> Option<Self> {
+        let size = u64::from(count) * 8;
+        let start = base.checked_add(offset)?;
+        let end = start.checked_add(size)?;
+        if count == 0 || first.checked_add(count)? > heap.count
+            || base == 0 || !start.is_multiple_of(8) || offset.checked_add(size)? > buffer_size
+            || end > victory_memory::gpu_table::ADDRESS_LIMIT
+        {
+            return None;
+        }
+        Some(Self::Resolve { heap, first, count, span: (start, end) })
+    }
+
+    fn encode(
+        &self, host: &Host, list: &HostList, batch: &PinnedBatch,
+        plan: &mut crate::page_resource::ResourcePlan, dirty: &mut BTreeSet<PhysicalPage>,
+    ) -> std::result::Result<(), BatchError> {
+        match self {
+            Self::End { heap, index } => {
+                list.keep(&heap.native);
+                // SAFETY: this exact timestamp slot is in range and the heap is fence-owned.
+                unsafe { list.recording().EndQuery(&heap.native, D3D12_QUERY_TYPE_TIMESTAMP, *index) };
+                plan.record_timestamp(heap, *index);
+            }
+            Self::Resolve { heap, first, count, span } => {
+                if !plan.timestamps_initialized(heap, *first..*first + *count) {
+                    return Err(BatchError::TargetNotInitialized);
+                }
+                let stage = host.default_buffer(span.1 - span.0).ok_or_else(|| BatchError::Native(oom()))?;
+                list.keep(&heap.native);
+                // SAFETY: all requested slots are ordered and initialized;
+                // the new buffer is in COPY_DEST and fits every result word.
+                unsafe { list.recording().ResolveQueryData(
+                    &heap.native, D3D12_QUERY_TYPE_TIMESTAMP, *first, *count, &stage, 0,
+                ) };
+                crate::page_view::scatter_regions(list, batch, [(*span, 0)], &stage, dirty)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PageOp {
@@ -63,6 +118,11 @@ impl PageOp {
             Self::Barrier(_) => "resource barrier",
             Self::ClearRaw(_) => "buffer UAV clear",
             Self::ClearUavTexture(_) => "texture UAV clear",
+            #[cfg(feature = "paged-title")]
+            Self::Timestamp(op) => match op.as_ref() {
+                TimestampOp::End { .. } => "timestamp end",
+                TimestampOp::Resolve { .. } => "timestamp resolve",
+            },
         };
         BatchError::Operation { phase, index, operation, cause: Box::new(cause) }
     }
@@ -197,7 +257,7 @@ impl ClosedFootprint {
             PageOp::Draw(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
             | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Input(_) | PageOp::UploadTexture(_) => true,
             PageOp::Dispatch(dispatch) => dispatch.reads_guest_only(),
-            PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) => false,
+            PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) | PageOp::Timestamp(_) => false,
         })
     }
 
@@ -210,6 +270,10 @@ impl ClosedFootprint {
                     PageOp::Copy(copy) => {
                         ranges.extend(copy.ranges());
                         max_copy = max_copy.max(copy.len as u64);
+                    }
+                    #[cfg(feature = "paged-title")]
+                    PageOp::Timestamp(op) => {
+                        if let TimestampOp::Resolve { span, .. } = op.as_ref() { ranges.push(*span); }
                     }
                     PageOp::Input(input) => ranges.push(input.range()?),
                     PageOp::ReadbackTexture(readback) => readback.ranges(&mut ranges)?,
@@ -612,7 +676,9 @@ impl Host {
                     }
                 }
             }
-            let mut dirty = self.encode_closed_ops(list, batch, pins, descriptors, targets, ops, max_copy)?;
+            let dirty = self.encode_closed_ops(list, batch, pins, descriptors, targets, ops, max_copy)?;
+            #[cfg(feature = "paged-title")]
+            let mut dirty = dirty;
             #[cfg(feature = "paged-title")]
             for (_, readback, span) in &visible {
                 publications.push(readback.prepare_mirror(&ranges[span.clone()], pins)?);
@@ -668,6 +734,8 @@ impl Host {
                     PageOp::Barrier(barrier) => barrier.encode(list, targets)?,
                     PageOp::ClearRaw(clear) => clear.encode(self, list, batch, descriptors, targets, &mut dirty)?,
                     PageOp::ClearUavTexture(clear) => clear.encode(self, list, batch, descriptors, targets)?,
+                    #[cfg(feature = "paged-title")]
+                    PageOp::Timestamp(op) => op.encode(self, list, batch, targets, &mut dirty)?,
                 }
                 Ok(())
             })().map_err(|error| op.failure("encode", index, error))?;

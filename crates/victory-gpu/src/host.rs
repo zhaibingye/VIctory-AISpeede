@@ -2187,6 +2187,11 @@ impl HostList {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::CopyTexture(std::sync::Arc::new(copy))));
     }
 
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn record_page_query(&self, query: crate::page_queue::TimestampOp) {
+        self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Timestamp(std::sync::Arc::new(query))));
+    }
+
     pub(crate) fn record_page_barrier(&self, barrier: crate::page_resource::PageBarrier) {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Barrier(std::sync::Arc::new(barrier))));
     }
@@ -3747,6 +3752,12 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn timestamp_frequency(&self) -> windows::core::Result<u64> {
+        // SAFETY: the retained direct queue supports timestamps.
+        unsafe { self.queue.GetTimestampFrequency() }
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in

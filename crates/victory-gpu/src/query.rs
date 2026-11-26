@@ -1,9 +1,21 @@
-//! Query heaps. Nothing runs on a GPU yet, so no query ever produces a
-//! result; the heap only remembers its description.
+//! Title query heaps. The VNME path admits actual direct-queue timestamps.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+
+#[cfg(all(windows, feature = "paged-title"))]
+use {
+    std::{collections::BTreeSet, sync::{Arc, Mutex, OnceLock}},
+    windows::Win32::Graphics::Direct3D12::*,
+};
+
+#[cfg(all(windows, feature = "paged-title"))]
+pub(crate) struct TimestampHeap {
+    pub(crate) native: ID3D12QueryHeap,
+    pub(crate) count: u32,
+    pub(crate) initialized: Mutex<BTreeSet<u32>>,
+}
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -29,6 +41,31 @@ pub(crate) struct Desc {
 struct Heap {
     object: Object,
     desc: Desc,
+    #[cfg(all(windows, feature = "paged-title"))]
+    native: OnceLock<Option<Arc<TimestampHeap>>>,
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+pub(crate) fn timestamp_heap(this: This, kind: u32) -> Option<Arc<TimestampHeap>> {
+    if this.is_null() || kind != D3D12_QUERY_TYPE_TIMESTAMP.0 as u32 { return None; }
+    // SAFETY: the query API receives a retained title query heap.
+    let heap = unsafe { &*this.cast::<Heap>() };
+    if heap.desc.kind != D3D12_QUERY_HEAP_TYPE_TIMESTAMP.0 as u32
+        || !matches!(heap.desc.nodes, 0 | 1) || !(1..=65536).contains(&heap.desc.count)
+    {
+        return None;
+    }
+    heap.native.get_or_init(|| {
+        let host = crate::host::host()?;
+        let mut native = None;
+        // SAFETY: the native description names this host's direct node.
+        unsafe { host.device.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC {
+            Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: heap.desc.count, NodeMask: 0,
+        }, &mut native) }.ok()?;
+        Some(Arc::new(TimestampHeap {
+            native: native?, count: heap.desc.count, initialized: Mutex::default(),
+        }))
+    }).clone()
 }
 
 /// Device method.
@@ -46,6 +83,8 @@ pub(crate) extern "system" fn create(
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
+        #[cfg(all(windows, feature = "paged-title"))]
+        native: OnceLock::new(),
     });
     object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
 }

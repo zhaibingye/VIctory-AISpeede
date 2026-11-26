@@ -1004,17 +1004,30 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+extern "system" fn begin_query(this: This, _heap: This, _kind: u32, _index: u32) {
+    #[cfg(all(windows, feature = "paged-title"))]
+    if let Some(list) = host_list(this) { list.mark_unlowered(); }
+    let _ = this;
+}
+
+extern "system" fn end_query(this: This, _heap: This, _kind: u32, _index: u32) {
+    #[cfg(all(windows, feature = "paged-title"))]
+    if let Some(list) = host_list(this) {
+        if let Some(heap) = crate::query::timestamp_heap(_heap, _kind).filter(|heap| _index < heap.count) {
+            list.record_page_query(crate::page_queue::TimestampOp::End { heap, index: _index });
+        } else {
+            list.mark_unlowered();
+        }
+    }
+    let _ = this;
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
 /// each query's result into the buffer once the list has run. Timestamps
 /// (type 2) are the GPU clock then; occlusion counts (0) say a million
 /// samples passed and binary occlusion (1) visible, so nothing is culled
 /// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// The legacy path below approximates results; VNME never uses it.
 extern "system" fn resolve_queries(
     this: This,
     _heap: This,
@@ -1024,33 +1037,50 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
-    const OCCLUSION: u32 = 0;
-    const BINARY: u32 = 1;
-    const TIMESTAMP: u32 = 2;
-    const PIPELINE_STATISTICS: u32 = 3;
-    let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
-        return;
-    };
-    let (what, bytes) = match kind {
-        OCCLUSION => (Written::Value(1 << 20), 8),
-        BINARY => (Written::Value(1), 8),
-        TIMESTAMP => (Written::GpuTimestamp, 8),
-        PIPELINE_STATISTICS => (Written::Value(0), 88),
-        _ => (Written::Value(0), 16),
-    };
-    let Some(end) = offset.checked_add(u64::from(count) * bytes) else {
-        return;
-    };
-    if end > size {
+    #[cfg(all(windows, feature = "paged-title"))]
+    {
+        if let Some(list) = host_list(this) {
+            if count == 0 { return; }
+            let op = crate::query::timestamp_heap(_heap, kind)
+                .zip(crate::resource::buffer_bytes(buffer))
+                .and_then(|(heap, (data, size))| crate::page_queue::TimestampOp::resolve(
+                    heap, _first, count, data as u64, size, offset,
+                ));
+            if let Some(op) = op { list.record_page_query(op); }
+            else { list.mark_unlowered(); }
+        }
         return;
     }
-    for i in 0..u64::from(count) {
-        // Wider results are written as 8-byte pieces.
-        for piece in 0..bytes / 8 {
-            // SAFETY: inside the buffer, checked above.
-            let at = unsafe { data.add((offset + i * bytes + piece * 8) as usize) };
-            let what = if piece == 0 { what } else { Written::Value(0) };
-            defer_write(this, at as u64, what, 8);
+    #[cfg(not(all(windows, feature = "paged-title")))]
+    {
+        const OCCLUSION: u32 = 0;
+        const BINARY: u32 = 1;
+        const TIMESTAMP: u32 = 2;
+        const PIPELINE_STATISTICS: u32 = 3;
+        let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
+            return;
+        };
+        let (what, bytes) = match kind {
+            OCCLUSION => (Written::Value(1 << 20), 8),
+            BINARY => (Written::Value(1), 8),
+            TIMESTAMP => (Written::GpuTimestamp, 8),
+            PIPELINE_STATISTICS => (Written::Value(0), 88),
+            _ => (Written::Value(0), 16),
+        };
+        let Some(end) = offset.checked_add(u64::from(count) * bytes) else {
+            return;
+        };
+        if end > size {
+            return;
+        }
+        for i in 0..u64::from(count) {
+            // Wider results are written as 8-byte pieces.
+            for piece in 0..bytes / 8 {
+                // SAFETY: inside the buffer, checked above.
+                let at = unsafe { data.add((offset + i * bytes + piece * 8) as usize) };
+                let what = if piece == 0 { what } else { Written::Value(0) };
+                defer_write(this, at as u64, what, 8);
+            }
         }
     }
 }
@@ -1681,8 +1711,8 @@ const MORE_METHODS: [(usize, *const ()); 12] = [
     (53, state::clear_unordered_uint as *const ()), // 0x1a8
     (54, state::clear_unordered_float as *const ()), // 0x1b0
     (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
-    (28, query_mark as *const ()),                  // 0xe0 BeginQuery
-    (29, query_mark as *const ()),                  // 0xe8 EndQuery
+    (28, begin_query as *const ()),                  // 0xe0 BeginQuery
+    (29, end_query as *const ()),                  // 0xe8 EndQuery
     (30, resolve_queries as *const ()),             // 0xf0
     (78, dispatch_x as *const ()),                  // 0x270
     (98, state::dispatch_mesh_x as *const ()),      // 0x310
