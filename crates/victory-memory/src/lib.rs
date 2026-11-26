@@ -9,6 +9,7 @@ pub mod gpu_table;
 pub mod guest;
 pub mod physical;
 pub mod residency;
+pub mod timeline;
 pub mod virtual_pages;
 
 pub const PAGE_BYTES: u64 = 64 << 10;

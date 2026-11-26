@@ -47,6 +47,34 @@ pub(crate) enum PageOp {
     ClearRaw(std::sync::Arc<crate::page_uav::RawClear>),
 }
 
+/// Snapshot of a complete title submission, independent of guest command
+/// list lifetime and reset. Guest backing pins are captured later, when
+/// this work is actually eligible to execute.
+pub(crate) struct ClosedTitleBatch(Vec<PageOp>);
+
+const _: fn() = || {
+    fn require_send<T: Send>() {}
+    require_send::<ClosedTitleBatch>();
+};
+
+impl ClosedTitleBatch {
+    pub(crate) fn capture(lists: &[&HostList]) -> std::result::Result<Self, BatchError> {
+        let mut ops = Vec::new();
+        for (index, list) in lists.iter().enumerate() {
+            if !list.append_closed_page_ops(&mut ops) {
+                return Err(BatchError::UnloweredList(index));
+            }
+        }
+        Ok(Self(ops))
+    }
+
+    pub(crate) fn execute(
+        &self, host: &Host, heap: &HostHeap, backing: &mut SubmissionBacking,
+    ) -> std::result::Result<PageStats, BatchError> {
+        host.execute_paged_ops(heap, backing, &self.0)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum WriteSet {
     /// The closed title recorder proves every GPU-written physical page.
@@ -248,13 +276,7 @@ impl Host {
         backing: &mut SubmissionBacking,
         lists: &[&HostList],
     ) -> std::result::Result<PageStats, BatchError> {
-        let mut ops = Vec::new();
-        for (index, list) in lists.iter().enumerate() {
-            if !list.append_closed_page_ops(&mut ops) {
-                return Err(BatchError::UnloweredList(index));
-            }
-        }
-        self.execute_paged_ops(heap, backing, &ops)
+        ClosedTitleBatch::capture(lists)?.execute(self, heap, backing)
     }
 
     /// Run a closed sequence of buffer copies against one capture and
