@@ -169,6 +169,31 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
     .ok()
 }
 
+/// 整个已识别布局的保守地址范围。供物理身份捕获使用；不能作为
+/// 像素复制范围，也不能把缺失结果解释为「不访问内存」。
+#[cfg(all(windows, feature = "paged-title"))]
+fn native_writer_candidate_span(address: u64, desc: &ResourceDesc) -> Option<(u64, u64)> {
+    let layout = texture_layout(desc)?;
+    if layout.planes.iter().any(|plane| !plane.layout.addressable()) { return None; }
+    let end = address.checked_add(layout.size)?;
+    (address != 0 && address < end && end <= victory_memory::gpu_table::ADDRESS_LIMIT
+        && address.is_multiple_of(layout.alignment)).then_some((address, end))
+}
+
+#[cfg(all(windows, feature = "paged-title", test))]
+#[test]
+fn candidate_span_bounds_the_layout_not_the_live_texels() {
+    let desc = ResourceDesc {
+        dimension: 3, alignment: 0, width: 2, height: 2, depth_or_array_size: 1,
+        mip_levels: 1, format: 2, sample_count: 1, sample_quality: 0,
+        layout: 0x102, flags: 0x30_0004,
+    };
+    assert_eq!(native_writer_candidate_span(0x10000, &desc), Some((0x10000, 0x10100)));
+    assert_eq!(native_writer_candidate_span(0x10001, &desc), None);
+    assert_eq!(native_writer_candidate_span(0x10000, &ResourceDesc { layout: 0xff, ..desc }), None);
+    assert_eq!(native_writer_candidate_span(victory_memory::gpu_table::ADDRESS_LIMIT, &desc), None);
+}
+
 /// Bytes and alignment a resource takes: buffers their width (64 KiB
 /// aligned), textures their console layout (formats it does not know:
 /// every mip of every array slice and sample, packed, 64 KiB aligned),
@@ -866,6 +891,9 @@ pub(crate) struct HostTexture {
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
     byte_exposure: std::sync::atomic::AtomicU8,
+    // 只在创建或共享同用途的宿主纹理时设置，不扫描资源表。
+    #[cfg(feature = "paged-title")]
+    pub(crate) candidate_guest_span: Option<(u64, u64)>,
     #[cfg(feature = "paged-title")]
     committed_linear: std::sync::OnceLock<crate::page_texture::LinearTexture>,
     #[cfg(feature = "paged-title")]
@@ -1174,6 +1202,8 @@ impl HostTexture {
             castable,
             host_written: false.into(),
             byte_exposure: 0.into(),
+            #[cfg(feature = "paged-title")]
+            candidate_guest_span: None,
             #[cfg(feature = "paged-title")]
             committed_linear: std::sync::OnceLock::new(),
             #[cfg(feature = "paged-title")]
@@ -1531,7 +1561,12 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
-    let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
+    #[allow(unused_mut)]
+    let mut texture = make_texture(&d, state, clear)?;
+    // 格式代换后的宿主布局不是来宾布局。必须使用原描述计算。
+    #[cfg(feature = "paged-title")]
+    { texture.candidate_guest_span = native_writer_candidate_span(address, desc); }
+    let t = std::sync::Arc::new(texture);
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

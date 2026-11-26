@@ -165,6 +165,11 @@ impl ResourcePlan {
     }
 
     fn record_write_at(&mut self, copy: &Arc<HostTexture>, subresource: Option<u32>) -> Result<(), BatchError> {
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        tracing::trace!(
+            subresource, layout_span_known = copy.candidate_guest_span.is_some(),
+            "已记录原生纹理写入；是否有布局范围不代表已固定物理页"
+        );
         let version = Version::successor(
             self.version_at(copy, subresource), Representation::NativeGpu, copy.byte_observation(),
         ).ok_or_else(|| BatchError::Native(windows::Win32::Foundation::E_FAIL.into()))?;
