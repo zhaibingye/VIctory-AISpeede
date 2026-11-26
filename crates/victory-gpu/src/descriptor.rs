@@ -470,7 +470,16 @@ impl View {
         if actual.MipLevels > 1 || array {
             return TextureInput::scoped_color(copy, format, selection).ok_or(ScopedAuthority);
         }
-        let plain_linear = crate::resource::paged_linear_texture(resource).filter(|input| input.format == format);
+        let plain_linear = crate::resource::paged_linear_texture(resource);
+        #[cfg(feature = "paged-title")]
+        let plain_linear = plain_linear.or_else(|| {
+            if matches!(self, Self::Placed(false, ..)) {
+                crate::resource::paged_single_texel(resource)
+            } else {
+                None
+            }
+        });
+        let plain_linear = plain_linear.filter(|input| input.format == format);
         #[cfg(feature = "paged-title")]
         let compatible = copy.exact_committed_bytes();
         #[cfg(not(feature = "paged-title"))]

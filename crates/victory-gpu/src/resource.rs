@@ -1717,6 +1717,65 @@ pub(crate) fn paged_linear_texture(this: This) -> Option<crate::page_texture::Li
     page_texture_layout(data as u64, &desc)
 }
 
+/// 单像素纹理不需要整张解块：其实际布局只需证明一个连续 texel。
+/// 仅供已经排除已知图形写者别名的地址式只读视图。
+#[cfg(all(windows, feature = "paged-title"))]
+pub(crate) fn paged_single_texel(this: This) -> Option<crate::page_texture::LinearTexture> {
+    let (address, desc) = texture_memory(this)?;
+    single_texel_bytes(address as u64, &desc)
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+fn single_texel_bytes(address: u64, desc: &ResourceDesc) -> Option<crate::page_texture::LinearTexture> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    if desc.dimension != 3 || desc.width != 1 || desc.height != 1
+        || desc.depth_or_array_size != 1 || desc.mip_levels != 1
+        || desc.flags & 0xf != 0 || desc.sample_count != 1 || desc.sample_quality != 0
+        || address == 0
+    {
+        return None;
+    }
+    let format = DXGI_FORMAT(desc.format as i32);
+    if !crate::page_texture::sample_color(format) { return None; }
+    let size = crate::page_texture::linear_texel_bytes(format)?;
+    let texture = texture_layout(desc)?;
+    let [plane] = texture.planes.as_slice() else { return None; };
+    let layout = &plane.layout;
+    if layout.desc.swizzle.xor() || layout.desc.block != 1 || layout.desc.element_bytes != size
+        || layout.slices != 1 || layout.mips.len() != 1
+    {
+        return None;
+    }
+    let offset = layout.offset(0, 0, 0, 0).ok()?;
+    if offset.checked_add(u64::from(size))? > layout.size {
+        return None;
+    }
+    let input = crate::page_texture::LinearTexture {
+        address: address.checked_add(plane.offset)?.checked_add(offset)?,
+        row_pitch: size, width: 1, height: 1, format,
+    };
+    let _rows = input.rows().ok()?;
+    Some(input)
+}
+
+#[cfg(all(windows, test, feature = "paged-title"))]
+#[test]
+fn one_texel_reads_only_its_proven_bytes() {
+    let desc = ResourceDesc {
+        dimension: 3, alignment: 0, width: 1, height: 1, depth_or_array_size: 1,
+        mip_levels: 1, format: 28, sample_count: 1, sample_quality: 0,
+        layout: 0x105, flags: 0x30_0000,
+    };
+    let input = single_texel_bytes(0x1_0000, &desc).unwrap();
+    let tile = texture_layout(&desc).unwrap();
+    let plane = &tile.planes[0];
+    let start = 0x1_0000 + plane.offset + plane.layout.offset(0, 0, 0, 0).unwrap();
+    assert_eq!(input.rows().unwrap().collect::<Vec<_>>(), [(start, start + 4)]);
+    assert!(single_texel_bytes(0x1_0000, &ResourceDesc { width: 2, ..desc }).is_none());
+    assert!(single_texel_bytes(0x1_0000, &ResourceDesc { layout: 0x115, ..desc }).is_none());
+    assert!(single_texel_bytes(0x1_0000, &ResourceDesc { flags: 4, ..desc }).is_none());
+}
+
 #[cfg(windows)]
 fn page_texture_layout(address: u64, desc: &ResourceDesc) -> Option<crate::page_texture::LinearTexture> {
     if desc.flags & 0xf != 0 {
