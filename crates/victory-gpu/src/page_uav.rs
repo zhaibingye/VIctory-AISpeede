@@ -106,7 +106,7 @@ pub(crate) enum TextureUavReject {
     VolumeShape { dimension: i32, mip: u32, mip_count: u16, depth: u16, samples: u32 },
     ViewRange { first: u32, count: u32, depth: u16 },
     #[cfg(feature = "paged-title")]
-    ExternalVolumeLayout { layout: Option<u32> },
+    ExternalVolumeLayout { layout: Option<u32>, size: Option<(u64, u32, u16)>, mip_count: Option<u16> },
     Subresource,
 }
 
@@ -201,7 +201,7 @@ impl NativeTextureUav {
 /// existing contents: a bounded shader store is not a full overwrite proof.
 pub(crate) struct ShaderTextureUav(
     NativeTextureUav,
-    #[cfg(feature = "paged-title")] Option<crate::page_texture::LinearVolume>,
+    #[cfg(feature = "paged-title")] Option<crate::page_texture::VolumeBytes>,
 );
 
 impl ShaderTextureUav {
@@ -214,10 +214,15 @@ impl ShaderTextureUav {
         }
         #[cfg(feature = "paged-title")]
         let backing = if target.uses_unproven_alias_backing() && selection.is_some_and(|s| s.volume.is_some()) {
-            Some(crate::resource::address_linear_volume(resource)
-                .filter(|v| v.plane.format == format)
-                .ok_or_else(|| TextureUavReject::ExternalVolumeLayout {
-                    layout: crate::resource::title_texture_layout(resource),
+            Some(crate::resource::address_volume_bytes(resource)
+                .filter(|v| v.format == format)
+                .ok_or_else(|| {
+                    let shape = crate::resource::title_volume_shape(resource);
+                    TextureUavReject::ExternalVolumeLayout {
+                        layout: shape.map(|(l, ..)| l),
+                        size: shape.map(|(_, w, h, d, _)| (w, h, d)),
+                        mip_count: shape.map(|(.., m)| m),
+                    }
                 })?)
         } else { None };
         #[cfg(feature = "paged-title")]
@@ -251,7 +256,7 @@ impl ShaderTextureUav {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn byte_backing(&self) -> Option<crate::page_texture::LinearVolume> { self.1 }
+    pub(crate) fn byte_backing(&self) -> Option<&crate::page_texture::VolumeBytes> { self.1.as_ref() }
 
     pub(crate) fn finish_write(
         &self, host: &Host, list: &HostList, pages: &PinnedBatch, resources: &mut ResourcePlan,

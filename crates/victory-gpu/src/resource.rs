@@ -1777,52 +1777,29 @@ fn one_texel_reads_only_its_proven_bytes() {
 }
 
 #[cfg(all(windows, feature = "paged-title"))]
-pub(crate) fn title_texture_layout(this: This) -> Option<u32> {
-    texture_memory(this).map(|(_, desc)| desc.layout)
+pub(crate) fn title_volume_shape(this: This) -> Option<(u32, u64, u32, u16, u16)> {
+    texture_memory(this).map(|(_, d)| (d.layout, d.width, d.height, d.depth_or_array_size, d.mip_levels))
 }
 
-/// 从地址式资源自身的布局推导体纹理行距与层距；这里不授予写入权威。
+/// 从地址式资源的实际布局构造精确字节后备；这里不授予写入权威。
 #[cfg(all(windows, feature = "paged-title"))]
-pub(crate) fn address_linear_volume(this: This) -> Option<crate::page_texture::LinearVolume> {
-    use crate::page_texture::{LinearTexture, LinearVolume};
+pub(crate) fn address_volume_bytes(this: This) -> Option<crate::page_texture::VolumeBytes> {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     if this.is_null() { return None; }
     let r = resource(this);
     let address = r.data() as u64;
     let d = &r.desc;
-    if !matches!(r.backing, Backing::Address(_) | Backing::Placed { .. })
+    if address == 0 || !matches!(r.backing, Backing::Address(_) | Backing::Placed { .. })
         || d.dimension != TEXTURE_3D || d.mip_levels != 1
         || d.sample_count != 1 || d.sample_quality != 0 || d.flags & 2 != 0
         || d.depth_or_array_size == 0
     {
         return None;
     }
-    let format = DXGI_FORMAT(d.format as i32);
-    let texel = crate::page_texture::linear_texel_bytes(format)?;
     let texture = texture_layout(d)?;
     let [plane] = texture.planes.as_slice() else { return None; };
-    let layout = &plane.layout;
-    let [mip] = layout.mips.as_slice() else { return None; };
-    if layout.desc.swizzle != texture::Swizzle::LINEAR || layout.thick
-        || layout.desc.block != 1 || layout.desc.element_bytes != texel
-        || layout.slices != u32::from(d.depth_or_array_size) || mip.tail.is_some()
-        || !address.is_multiple_of(layout.alignment)
-    {
-        return None;
-    }
-    let plane_base = address.checked_add(plane.offset)?;
-    let source = LinearVolume {
-        plane: LinearTexture {
-            address: plane_base.checked_add(layout.offset(0, 0, 0, 0).ok()?)?,
-            width: u32::try_from(d.width).ok()?, height: d.height,
-            row_pitch: mip.pitch.checked_mul(texel)?, format,
-        },
-        depth: d.depth_or_array_size,
-        slice_pitch: layout.slice_size,
-    };
-    let last = source.rows().ok()?.next_back()?.1;
-    if last > plane_base.checked_add(layout.size)? { return None; }
-    Some(source)
+    crate::page_texture::VolumeBytes::new(address.checked_add(plane.offset)?,
+        DXGI_FORMAT(d.format as i32), &plane.layout)
 }
 
 #[cfg(windows)]

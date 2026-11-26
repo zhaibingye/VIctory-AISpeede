@@ -1,6 +1,5 @@
-//! Read-only derived native textures, built from current captured GPU
-//! pages rather than an independent CPU shadow. Only explicit linear
-//! layouts are accepted; swizzled/native layouts require their own decode.
+//! 从固定物理页构造宿主纹理，不维持独立的 CPU 影子副本。
+//! 共享体纹理只支持可证明的线性布局或有界的 4 KiB 分块布局。
 use victory_memory::gpu_table::ADDRESS_LIMIT;
 use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -416,53 +415,148 @@ fn checked_texture_footprint(host: &Host, desc: D3D12_RESOURCE_DESC)
     Ok((footprint, total))
 }
 
-/// 地址式三维资源的线性字节表示。只有每行和每层都已证明后才可构造。
-/// GPU 保留顺序：从当前物理页复制，随后将需要发布的写入散回相同的页。
+/// 地址式三维资源的精确字节后备。宿主原生纹理只是单次派发的工作表示。
 #[cfg(feature = "paged-title")]
-#[derive(Clone, Copy)]
-pub(crate) struct LinearVolume {
-    pub(crate) plane: LinearTexture,
-    pub(crate) depth: u16,
-    pub(crate) slice_pitch: u64,
+pub(crate) struct VolumeBytes {
+    pub(crate) format: DXGI_FORMAT,
+    width: u32,
+    height: u32,
+    depth: u16,
+    layout: VolumeLayout,
 }
 
 #[cfg(feature = "paged-title")]
-impl LinearVolume {
-    pub(crate) fn rows(self) -> Result<impl DoubleEndedIterator<Item = (u64, u64)>, BatchError> {
+enum VolumeLayout {
+    Linear { base: u64, row_pitch: u64, slice_pitch: u64 },
+    Blocked { regions: Vec<VolumeRegion>, spans: Vec<(u64, u64)> },
+}
+
+#[cfg(feature = "paged-title")]
+#[derive(Clone, Copy)]
+struct VolumeRegion {
+    start: u64,
+    len: u64,
+    row: u64,
+    offset: u64,
+}
+
+#[cfg(feature = "paged-title")]
+impl VolumeBytes {
+    pub(crate) fn new(base: u64, format: DXGI_FORMAT, layout: &victory_formats::texture::Layout)
+        -> Option<Self>
+    {
+        use victory_formats::texture::{Dimension, Swizzle};
         const LIMIT: u32 = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION;
-        let invalid = || BatchError::Range(self.plane.address, self.plane.address);
-        let texel = linear_texel_bytes(self.plane.format).ok_or_else(invalid)?;
-        let width = u64::from(self.plane.width) * u64::from(texel);
-        let pitch = u64::from(self.plane.row_pitch);
-        let depth = u64::from(self.depth);
-        let height = u64::from(self.plane.height);
-        if self.plane.address == 0 || depth == 0 || height == 0 || width == 0
-            || u32::from(self.depth) > LIMIT || self.plane.height > LIMIT || self.plane.width > LIMIT
-            || width > pitch
+        let [mip] = layout.mips.as_slice() else { return None; };
+        let texel = u64::from(linear_texel_bytes(format)?);
+        let (width, height, depth) = (mip.width, mip.height, mip.depth);
+        let end = base.checked_add(layout.size)?;
+        if base == 0 || end > ADDRESS_LIMIT || !base.is_multiple_of(layout.alignment)
+            || layout.desc.dimension != Dimension::Tex3d || layout.desc.samples != 1
+            || layout.desc.block != 1 || u64::from(layout.desc.element_bytes) != texel
+            || !layout.addressable() || mip.tail.is_some()
+            || [width, height, depth].into_iter().any(|n| n == 0 || n > LIMIT)
         {
-            return Err(invalid());
+            return None;
         }
-        let slice_bytes = ((height - 1) * pitch).checked_add(width).ok_or_else(invalid)?;
-        let end = self.slice_pitch.checked_mul(depth - 1)
-            .and_then(|n| n.checked_add(slice_bytes))
-            .and_then(|n| self.plane.address.checked_add(n)).ok_or_else(invalid)?;
-        if (depth > 1 && self.slice_pitch < slice_bytes) || end > ADDRESS_LIMIT {
-            return Err(BatchError::Range(self.plane.address, end));
-        }
-        Ok((0..depth * height).map(move |index| {
-            let at = self.plane.address + index / height * self.slice_pitch + index % height * pitch;
-            (at, at + width)
-        }))
+        let layout = match layout.desc.swizzle {
+            Swizzle::LINEAR if !layout.thick && layout.slices == depth => {
+                let start = base.checked_add(layout.offset(0, 0, 0, 0).ok()?)?;
+                let row_pitch = u64::from(mip.pitch) * texel;
+                let row_bytes = u64::from(width) * texel;
+                let slice_pitch = layout.slice_size;
+                let slice_bytes = u64::from(height - 1) * row_pitch + row_bytes;
+                let last = slice_pitch.checked_mul(u64::from(depth - 1))?
+                    .checked_add(slice_bytes)?.checked_add(start)?;
+                if row_bytes > row_pitch || depth > 1 && slice_pitch < slice_bytes || last > end {
+                    return None;
+                }
+                VolumeLayout::Linear { base: start, row_pitch, slice_pitch }
+            }
+            Swizzle::SW_4KB_S if layout.thick => {
+                // 只为有界小体纹理展开一次，合并来宾和宿主都连续的字节。
+                // 更大的工作集需要 GPU 重排，不能用无上限的 CopyBufferRegion。
+                const MAX_TEXELS: u64 = 262_144;
+                const MAX_REGIONS: usize = 32_768;
+                if u64::from(width) * u64::from(height) * u64::from(depth) > MAX_TEXELS {
+                    return None;
+                }
+                let mut regions: Vec<VolumeRegion> = Vec::new();
+                for z in 0..depth {
+                    for y in 0..height {
+                        let row = u64::from(z) * u64::from(height) + u64::from(y);
+                        for x in 0..width {
+                            let start = base.checked_add(layout.offset(0, x, y, z).ok()?)?;
+                            let offset = u64::from(x) * texel;
+                            if start.checked_add(texel)? > end { return None; }
+                            if let Some(last) = regions.last_mut()
+                                && last.row == row && last.start + last.len == start
+                                && last.offset + last.len == offset
+                            {
+                                last.len += texel;
+                            } else {
+                                if regions.len() == MAX_REGIONS { return None; }
+                                regions.push(VolumeRegion { start, len: texel, row, offset });
+                            }
+                        }
+                    }
+                }
+                let mut spans: Vec<_> = regions.iter().map(|r| (r.start, r.start + r.len)).collect();
+                spans.sort_unstable();
+                let mut merged = Vec::<(u64, u64)>::new();
+                for (start, end) in spans {
+                    if let Some((_, last)) = merged.last_mut() {
+                        if start < *last { return None; }
+                        if start == *last {
+                            *last = end;
+                            continue;
+                        }
+                    }
+                    merged.push((start, end));
+                }
+                VolumeLayout::Blocked { regions, spans: merged }
+            }
+            _ => return None,
+        };
+        Some(Self { format, width, height, depth: u16::try_from(depth).ok()?, layout })
     }
 
-    fn footprint(self, host: &Host, texture: &ID3D12Resource)
+    fn regions(&self) -> impl Iterator<Item = VolumeRegion> + '_ {
+        let rows = u64::from(self.height);
+        let row_bytes = u64::from(self.width) * u64::from(linear_texel_bytes(self.format).unwrap());
+        let (linear, blocked) = match &self.layout {
+            VolumeLayout::Linear { base, row_pitch, slice_pitch } => {
+                (Some((*base, *row_pitch, *slice_pitch)), &[][..])
+            }
+            VolumeLayout::Blocked { regions, .. } => (None, regions.as_slice()),
+        };
+        linear.into_iter().flat_map(move |(base, row_pitch, slice_pitch)| {
+            (0..rows * u64::from(self.depth)).map(move |row| VolumeRegion {
+                start: base + row / rows * slice_pitch + row % rows * row_pitch,
+                len: row_bytes, row, offset: 0,
+            })
+        }).chain(blocked.iter().copied())
+    }
+
+    pub(crate) fn ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let blocked = match &self.layout {
+            VolumeLayout::Linear { .. } => None,
+            VolumeLayout::Blocked { spans, .. } => Some(spans.as_slice()),
+        };
+        blocked.into_iter().flatten().copied().chain(
+            self.regions().take(if blocked.is_some() { 0 } else { usize::MAX })
+                .map(|r| (r.start, r.start + r.len)),
+        )
+    }
+
+    fn footprint(&self, host: &Host, texture: &ID3D12Resource)
         -> Result<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64), BatchError>
     {
         // 安全：查询保留的宿主资源，不读取其像素。
         let desc = unsafe { texture.GetDesc() };
         if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || desc.MipLevels != 1
-            || desc.Width != u64::from(self.plane.width) || desc.Height != self.plane.height
-            || desc.DepthOrArraySize != self.depth || desc.Format != self.plane.format
+            || desc.Width != u64::from(self.width) || desc.Height != self.height
+            || desc.DepthOrArraySize != self.depth || desc.Format != self.format
             || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
         {
             return Err(BatchError::UnsupportedTextureMap);
@@ -472,14 +566,15 @@ impl LinearVolume {
 
     /// 调用方保证上传/读回所需状态；只交换有效行，不覆盖来宾填充字节。
     pub(crate) fn transfer(
-        self, host: &Host, list: &HostList, batch: &PinnedBatch, texture: &ID3D12Resource,
+        &self, host: &Host, list: &HostList, batch: &PinnedBatch, texture: &ID3D12Resource,
         written_pages: Option<&mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>>,
     ) -> Result<(), BatchError> {
-        let rows = self.rows()?;
         let (footprint, total) = self.footprint(host, texture)?;
         let staging = host.default_buffer(total).ok_or_else(|| BatchError::Native(E_OUTOFMEMORY.into()))?;
         let pitch = u64::from(footprint.Footprint.RowPitch);
-        let regions = rows.enumerate().map(|(row, range)| (range, footprint.Offset + row as u64 * pitch));
+        let regions = self.regions().map(|r| {
+            ((r.start, r.start + r.len), footprint.Offset + r.row * pitch + r.offset)
+        });
         let native = D3D12_TEXTURE_COPY_LOCATION {
             // 安全：对象由调用方持有，并在本命令列表保留到 Fence。
             pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -510,19 +605,44 @@ impl LinearVolume {
 
 #[cfg(all(test, feature = "paged-title"))]
 #[test]
-fn linear_volume_excludes_all_padding_and_rejects_overlapping_slices() {
-    let volume = LinearVolume {
-        plane: LinearTexture {
-            address: 0x10000, row_pitch: 32, width: 2, height: 2,
-            format: DXGI_FORMAT_R16G16B16A16_FLOAT,
-        },
-        depth: 2,
-        slice_pitch: 128,
-    };
-    assert_eq!(volume.rows().unwrap().collect::<Vec<_>>(),
-        [(0x10000, 0x10010), (0x10020, 0x10030), (0x10080, 0x10090), (0x100a0, 0x100b0)]);
-    assert!((LinearVolume { slice_pitch: 47, ..volume }).rows().is_err());
-    assert!((LinearVolume { slice_pitch: u64::MAX, ..volume }).rows().is_err());
+fn shared_volume_maps_only_texels_with_matching_host_rows() {
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+    for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+        // 非对齐尺寸跨分块边界，同时覆盖最后一个不完整深度块。
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex3d, width: 19, height: 11, depth: 9,
+            mips: 1, element_bytes: 8, block: 1, samples: 1, swizzle,
+        }).unwrap();
+        let base = 0x10000;
+        let plan = VolumeBytes::new(base, DXGI_FORMAT_R16G16B16A16_FLOAT, &layout).unwrap();
+        let mut covered = std::collections::BTreeSet::new();
+        let mut mapped = Vec::new();
+        for r in plan.regions() {
+            assert!(r.offset + r.len <= 19 * 8);
+            assert_eq!(r.len % 8, 0);
+            for step in (0..r.len).step_by(8) {
+                assert!(covered.insert(r.start + step));
+                mapped.push((r.row, r.offset + step, r.start + step));
+            }
+        }
+        let mut expected = Vec::new();
+        for z in 0..9u32 {
+            for y in 0..11u32 {
+                for x in 0..19u32 {
+                    expected.push((u64::from(z * 11 + y), u64::from(x * 8),
+                        base + layout.offset(0, x, y, z).unwrap()));
+                }
+            }
+        }
+        assert_eq!(mapped, expected);
+        let mut pinned = std::collections::BTreeSet::new();
+        for (start, end) in plan.ranges() {
+            for byte in (start..end).step_by(8) {
+                assert!(pinned.insert(byte));
+            }
+        }
+        assert_eq!(covered, pinned);
+    }
 }
 
 impl LinearTexture {

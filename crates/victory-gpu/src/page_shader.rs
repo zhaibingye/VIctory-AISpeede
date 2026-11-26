@@ -615,7 +615,7 @@ impl ShaderBindings {
         self.ordinary_ranges(ranges)?;
         #[cfg(feature = "paged-title")]
         for volume in self.texture_outputs().filter_map(|uav| uav.byte_backing()) {
-            ranges.extend(volume.rows()?);
+            ranges.extend(volume.ranges());
         }
         Ok(())
     }
@@ -686,7 +686,7 @@ impl ShaderBindings {
             }
             Ok(())
         };
-        for (start, end) in volume.rows()? { add_range(start, end)?; }
+        for (start, end) in volume.ranges() { add_range(start, end)?; }
         let mut ordinary = Vec::new();
         self.ordinary_ranges(&mut ordinary)?;
         for (start, end) in ordinary {
