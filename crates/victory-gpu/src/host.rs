@@ -119,7 +119,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => text.push_str(
-                "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command",
+                "；诊断版可用 VICTORY_D3D12_DEBUG=1 查看相关命令",
             ),
             None => {}
         }

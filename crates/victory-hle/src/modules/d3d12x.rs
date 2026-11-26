@@ -37,7 +37,7 @@ extern "system" fn create_device(
 #[cfg(windows)]
 fn host_gpu_failed(what: &str) -> ! {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
-    victory_loader::log_crash(&format!("VIctory: host GPU failure: {what}"));
+    victory_loader::log_crash(&format!("VIctory：宿主 GPU 错误：{what}"));
     const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
     // SAFETY: ends our own process.
     unsafe { TerminateProcess(GetCurrentProcess(), DXGI_ERROR_DEVICE_REMOVED) };

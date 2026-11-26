@@ -21,7 +21,7 @@ impl Job {
         match self {
             Self::Execute { host, heap, batches } => {
                 if let Err(error) = ClosedTitleBatch::execute_adjacent(host, heap, batches) {
-                    fail(format_args!("paged title submission rejected: {error:?}"));
+                    fail(format_args!("[VNME_SUBMISSION_REJECTED] VNME 拒绝提交 GPU 命令列表： {error:?}"));
                 }
             }
             Self::Boundary(work) => work(),

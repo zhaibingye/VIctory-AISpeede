@@ -1,10 +1,9 @@
-# Copy to `victory.toml` (git-ignored) and point it at YOUR files.
-# Every path must be OUTSIDE the repository; the tools refuse otherwise.
-# Environment variables (shown below) take precedence over this file.
-# VICTORY_CONFIG selects a different config file.
+# 复制为 victory.toml（不纳入 Git），然后填入自己的路径。
+# 游戏、缓存和存档路径必须位于仓库之外。
+# 环境变量优先于本文件；VICTORY_CONFIG 可指定其他配置文件。
 
 [paths]
-# Your own dump of Grand Theft Auto VI.     env: VICTORY_GAME_DIR
+# 你有权运行的游戏目录。环境变量：VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'
 
 # 默认在游戏 EXE 所在目录的上一级创建 cache。环境变量：VICTORY_CACHE_DIR
@@ -13,11 +12,10 @@ game_dir = 'D:\victory-data\game'
 # 默认在同一父目录创建 data，单独保存存档等持久数据。环境变量：VICTORY_DATA_DIR
 # data_dir = 'D:\victory-data\data'
 
-# AMD FidelityFX for PC: the folder with amd_fidelityfx_upscaler_dx12.dll
-# (FidelityFX SDK, Kits/FidelityFX/signedbin). It upscales in place of a
-# title's console build. Unset: the title's own.   env: VICTORY_FIDELITYFX_DIR
+# PC 版 AMD FidelityFX 目录，包含 amd_fidelityfx_upscaler_dx12.dll。
+# 未设置时使用游戏自带版本。环境变量：VICTORY_FIDELITYFX_DIR
 # fidelityfx_dir = 'D:\victory-data\fidelityfx'
 
-# Other Xbox Series titles used to test platform-level code.
-# env: VICTORY_TEST_TITLES (separated by ';')
+# 用于检验平台功能的其他 Xbox Series 游戏目录。
+# 环境变量：VICTORY_TEST_TITLES（Windows 下用分号分隔）。
 test_titles = []
