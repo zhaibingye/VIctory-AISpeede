@@ -132,6 +132,10 @@ impl ResourcePlan {
         self.record_write_at(copy, None)
     }
 
+    pub(crate) fn record_color_write(&mut self, copy: &Arc<HostTexture>, sub: ColorSubresource) -> Result<(), BatchError> {
+        self.record_write_at(copy, sub.authority())
+    }
+
     fn record_write_at(&mut self, copy: &Arc<HostTexture>, subresource: Option<u32>) -> Result<(), BatchError> {
         let version = Version::successor(
             self.version_at(copy, subresource), Representation::NativeGpu, copy.byte_observation(),
@@ -257,6 +261,14 @@ pub(crate) struct ColorSubresource {
 }
 
 impl ColorSubresource {
+    pub(crate) fn from_mip_slice(desc: D3D12_RESOURCE_DESC, mip: u32, slice: u32) -> Option<Self> {
+        let mips = u32::from(desc.MipLevels);
+        if mip >= mips || slice >= u32::from(desc.DepthOrArraySize) { return None; }
+        Self::capture(desc, slice.checked_mul(mips)?.checked_add(mip)?)
+    }
+
+    pub(crate) fn is_scoped(self) -> bool { self.scoped }
+
     pub(crate) fn capture(desc: D3D12_RESOURCE_DESC, index: u32) -> Option<Self> {
         if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
             || desc.SampleDesc.Quality != 0 || desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)

@@ -7,7 +7,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use std::sync::{Arc, atomic::Ordering};
 
 use crate::host::{Host, HostList, transition};
-use crate::page_resource::ResourcePlan;
+use crate::page_resource::{ColorSubresource, ResourcePlan};
 use crate::page_shader::{ShaderBindings, UnloweredShader};
 #[cfg(all(test, feature = "diagnostics"))]
 use crate::page_shader::RootWords;
@@ -35,6 +35,8 @@ impl DrawCall {
 pub(crate) struct ColorTarget {
     copy: Arc<HostTexture>,
     desc: Option<D3D12_RENDER_TARGET_VIEW_DESC>,
+    sub: ColorSubresource,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
 }
 
 impl ColorTarget {
@@ -57,24 +59,45 @@ impl ColorTarget {
     ) -> Option<Self> {
         // SAFETY: the retained COM object is live.
         let tex = unsafe { copy.texture.GetDesc() };
-        if copy.sparse.is_some()
-            || tex.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-            || tex.SampleDesc.Count != 1
-            || tex.DepthOrArraySize != 1
-            || tex.MipLevels != 1
-            || tex.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0
-            || desc.as_ref().is_some_and(|d| {
-                if d.ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D {
-                    return true;
-                }
-                // SAFETY: the dimension selects this union variant.
-                let view = unsafe { d.Anonymous.Texture2D };
-                view.MipSlice != 0 || view.PlaneSlice != 0
-            })
+        if copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
+            || !tex.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
         {
             return None;
         }
-        Some(Self { copy, desc })
+        let (mip, slice) = match desc.as_ref() {
+            None if tex.DepthOrArraySize == 1 => (0, 0),
+            Some(d) if d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D
+                && tex.DepthOrArraySize == 1 =>
+            {
+                // SAFETY: the view dimension selects Texture2D.
+                let view = unsafe { d.Anonymous.Texture2D };
+                if view.PlaneSlice != 0 { return None; }
+                (view.MipSlice, 0)
+            }
+            Some(d) if d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY => {
+                // SAFETY: the view dimension selects Texture2DArray.
+                let view = unsafe { d.Anonymous.Texture2DArray };
+                if view.PlaneSlice != 0 || view.ArraySize != 1 { return None; }
+                (view.MipSlice, view.FirstArraySlice)
+            }
+            _ => return None,
+        };
+        let sub = ColorSubresource::from_mip_slice(tex, mip, slice)?;
+        let format = desc.as_ref().map_or(tex.Format, |d| d.Format);
+        if !sub.allows(&copy) || sub.is_scoped() && format != tex.Format {
+            return None;
+        }
+        Some(Self { copy, desc, sub, format })
+    }
+
+    fn extent(&self) -> (u64, u32) { (self.sub.width, self.sub.height) }
+
+    fn validate_native(&self) -> Result<(), BatchError> {
+        if self.sub.allows(&self.copy) && !self.copy.twin.get().is_some_and(Option::is_some) {
+            Ok(())
+        } else {
+            Err(BatchError::UnsupportedTextureMap)
+        }
     }
 
 }
@@ -88,7 +111,7 @@ pub(crate) struct ColorClear {
 impl ColorClear {
     #[cfg(feature = "paged-title")]
     pub(crate) fn preserves_color(&self) -> Option<&Arc<HostTexture>> {
-        (!self.rects.is_empty()).then_some(&self.target.copy)
+        (!self.replaces_all()).then_some(&self.target.copy)
     }
 
     #[cfg(feature = "paged-title")]
@@ -96,11 +119,28 @@ impl ColorClear {
         out.push(&self.target.copy);
     }
 
+    fn replaces_all(&self) -> bool {
+        let (width, height) = self.target.extent();
+        self.rects.is_empty() || self.rects.iter().any(|rect| {
+            rect.left == 0 && rect.top == 0
+                && u64::try_from(rect.right).ok() == Some(width)
+                && u32::try_from(rect.bottom).ok() == Some(height)
+        })
+    }
+
     pub(crate) fn encode(
         &self, host: &Host, list: &HostList, batch: &PinnedBatch, initialized: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
-        if !self.rects.is_empty() {
-            initialized.require_native(host, list, batch, &self.target.copy)?;
+        self.target.validate_native()?;
+        let (width, height) = self.target.extent();
+        if self.target.sub.is_scoped() && self.rects.iter().any(|rect| {
+            rect.left < 0 || rect.top < 0 || rect.right <= rect.left || rect.bottom <= rect.top
+                || rect.right as u64 > width || rect.bottom as u32 > height
+        }) {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
+        if !self.replaces_all() {
+            initialized.require_color_subresource(host, list, batch, &self.target.copy, self.target.sub)?;
         }
         let texture = &self.target.copy.texture;
         let before = initialized.state(&self.target.copy);
@@ -120,7 +160,7 @@ impl ColorClear {
                 cmd.ResourceBarrier(&[transition(texture, after, before)]);
             }
         }
-        initialized.record_write(&self.target.copy)?;
+        initialized.record_color_write(&self.target.copy, self.target.sub)?;
         Ok(())
     }
 }
@@ -327,9 +367,7 @@ impl ClosedDraw {
         let extent = |desc: D3D12_RESOURCE_DESC| (desc.Width, desc.Height);
         let mut first_extent = None;
         for (index, (target, &format)) in targets.iter().zip(formats).enumerate() {
-            // SAFETY: target and depth both retain their native objects.
-            let desc = unsafe { target.copy.texture.GetDesc() };
-            let view_format = target.desc.as_ref().map_or(desc.Format, |d| d.Format);
+            let view_format = target.format;
             if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN
                 || view_format != format
                 || shader.samples_target(&target.copy)
@@ -337,12 +375,12 @@ impl ClosedDraw {
             {
                 return Err(UnloweredShader::GraphicsState);
             }
-            if targets.len() > 1 {
+            if targets.len() > 1 || target.sub.is_scoped() {
                 if target.copy.uses_unproven_alias_backing()
                     || targets[..index].iter().any(|other| other.copy.texture == target.copy.texture)
-                    || *first_extent.get_or_insert_with(|| extent(desc)) != extent(desc)
+                    || *first_extent.get_or_insert_with(|| target.extent()) != target.extent()
                     || depth.as_ref().is_some_and(|d| d.copy.uses_unproven_alias_backing()
-                        || extent(unsafe { d.copy.texture.GetDesc() }) != extent(desc))
+                        || extent(unsafe { d.copy.texture.GetDesc() }) != target.extent())
                 {
                     return Err(UnloweredShader::GraphicsState);
                 }
@@ -396,7 +434,8 @@ impl ClosedDraw {
             return Err(BatchError::UnsupportedTextureMap);
         }
         for target in &self.targets {
-            initialized.require_native(host, list, batch, &target.copy)?;
+            target.validate_native()?;
+            initialized.require_color_subresource(host, list, batch, &target.copy, target.sub)?;
         }
         let indirect = match self.call {
             DrawCall::Indirect(draw) => Some(draw.prepare(host, list, batch, budget)?),
@@ -470,7 +509,7 @@ impl ClosedDraw {
             initialized.record_write(&depth.copy)?;
         }
         for target in &self.targets {
-            initialized.record_write(&target.copy)?;
+            initialized.record_color_write(&target.copy, target.sub)?;
         }
         Ok(())
     }
