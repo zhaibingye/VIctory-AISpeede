@@ -73,6 +73,24 @@ impl<D, W> Timeline<D, W> {
         }
     }
 
+    /// Fold immediately adjacent work into the issued operation, without
+    /// crossing even an already satisfied dependency marker.
+    pub fn take_adjacent(&mut self, ticket: Ticket, fold: impl FnOnce(&W) -> bool) -> Option<W> {
+        if self.issued != Some(ticket) {
+            return None;
+        }
+        let (_, Item::Work(next)) = self.pending.front()? else {
+            return None;
+        };
+        if !fold(next) {
+            return None;
+        }
+        match self.pending.pop_front() {
+            Some((_, Item::Work(next))) => Some(next),
+            _ => unreachable!("validated adjacent work"),
+        }
+    }
+
     /// Call after the promised completion boundary, not just after enqueue.
     /// A stale or foreign ticket must never unblock the current work.
     pub fn retire(&mut self, ticket: Ticket) -> bool {

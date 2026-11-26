@@ -137,12 +137,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             let heap = crate::memory::heap().unwrap_or_else(|| {
                 crate::host::fail(format_args!("paged title submission has no descriptor heap"))
             });
-            if !crate::title_timeline::Lane::work(&queue(this).lane, move || {
-                let mut backing = crate::title_backing::SubmissionBacking::default();
-                if let Err(error) = batch.execute(host, heap, &mut backing) {
-                    crate::host::fail(format_args!("paged title submission rejected: {error:?}"));
-                }
-            }) {
+            if !crate::title_timeline::Lane::execute(&queue(this).lane, host, heap, batch) {
                 crate::host::fail(format_args!("VNME title queue exceeded its in-flight bound"));
             }
         }

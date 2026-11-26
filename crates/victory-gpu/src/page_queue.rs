@@ -68,6 +68,28 @@ impl ClosedTitleBatch {
         Ok(Self(ops))
     }
 
+    /// Fold only native work with no guest backing snapshots or merge.
+    /// This does not turn two separately budgeted page sets into one
+    /// larger resident set, or suppress any CPU-visible byte updates.
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn may_fold(&self, next: &Self) -> bool {
+        let native_only = |batch: &Self| batch.0.iter().all(|op| match op {
+            PageOp::CopyTexture(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => true,
+            PageOp::Draw(draw) => {
+                let mut ranges = Vec::new();
+                draw.ranges(&mut ranges).is_ok() && ranges.is_empty()
+            }
+            _ => false,
+        });
+        self.0.len().saturating_add(next.0.len()) <= 64
+            && native_only(self) && native_only(next)
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn append(&mut self, mut next: Self) {
+        self.0.append(&mut next.0);
+    }
+
     pub(crate) fn execute(
         &self, host: &Host, heap: &HostHeap, backing: &mut SubmissionBacking,
     ) -> std::result::Result<PageStats, BatchError> {

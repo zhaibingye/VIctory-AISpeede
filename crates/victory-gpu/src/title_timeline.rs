@@ -7,9 +7,43 @@ use std::time::Duration;
 use victory_memory::timeline::{Item, Timeline};
 
 use crate::fence::GuestFenceRef;
-use crate::host::fail;
+use crate::host::{Host, fail};
+use crate::descriptor::host::HostHeap;
+use crate::page_queue::ClosedTitleBatch;
 
-type Job = Box<dyn FnOnce() + Send>;
+enum Job {
+    Execute { host: &'static Host, heap: &'static HostHeap, batch: ClosedTitleBatch },
+    Boundary(Box<dyn FnOnce() + Send>),
+}
+
+impl Job {
+    fn run(self) {
+        match self {
+            Self::Execute { host, heap, batch } => {
+                let mut backing = crate::title_backing::SubmissionBacking::default();
+                if let Err(error) = batch.execute(host, heap, &mut backing) {
+                    fail(format_args!("paged title submission rejected: {error:?}"));
+                }
+            }
+            Self::Boundary(work) => work(),
+        }
+    }
+
+    fn fold_adjacent(&mut self, timeline: &mut Timeline<GuestFenceRef, Self>, ticket: victory_memory::timeline::Ticket) {
+        let Self::Execute { host, heap, batch } = self else { return; };
+        // Bound both the number and command count; other logical lanes
+        // can run after this group retires.
+        for _ in 0..3 {
+            let next = timeline.take_adjacent(ticket, |next| match next {
+                Self::Execute { host: h, heap: d, batch: other } =>
+                    std::ptr::eq(*host, *h) && std::ptr::eq(*heap, *d) && batch.may_fold(other),
+                Self::Boundary(_) => false,
+            });
+            let Some(Self::Execute { batch: next, .. }) = next else { break; };
+            batch.append(next);
+        }
+    }
+}
 
 pub(crate) struct Lane(Mutex<Timeline<GuestFenceRef, Job>>);
 
@@ -22,8 +56,12 @@ impl Lane {
         enqueue(lane, Item::Dependency(fence))
     }
 
+    pub(crate) fn execute(lane: &Arc<Self>, host: &'static Host, heap: &'static HostHeap, batch: ClosedTitleBatch) -> bool {
+        enqueue(lane, Item::Work(Job::Execute { host, heap, batch }))
+    }
+
     pub(crate) fn work(lane: &Arc<Self>, work: impl FnOnce() + Send + 'static) -> bool {
-        enqueue(lane, Item::Work(Box::new(work)))
+        enqueue(lane, Item::Work(Job::Boundary(Box::new(work))))
     }
 }
 
@@ -73,7 +111,10 @@ impl Scheduler {
                 for _ in 0..lanes.len() {
                     let lane = lanes.pop_front().expect("scheduled lane exists");
                     let mut timeline = lane.0.lock().unwrap_or_else(|e| e.into_inner());
-                    let ready = timeline.take_ready(GuestFenceRef::reached);
+                    let mut ready = timeline.take_ready(GuestFenceRef::reached);
+                    if let Some(work) = &mut ready {
+                        work.work.fold_adjacent(&mut timeline, work.ticket);
+                    }
                     let active = !timeline.is_idle();
                     drop(timeline);
                     if active {
@@ -95,7 +136,7 @@ impl Scheduler {
                 };
             };
             drop(lanes);
-            (ready.work)();
+            ready.work.run();
             let mut timeline = lane.0.lock().unwrap_or_else(|e| e.into_inner());
             if !timeline.retire(ready.ticket) {
                 fail(format_args!("VNME title queue retired the wrong operation"));
