@@ -43,14 +43,14 @@ const SHADER_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
 );
 
-/// Temporary per-command states for disjoint shader reads and writes.
+/// Temporary per-command states for disjoint native subresource accesses.
 /// Duplicate views of a subresource share one transition pair.
 #[derive(Default)]
-pub(crate) struct ScopedShaderAccess(std::collections::BTreeMap<
+pub(crate) struct ScopedTextureAccess(std::collections::BTreeMap<
     (usize, u32), (ID3D12Resource, crate::page_resource::ColorSubresource, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES),
 >);
 
-impl ScopedShaderAccess {
+impl ScopedTextureAccess {
     pub(crate) fn insert(&mut self, texture: &ID3D12Resource, sub: crate::page_resource::ColorSubresource,
         before: D3D12_RESOURCE_STATES, wanted: D3D12_RESOURCE_STATES,
     ) -> Result<(), BatchError> {
@@ -272,7 +272,7 @@ impl TextureInput {
 
     pub(crate) fn encode(
         &self, host: &Host, list: &HostList, batch: &PinnedBatch,
-        plan: &mut crate::page_resource::ResourcePlan, mut shared: Option<&mut ScopedShaderAccess>,
+        plan: &mut crate::page_resource::ResourcePlan, mut shared: Option<&mut ScopedTextureAccess>,
     ) -> Result<(ID3D12Resource, DXGI_FORMAT), BatchError> {
         match self {
             Self::Scoped { copy, format, selection } => {

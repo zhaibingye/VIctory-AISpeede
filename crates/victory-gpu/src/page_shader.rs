@@ -267,7 +267,7 @@ impl ConstantSpan {
 pub(crate) struct PreparedShader {
     words: Vec<(u32, Vec<u32>)>,
     cbvs: Vec<(u32, u64)>,
-    pub(crate) shared_access: crate::page_texture::ScopedShaderAccess,
+    pub(crate) shared_access: crate::page_texture::ScopedTextureAccess,
 }
 
 impl PreparedShader {
@@ -585,7 +585,7 @@ impl ShaderBindings {
         }
         let mut bases = BTreeMap::new();
         let mut shader_dirty = BTreeSet::new();
-        let mut shared_access = crate::page_texture::ScopedShaderAccess::default();
+        let mut shared_access = crate::page_texture::ScopedTextureAccess::default();
         let texture_reads: Vec<_> = self.tables.values().flat_map(|table| table.values())
             .filter_map(|view| match view {
                 ClosedView::Texture(input) => Some(input),

@@ -155,7 +155,7 @@ impl ShaderTextureUav {
 
     pub(crate) fn prepare(
         &self, host: &Host, list: &HostList, pages: &PinnedBatch, resources: &mut ResourcePlan,
-        shared: Option<&mut crate::page_texture::ScopedShaderAccess>,
+        shared: Option<&mut crate::page_texture::ScopedTextureAccess>,
     ) -> Result<crate::page_queue::TableDescriptor, BatchError> {
         self.0.check_native(host)?;
         resources.require_color_subresource(host, list, pages, self.target(), self.0.sub)?;

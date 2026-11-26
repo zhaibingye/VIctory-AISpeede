@@ -525,7 +525,10 @@ impl TextureCopy {
         let writable = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         let exact_backing = scoped || !a.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
             || !b.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-        if Arc::ptr_eq(&src, &dst) || src.texture == dst.texture
+        let same_allocation = src.texture == dst.texture;
+        let separate_subresources = region.is_some() && Arc::ptr_eq(&src, &dst)
+            && source.scoped && destination.scoped && source.index != destination.index;
+        if same_allocation && !separate_subresources
             || !source.allows(&src) || !destination.allows(&dst)
             || (!scoped && (a.Flags.0 & writable == 0 || b.Flags.0 & writable == 0))
             || exact_backing && (src.uses_unproven_alias_backing() || dst.uses_unproven_alias_backing())
@@ -591,15 +594,29 @@ impl TextureCopy {
         if self.area.as_ref().is_some_and(|area| !area.fills_destination) {
             plan.require_color_subresource(host, list, batch, &self.dst, self.destination)?;
         }
-        plan.transition_texture(list, &self.src, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)?;
-        plan.transition_texture(list, &self.dst, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
+        let source_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let destination_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        let same_allocation = Arc::ptr_eq(&self.src, &self.dst);
+        let mut scoped = crate::page_texture::ScopedTextureAccess::default();
+        if same_allocation {
+            if self.src.twin.get().is_some_and(Option::is_some) {
+                return Err(BatchError::UnsupportedBarrier);
+            }
+            let before = plan.state(&self.src);
+            scoped.insert(&self.src.texture, self.source, before, source_state)?;
+            scoped.insert(&self.dst.texture, self.destination, before, destination_state)?;
+        } else {
+            plan.transition_texture(list, &self.src, source_state.0 as u32)?;
+            plan.transition_texture(list, &self.dst, destination_state.0 as u32)?;
+        }
         list.keep(&self.src.texture);
         list.keep(&self.dst.texture);
-        // SAFETY: both resources stay alive in COPY_SOURCE/DEST. A region
-        // uses checked texel bounds and borrows the retained resources.
+        let cmd = list.recording();
+        if same_allocation { scoped.transition(cmd, false); }
+        // SAFETY: the retained source and destination subresources are
+        // distinct and in COPY_SOURCE/DEST. A region uses checked bounds.
         // A whole copy uses matching texture shapes and proven source contents.
         unsafe {
-            let cmd = list.recording();
             if let Some(area) = &self.area {
                 let location = |texture: &ID3D12Resource, index| D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(texture),
@@ -612,6 +629,7 @@ impl TextureCopy {
                 cmd.CopyResource(&self.dst.texture, &self.src.texture);
             }
         }
+        if same_allocation { scoped.transition(cmd, true); }
         for authority in self.authorities(self.destination) {
             plan.record_write_at(&self.dst, authority)?;
         }
