@@ -64,7 +64,7 @@ pub(crate) struct Shader {
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     #[cfg(windows)]
-    static_view_slots: OnceLock<Option<Vec<victory_shader::emit::StaticViewSlot>>>,
+    static_view_slots: OnceLock<victory_shader::emit::StaticViewReport>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -110,10 +110,17 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
-    pub(crate) fn static_view_slots(&self) -> Option<&[victory_shader::emit::StaticViewSlot]> {
-        self.static_view_slots
-            .get_or_init(|| victory_shader::emit::static_view_slots(&self.container).ok().flatten())
-            .as_deref()
+    pub(crate) fn static_view_slots(
+        &self,
+    ) -> Result<&[victory_shader::emit::StaticViewSlot], victory_shader::emit::StaticViewFailure> {
+        use victory_shader::emit::{StaticViewFailure, StaticViewReport, static_view_report};
+        match self.static_view_slots.get_or_init(|| {
+            static_view_report(&self.container)
+                .unwrap_or(StaticViewReport::Rejected(StaticViewFailure::ParseOrAnalysis))
+        }) {
+            StaticViewReport::Proven(slots) => Ok(slots),
+            StaticViewReport::Rejected(reason) => Err(*reason),
+        }
     }
 
     /// The translation, made on first use (or taken from the cache); a

@@ -27,7 +27,7 @@ pub(crate) enum UnloweredShader {
     DescriptorHeap,
     RootView,
     DescriptorTable,
-    DescriptorProof { stage: &'static str },
+    DescriptorProof { stage: &'static str, reason: victory_shader::emit::StaticViewFailure },
     DescriptorDeclaration { root: u8, kind: victory_shader::ResourceType, source: RootType },
     DescriptorSlot { stage: &'static str, root: u8, index: u32, reason: DescriptorSlotReason },
     UnknownUserData,
@@ -430,7 +430,7 @@ impl ShaderBindings {
             });
             let slots = if needs_table_or_root {
                 stage.shader.static_view_slots()
-                    .ok_or(UnloweredShader::DescriptorProof { stage: stage.shader.stage })?
+                    .map_err(|reason| UnloweredShader::DescriptorProof { stage: stage.shader.stage, reason })?
             } else {
                 &[]
             };

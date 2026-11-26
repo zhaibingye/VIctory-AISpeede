@@ -42,10 +42,38 @@ pub fn static_texture_slots(container: &[u8]) -> Result<Option<Vec<StaticTexture
     }))
 }
 
+/// 静态证据不完整时的原因。只保留指令助记符和维度，不输出着色器字节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticViewFailure {
+    ParseOrAnalysis,
+    NoNativeStage,
+    DynamicSampler { operation: &'static str },
+    UnsupportedAccess { operation: &'static str, image_dimension: Option<u8> },
+    UnprovenRootView { operation: &'static str },
+    UntracedSource { operation: &'static str },
+    DivergentSource { operation: &'static str },
+    MissingTableAddress { operation: &'static str },
+    UnprovenTableSlot { operation: &'static str },
+}
+
+pub enum StaticViewReport {
+    Proven(Vec<StaticViewSlot>),
+    Rejected(StaticViewFailure),
+}
+
 /// Prove descriptor operands and raw access byte windows from native
 /// instructions, not inferred from resource declarations. Excludes
 /// arbitrary addresses and does not by itself admit a host shader.
 pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>, ShaderError> {
+    Ok(match static_view_report(container)? {
+        StaticViewReport::Proven(slots) => Some(slots),
+        StaticViewReport::Rejected(_) => None,
+    })
+}
+
+pub fn static_view_report(container: &[u8]) -> Result<StaticViewReport, ShaderError> {
+    use StaticViewFailure as Reason;
+    let rejected = |reason| Ok(StaticViewReport::Rejected(reason));
     let c = Container::parse(container)?;
     let dxil = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
@@ -53,7 +81,7 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
         .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms))
     else {
         // The translated host blob cannot stand in for a guest proof.
-        return Ok(None);
+        return rejected(Reason::NoNativeStage);
     };
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let st = st?;
@@ -64,22 +92,21 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
     for descriptor in &resources.descriptors {
         let (b, i) = descriptor.site;
         let inst = &p.blocks[b].insts[i];
+        let name = inst.name();
         if descriptor.role == Role::Sampler {
             // Immediate samplers use the host PSO's static samplers;
             // do not admit a second, dynamically indexed sampler heap.
             if !matches!(descriptor.source, Source::Constant(_)) {
-                return Ok(None);
+                return rejected(Reason::DynamicSampler { operation: name });
             }
             continue;
         }
-        let name = inst.name();
         let access = if let Some(access) = bounded_texture_write(inst, &mut bounds) {
             AccessProof::Native(access)
-        } else if matches!(inst.fields, Fields::Image { dim: 1 | 4, .. })
-            && (name.starts_with("image_sample") || matches!(name, "image_load" | "image_load_mip"))
+        } else if let Fields::Image { dim, .. } = inst.fields
+            && let Some(access) = closed_image_read(name, dim)
         {
-            let array = matches!(inst.fields, Fields::Image { dim: 4, .. });
-            AccessProof::Native(StaticViewAccess::TextureRead { array })
+            AccessProof::Native(access)
         } else if let Some(access) = bounded_typed_load(inst, &mut bounds) {
             access
         } else if let Some(access) = bounded_structured_access(inst, &mut bounds) {
@@ -87,27 +114,62 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
         } else if let Some(access) = bounded_raw_access(inst, &mut bounds) {
             AccessProof::Native(access)
         } else {
-            return Ok(None);
+            let image_dimension = match inst.fields {
+                Fields::Image { dim, .. } => Some(dim),
+                _ => None,
+            };
+            return rejected(Reason::UnsupportedAccess { operation: name, image_dimension });
         };
         if let Source::Built { address, bits, words } = descriptor.source {
             let Some(root) = proven_root_srv(&native, address, bits, words, access) else {
-                return Ok(None);
+                return rejected(Reason::UnprovenRootView { operation: name });
             };
             slots.insert(root);
             continue;
         }
         let Source::Loaded { load, first } = descriptor.source else {
-            return Ok(None);
+            return rejected(Reason::UntracedSource { operation: name });
         };
         if resources.waterfall.loads.contains(&load) {
-            return Ok(None);
+            return rejected(Reason::DivergentSource { operation: name });
         }
-        let Some(view) = addresses.get(&load).and_then(|a| proven_slot(&native, *a, first, access)) else {
-            return Ok(None);
+        let Some(&address) = addresses.get(&load) else {
+            return rejected(Reason::MissingTableAddress { operation: name });
+        };
+        let Some(view) = proven_slot(&native, address, first, access) else {
+            return rejected(Reason::UnprovenTableSlot { operation: name });
         };
         slots.insert(view);
     }
-    Ok(Some(slots.into_iter().collect()))
+    Ok(StaticViewReport::Proven(slots.into_iter().collect()))
+}
+
+fn closed_image_read(operation: &str, dimension: u8) -> Option<StaticViewAccess> {
+    // getDimensions 只读取视图信息，不写资源。仍要求绑定对应的原生 SRV，
+    // 以便返回真实维度和 mip。下面的描述符证明并不会因此接受 UAV。
+    // 暂不接纳数组尺寸查询：现有翻译还不能保证数组层数通道的语义。
+    if operation == "image_get_resinfo" && dimension != 1 {
+        return None;
+    }
+    if !operation.starts_with("image_sample")
+        && !matches!(operation, "image_load" | "image_load_mip" | "image_get_resinfo")
+    {
+        return None;
+    }
+    match dimension {
+        1 => Some(StaticViewAccess::TextureRead { array: false }),
+        4 => Some(StaticViewAccess::TextureRead { array: true }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn page_image_size_query_uses_the_exact_2d_shader_view() {
+    assert_eq!(closed_image_read("image_get_resinfo", 1), Some(StaticViewAccess::TextureRead { array: false }));
+    assert_eq!(closed_image_read("image_get_resinfo", 4), None);
+    assert_eq!(closed_image_read("image_get_resinfo", 3), None);
+    assert_eq!(closed_image_read("image_store", 1), None);
 }
 
 /// One instruction set for raw atomic admission and DXIL lowering.
