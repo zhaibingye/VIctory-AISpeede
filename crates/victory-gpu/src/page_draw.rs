@@ -370,6 +370,31 @@ pub(crate) struct ClosedDraw {
     sample: Option<crate::page_texture::SampledTexture>,
 }
 
+fn host_draw_topology(guest: u32, rectangle_gs: bool) -> Result<D3D_PRIMITIVE_TOPOLOGY, crate::page_shader::DrawState> {
+    use crate::draw::RECTANGLES;
+    use crate::page_shader::DrawState;
+    use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    match (guest, rectangle_gs) {
+        (RECTANGLES, true) => Ok(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST),
+        (1..=5, false) => Ok(D3D_PRIMITIVE_TOPOLOGY(guest as i32)),
+        (RECTANGLES, false) | (1..=5, true) => Err(DrawState::RectanglePipeline {
+            topology: guest, geometry_shader: rectangle_gs,
+        }),
+        _ => Err(DrawState::Topology(guest)),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn closed_rectangle_topology_requires_a_geometry_shader() {
+    use crate::draw::RECTANGLES;
+    use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    assert_eq!(host_draw_topology(RECTANGLES, true), Ok(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST));
+    assert!(host_draw_topology(RECTANGLES, false).is_err());
+    assert_eq!(host_draw_topology(4, false), Ok(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST));
+    assert!(host_draw_topology(4, true).is_err());
+}
+
 impl ClosedDraw {
     #[cfg(feature = "paged-title")]
     pub(crate) fn preserved_colors<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
@@ -405,9 +430,7 @@ impl ClosedDraw {
         }
     }
 
-    /// Admit a real translated title PSO only when every stage gets an
-    /// unambiguous captured constant block and has no guest memory views.
-    /// The producer is still responsible for complete IA and target state.
+    /// 捕获已转换的游戏管线，以及它对应的资源、输入和输出状态。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_translated(
         pipeline: &crate::pipeline::host::HostPipeline,
@@ -417,16 +440,19 @@ impl ClosedDraw {
         targets: Vec<ColorTarget>,
         depth: Option<DepthTarget>,
         stencil_ref: u32,
-        topology: D3D_PRIMITIVE_TOPOLOGY,
+        guest_topology: u32,
         viewport: D3D12_VIEWPORT,
         scissor: RECT,
         inputs: Vec<InputView>,
         call: DrawCall,
     ) -> Result<Self, UnloweredShader> {
-        if pipeline.compute || pipeline.mesh || pipeline.rectangles || pipeline.marks.is_some() {
+        if pipeline.compute || pipeline.mesh || pipeline.marks.is_some() {
             return Err(UnloweredShader::UnknownUserData);
         }
         use crate::page_shader::{DrawState as Reason, UnloweredShader::DrawState};
+        // 主机没有矩形列表。仅在管线确实含补角几何着色器时才把
+        // 每组三个顶点送入三角形列表；着色器补出第四角和第二个三角形。
+        let topology = host_draw_topology(guest_topology, pipeline.rectangles).map_err(DrawState)?;
         let formats = pipeline.closed_color_formats.as_ref().ok_or(DrawState(Reason::PipelineAttachments))?;
         let samples = pipeline.closed_samples.ok_or(DrawState(Reason::PipelineAttachments))?.Count;
         if formats.len() != targets.len() {

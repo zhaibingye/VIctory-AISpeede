@@ -37,6 +37,7 @@ pub(crate) enum UnloweredShader {
 pub(crate) enum DrawState {
     Opaque,
     Topology(u32),
+    RectanglePipeline { topology: u32, geometry_shader: bool },
     TargetsNotCaptured,
     ViewportNotCaptured,
     ScissorNotCaptured,

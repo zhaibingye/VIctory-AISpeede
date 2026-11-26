@@ -422,7 +422,7 @@ impl State {
         if self.page_state_opaque {
             return Err(DrawState(Reason::Opaque));
         }
-        if !matches!(self.topology, 1..=5) {
+        if !matches!(self.topology, 1..=5 | RECTANGLES) {
             return Err(DrawState(Reason::Topology(self.topology)));
         }
         let targets = self.page_targets.clone().ok_or(DrawState(Reason::TargetsNotCaptured))?;
@@ -451,7 +451,7 @@ impl State {
             targets,
             self.page_depth.clone(),
             self.page_stencil,
-            D3D_PRIMITIVE_TOPOLOGY(self.topology as i32),
+            self.topology,
             viewport,
             scissor,
             inputs,
@@ -2036,7 +2036,7 @@ fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
 
 /// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
-const RECTANGLES: u32 = 17;
+pub(crate) const RECTANGLES: u32 = 17;
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
