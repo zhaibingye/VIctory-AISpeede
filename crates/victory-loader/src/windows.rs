@@ -54,23 +54,23 @@ pub struct BindReport {
 /// `dir` receives derived game data, so it must be outside the repository.
 pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     victory_core::ensure_outside_repo(dir)?;
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("无法创建 {}", dir.display()))?;
     let path = dir.join(prepared.file_name());
     write_if_changed(&path, &prepared.bytes)?;
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: `wide` is a NUL-terminated path. The image has no entry point
+    // SAFETY: `wide` is a NUL-terminated path. The 映像没有入口点
     // and no imports, so loading it runs no title code.
     let module = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), 0) };
     if module.is_null() {
         bail!(
-            "LoadLibraryExW({}) failed: {}{}",
+            "LoadLibraryExW({}) 失败：{}{}",
             path.display(),
             std::io::Error::last_os_error(),
             if prepared.info.has_relocations {
                 ""
             } else {
-                " (image has no relocations; its preferred base may be taken)"
+                "（映像没有重定位信息，首选基址可能已被占用）"
             }
         );
     }
@@ -88,7 +88,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),
         path = %loaded.path.display(),
-        "image mapped"
+        "映像已映射"
     );
     crate::threads::mapped(&loaded);
     Ok(loaded)
@@ -151,9 +151,9 @@ fn map_dll(
     if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
         return Ok(());
     }
-    let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
-    let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
+    let original = std::fs::read(&path).with_context(|| format!("无法读取 {}", path.display()))?;
+    let prepared = prepare(&original).with_context(|| format!("无法准备映像 {}", path.display()))?;
+    let image = load(&prepared, dirs.1).with_context(|| format!("无法加载 {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
     loaded.push((name, image));
     Ok(())
@@ -184,7 +184,7 @@ impl ImportResolver for WithTitleDlls<'_> {
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
     crate::publish::write_if_changed(path, bytes)
-        .with_context(|| format!("publishing {}", path.display()))
+        .with_context(|| format!("无法写出 {}", path.display()))
 }
 
 impl LoadedImage {
@@ -274,7 +274,7 @@ impl LoadedImage {
             hle = report.hle,
             host = report.host,
             missing = report.missing.len(),
-            "imports bound"
+            "导入项已绑定"
         );
         Ok(report)
     }
@@ -288,7 +288,7 @@ impl LoadedImage {
             // SAFETY: the parser only yields slots inside the image.
             if unsafe { VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) } == 0 {
                 bail!(
-                    "VirtualProtect(IAT slot {rva:#x}) failed: {}",
+                    "VirtualProtect 无法调整 IAT 槽位 {rva:#x} 的权限：{}",
                     std::io::Error::last_os_error()
                 );
             }
@@ -333,7 +333,7 @@ impl LoadedImage {
     pub unsafe fn attach(&self) -> Result<()> {
         // SAFETY: forwarded from the caller.
         if unsafe { self.notify(DLL_PROCESS_ATTACH, true, std::ptr::null_mut()) } == Some(0) {
-            bail!("DllMain returned FALSE");
+            bail!("DllMain 返回 FALSE");
         }
         crate::threads::attached(self.base());
         Ok(())
@@ -388,7 +388,7 @@ impl LoadedImage {
         dlls: Vec<(String, LoadedImage)>,
     ) -> Result<std::thread::JoinHandle<Result<u32>>> {
         if self.info.entry_rva == 0 {
-            bail!("image has no entry point");
+            bail!("映像没有入口点");
         }
         let stack = usize::try_from(self.info.stack_reserve)
             .unwrap_or(usize::MAX)
@@ -399,7 +399,7 @@ impl LoadedImage {
             .spawn(move || {
                 for (name, dll) in &dlls {
                     // SAFETY: forwarded from the caller of `spawn_main`.
-                    unsafe { dll.attach() }.with_context(|| format!("attaching {name}"))?;
+                    unsafe { dll.attach() }.with_context(|| format!("初始化 DLL {name} 失败"))?;
                 }
                 // SAFETY: forwarded from the caller of `spawn_main`.
                 unsafe { self.run_tls_callbacks(DLL_PROCESS_ATTACH) };
@@ -411,7 +411,7 @@ impl LoadedImage {
                 // SAFETY: forwarded from the caller of `spawn_main`.
                 Ok(unsafe { entry(std::ptr::null_mut()) })
             })
-            .context("spawning title main thread")
+            .context("无法创建游戏主线程")
     }
 
     /// Unmaps the image.

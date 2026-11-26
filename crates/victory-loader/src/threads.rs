@@ -96,7 +96,7 @@ extern "C" fn detach_all() {
         attached.into_iter().rev().partition(|i| i.info().is_dll());
     tracing::info!(
         images = dlls.len() + exes.len(),
-        "process exit: ending other threads, detaching title images"
+        "进程退出：结束其他线程并卸载游戏映像"
     );
     EXITING.store(true, Ordering::SeqCst);
     // As on Windows, a lock a thread held when it ended stays taken; detach

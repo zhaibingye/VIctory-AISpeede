@@ -56,16 +56,16 @@ extern "system" fn unimplemented_import(site: &'static ImportSite) -> u64 {
     match site.policy {
         UnimplementedPolicy::ReturnZero => {
             if previous == 0 {
-                tracing::warn!(dll = %site.dll, symbol = %site.symbol, "unimplemented import called, returning 0");
+                tracing::warn!(dll = %site.dll, symbol = %site.symbol, "调用未实现的导入项，返回 0");
             }
             0
         }
         UnimplementedPolicy::Trap => {
-            tracing::error!(dll = %site.dll, symbol = %site.symbol, "unimplemented import called");
+            tracing::error!(dll = %site.dll, symbol = %site.symbol, "调用了未实现的导入项");
             // Into the crash log too: `abort` ends the process without
             // running the handlers that write it.
             let (dll, symbol) = (&site.dll, &site.symbol);
-            let text = format!("VIctory: unimplemented import {dll}!{symbol} called");
+            let text = format!("VIctory：[UNIMPLEMENTED_IMPORT] 调用了未实现的导入项 {dll}!{symbol}");
             crate::log_crash(&text);
             // SAFETY: plain Win32 calls without preconditions.
             unsafe {
@@ -102,7 +102,7 @@ impl ThunkBlock {
         } as *mut u8;
         if base.is_null() {
             bail!(
-                "VirtualAlloc for import stubs failed: {}",
+                "VirtualAlloc 无法为导入占位代码分配内存：{}",
                 std::io::Error::last_os_error()
             );
         }
@@ -112,7 +112,7 @@ impl ThunkBlock {
     /// Emits a stub for `site` and returns its address.
     pub(crate) fn emit(&mut self, site: &'static ImportSite) -> Result<usize> {
         if self.used + THUNK_SIZE > self.len {
-            bail!("import stub block is full");
+            bail!("导入占位代码区已满");
         }
         let mut code = [0xCC_u8; THUNK_SIZE]; // int3 padding
         code[0..2].copy_from_slice(&[0x48, 0xB9]);
@@ -139,7 +139,7 @@ impl ThunkBlock {
         let ok = unsafe { VirtualProtect(self.base as _, self.len, PAGE_EXECUTE_READ, &mut old) };
         if ok == 0 {
             bail!(
-                "VirtualProtect for import stubs failed: {}",
+                "VirtualProtect 无法调整导入占位代码区权限：{}",
                 std::io::Error::last_os_error()
             );
         }
@@ -181,7 +181,7 @@ mod tests {
             .unwrap();
         assert!(!out.status.success(), "the trap ends the process");
         let text = std::fs::read_to_string(&log).unwrap_or_default();
-        let named = text.contains("VIctory: unimplemented import probe.dll!Missing called");
+        let named = text.contains("VIctory：[UNIMPLEMENTED_IMPORT] 调用了未实现的导入项 probe.dll!Missing");
         assert!(named, "crash log: {text:?}");
     }
 }

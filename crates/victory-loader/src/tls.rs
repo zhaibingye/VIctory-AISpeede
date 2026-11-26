@@ -54,7 +54,7 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
         // SAFETY: the section is part of the mapped image.
         if unsafe { VirtualProtect(start as _, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
             bail!(
-                "VirtualProtect(code) failed: {}",
+                "VirtualProtect 无法调整代码页权限：{}",
                 std::io::Error::last_os_error()
             );
         }
@@ -69,7 +69,7 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     }
     // SAFETY: see `index_at`; `.data` is writable.
     unsafe { index_at.write(0) };
-    tracing::info!(index, patched, "static TLS redirected");
+    tracing::info!(index, patched, "已重定向静态 TLS");
     Ok(patched)
 }
 
@@ -131,7 +131,7 @@ fn thunks(block: *mut u8, index: u32) -> Result<usize> {
     // SAFETY: `block` is our allocation of one page.
     if unsafe { VirtualProtect(block as _, 4096, PAGE_EXECUTE_READ, &mut old) } == 0 {
         bail!(
-            "VirtualProtect(TLS thunks) failed: {}",
+            "VirtualProtect 无法调整 TLS 跳板权限：{}",
             std::io::Error::last_os_error()
         );
     }
@@ -144,7 +144,7 @@ fn near(base: usize, size: usize) -> Result<*mut u8> {
     const GRANULE: usize = 0x1_0000;
     // The search spans 1 GiB each side, so every call site stays in reach.
     if size >= 1 << 30 {
-        bail!("image too large for TLS thunks within rel32 reach");
+        bail!("映像过大，无法在 rel32 可达范围内放置 TLS 跳板");
     }
     let above = (base + size).next_multiple_of(GRANULE);
     for k in 0..(1usize << 14) {
@@ -167,7 +167,7 @@ fn near(base: usize, size: usize) -> Result<*mut u8> {
             }
         }
     }
-    bail!("no free page near the image for TLS thunks")
+    bail!("映像附近没有可供 TLS 跳板使用的空闲页面")
 }
 
 #[cfg(test)]

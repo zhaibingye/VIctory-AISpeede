@@ -18,8 +18,8 @@ fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()>
         return Ok(());
     }
     anyhow::bail!(
-        "this CPU does not support AVX2, which Xbox Series titles require; \
-         set {SKIP_CPU_CHECK_ENV}=1 to bypass this check (for example under CPU emulation such as Intel SDE)"
+        "此 CPU 不支持 Xbox Series 游戏所需的 AVX2。\
+         仅在使用 Intel SDE 等 CPU 模拟器时，才考虑用 {SKIP_CPU_CHECK_ENV}=1 跳过检查。"
     );
 }
 
@@ -81,18 +81,18 @@ pub fn run(
     // Before the import registry is first used: it holds the module only
     // when the host's FidelityFX serves.
     victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
-    let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+    let original = std::fs::read(exe).with_context(|| format!("无法读取 {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
         Some(build) => {
-            println!("build          {} ({hash})", build.label);
+            println!("构建版本       {}（{hash}）", build.label);
             if execute {
                 check_startup_archive(&title_dir.join(build.startup_archive))?;
             }
         }
-        None => println!("build          unknown ({hash})"),
+        None => println!("构建版本       未识别（{hash}）"),
     }
 
     let images = cfg.cache_subdir("images")?;
@@ -101,7 +101,7 @@ pub fn run(
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
-        "mapped at      {:#x} (preferred {:#x})",
+        "映射地址       {:#x}（首选地址 {:#x}）",
         image.base(),
         image.info().image_base
     );
@@ -117,7 +117,7 @@ pub fn run(
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
-        "title          {:08X}, storage {} ({} MB)",
+        "标题           {:08X}，存档目录 {}（{} MB）",
         title.id,
         storage.display(),
         title.storage_bytes >> 20
@@ -127,10 +127,10 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
-    println!("console        {}", victory_hle::console::NAME);
+    println!("主机配置       {}", victory_hle::console::NAME);
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
-        println!("title dll      {name} at {:#x}", dll.base());
+        println!("游戏 DLL       {name}，地址 {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
     let imported: Vec<&str> = image
@@ -143,19 +143,17 @@ pub fn run(
     let absent = absent_title_dlls(&imported, &mapped, &wanted);
     if !absent.is_empty() {
         let message = format!(
-            "{} not in {}, and neither the host nor VIctory provides {}: the package is \
-             incomplete; copy every file of the package next to the executable",
+            "缺少 {}，在 {} 中未找到，宿主与 VIctory 也未提供。请确认游戏文件完整，所需文件与游戏 EXE 位于同一目录。",
             absent.join(", "),
             title_dir.display(),
-            if absent.len() == 1 { "it" } else { "them" },
         );
-        println!("missing dlls   {message}");
+        println!("缺少 DLL       {message}");
         // None of their imports can be bound, so the title stops at its first
         // call into one (Grand Theft Auto VI 1.0.2.1 at +0x2237178 during
         // System Init, #930) with nothing saying why. Stubs only if asked for.
         if execute && matches!(unimplemented, Unimplemented::Trap) {
             anyhow::bail!(
-                "the title's own DLLs are missing: {message} (`--unimplemented zero` runs it anyway)"
+                "游戏所需 DLL 缺失：{message}（`--unimplemented zero` 仅用于继续诊断，不能保证正确运行。）"
             );
         }
     }
@@ -170,14 +168,14 @@ pub fn run(
     };
     let show = |name: &str, report: BindReport| {
         println!(
-            "bound          {name}: {} hle, {} host, {} title, {} missing",
+            "已绑定         {name}：{} 项运行时实现，{} 项宿主直通，{} 项来自游戏，{} 项缺失",
             report.hle,
             report.host,
             report.title,
             report.missing.len()
         );
         for m in &report.missing {
-            println!("  missing      {}!{}", m.dll, m.symbol);
+            println!("  缺失         {}!{}", m.dll, m.symbol);
         }
     };
     for (name, dll) in &dlls {
@@ -189,7 +187,7 @@ pub fn run(
     };
     show(&exe_name, image.bind_imports(&imports, policy)?);
     if !execute {
-        println!("not executing (pass --execute to start the title)");
+        println!("仅完成绑定，未启动游戏；加上 --execute 才实际运行。");
         return Ok(0);
     }
     victory_loader::report_crashes();
@@ -212,8 +210,8 @@ pub fn run(
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
         .join()
-        .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
-    println!("title exited with {code}");
+        .map_err(|_| anyhow::anyhow!("游戏主线程发生恐慌"))??;
+    println!("游戏已退出，状态码 {code}");
     Ok(code)
 }
 
@@ -226,13 +224,13 @@ fn check_startup_archive(path: &Path) -> Result<()> {
         .and_then(|mut file| file.read_exact(&mut magic))
         .with_context(|| {
             format!(
-                "Cannot read startup archive {}. Check that the file from your package is present and readable.",
+                "无法读取启动归档 {}。请检查文件是否存在且可读取。",
                 path.display()
             )
         })?;
     anyhow::ensure!(
         magic == *b"9FPR",
-        "Invalid RPF9 header in {}. Restore the startup archive from your package.",
+        "{} 的 RPF9 文件头无效。请从原游戏文件恢复启动归档。",
         path.display()
     );
     Ok(())
@@ -284,7 +282,7 @@ fn watch(base: usize, size: usize) {
                 // SAFETY: four bytes inside the mapped image, checked above.
                 let value = unsafe { ((base + rva) as *const u32).read_volatile() };
                 if *seen != Some(value) {
-                    eprintln!("VIctory: title+{rva:#x} = {value:#x}");
+                    eprintln!("VIctory：游戏地址 +{rva:#x} = {value:#x}");
                     *seen = Some(value);
                 }
             }
@@ -397,7 +395,7 @@ impl LateDlls {
                 };
                 for (name, dll) in &new {
                     println!(
-                        "title dll      {name} at {:#x} (loaded by the title)",
+                        "动态加载 DLL   {name}，地址 {:#x}",
                         dll.base()
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
@@ -412,7 +410,7 @@ impl LateDlls {
                 let attached = unsafe { dll.attach() };
                 attached
                     .err()
-                    .map(|e| (i, e.context(format!("attaching {name}"))))
+                    .map(|e| (i, e.context(format!("初始化 DLL {name} 失败"))))
             });
             let Some((i, error)) = failed else {
                 return Ok(new.last().map(|(_, dll)| dll.base()));
@@ -570,5 +568,5 @@ mod cpu_check_tests {
 
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool) -> Result<u32> {
-    anyhow::bail!("running titles requires Windows")
+    anyhow::bail!("运行游戏需要 Windows。")
 }

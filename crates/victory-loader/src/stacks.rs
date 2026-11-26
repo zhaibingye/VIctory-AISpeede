@@ -96,7 +96,7 @@ pub fn dump_stacks() {
     }
     // SAFETY: we opened it.
     unsafe { CloseHandle(snapshot) };
-    eprintln!("VIctory: stacks of {} threads", ids.len());
+    eprintln!("VIctory：{} 个线程的调用栈", ids.len());
     for id in ids {
         // SAFETY: opens a thread of our own process.
         let thread = unsafe {
@@ -111,7 +111,7 @@ pub fn dump_stacks() {
         }
         let (frames, (priority, base)) = frames_of(thread);
         eprintln!(
-            "  thread {id} \"{}\" start {} priority {priority} (base {base})",
+            "  线程 {id} \"{}\"，入口 {}，优先级 {priority}（基础值 {base}）",
             name_of(thread),
             locate(start_of(thread))
         );

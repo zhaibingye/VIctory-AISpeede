@@ -60,7 +60,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
         std::panic::set_hook(Box::new(move |info| {
             print(info);
             append_to_log(&format!(
-                "VIctory: panic on thread {:?}: {info}\n{}",
+                "VIctory：线程 {:?} 发生恐慌：{info}\n{}",
                 std::thread::current().name().unwrap_or("?"),
                 report_end()
             ));
@@ -540,7 +540,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         let to_file =
             code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
         // SAFETY: as above.
-        unsafe { report("first-chance exception", info, to_file) };
+        unsafe { report("首次机会异常", info, to_file) };
     }
     EXCEPTION_CONTINUE_SEARCH
 }
@@ -552,7 +552,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 /// `info` comes from the system, for an exception being dispatched.
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     // SAFETY: forwarded from the caller.
-    unsafe { report("unhandled exception", info, true) };
+    unsafe { report("未处理的异常", info, true) };
 }
 
 /// The bytes at `at` as hex, as many as the longest x86 instruction (15),
@@ -647,7 +647,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         text.push('\n');
     };
     line(format!(
-        "VIctory: {what} {:#010x} at {}{detail}",
+        "VIctory：{what} {:#010x}，位置 {}{detail}",
         code as u32,
         locate(at)
     ));
@@ -688,7 +688,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         let bytes = unsafe { std::slice::from_raw_parts(*address as *const u8, *len) };
         let saved = std::fs::write(file, bytes);
         eprintln!(
-            "  saved {address:#x}+{len:#x} to {} ({saved:?})",
+            "  已尝试将 {address:#x}+{len:#x} 保存到 {}，结果：{saved:?}",
             file.display()
         );
     }
