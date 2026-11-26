@@ -3,7 +3,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
@@ -31,13 +31,112 @@ pub(crate) const FENCE_IIDS: [Iid; 5] = [
 #[repr(C)]
 struct Fence {
     object: Object,
-    /// Titles also read it straight from memory, at the fence's GPU
-    /// address.
-    value: AtomicU64,
     flags: u32,
-    /// Events to set once the value reaches theirs (handles as integers).
-    waiters: Mutex<Vec<(u64, usize)>>,
+    state: Arc<FenceState>,
+}
+
+struct FenceState {
+    // The address exposed to the title is the address of this atomic.
+    value: AtomicU64,
+    waiters: Mutex<Vec<(u64, PendingEvent)>>,
     published: Condvar,
+    #[cfg(all(windows, feature = "paged-title"))]
+    address_exposed: std::sync::atomic::AtomicBool,
+}
+
+struct PendingEvent(usize);
+
+impl PendingEvent {
+    fn retain(event: *mut c_void) -> Option<Self> {
+        #[cfg(all(windows, feature = "paged-title"))]
+        {
+            use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let mut duplicate = std::ptr::null_mut();
+            // SAFETY: duplicate the caller's handle into our process;
+            // ownership doesn't depend on its numeric handle staying open.
+            let ok = unsafe {
+                let process = GetCurrentProcess();
+                DuplicateHandle(process, event, process, &mut duplicate, 0, 0, DUPLICATE_SAME_ACCESS)
+            };
+            (ok != 0).then_some(Self(duplicate as usize))
+        }
+        #[cfg(not(all(windows, feature = "paged-title")))]
+        Some(Self(event as usize))
+    }
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+impl Drop for PendingEvent {
+    fn drop(&mut self) {
+        // SAFETY: this is our own duplicate, closed exactly once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0 as *mut c_void) };
+    }
+}
+
+impl FenceState {
+    fn wake_events(waiters: &mut Vec<(u64, PendingEvent)>, value: u64) {
+        waiters.retain(|(wanted, event)| {
+            let reached = *wanted <= value;
+            if reached { set_event(event.0); }
+            !reached
+        });
+    }
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+mod direct_events {
+    use super::*;
+    use std::sync::{OnceLock, Weak};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Observer {
+        fences: Mutex<Vec<Weak<FenceState>>>,
+        changed: Condvar,
+    }
+
+    pub(super) fn watch(state: &Arc<FenceState>) {
+        if !state.address_exposed.load(Ordering::Acquire) {
+            return;
+        }
+        static OBSERVER: OnceLock<Arc<Observer>> = OnceLock::new();
+        let observer = OBSERVER.get_or_init(|| {
+            let observer = Arc::new(Observer::default());
+            let worker = observer.clone();
+            std::thread::Builder::new().name("vnme-fence-events".into())
+                .spawn(move || worker.run())
+                .unwrap_or_else(|e| crate::host::fail(format_args!("cannot start VNME fence observer: {e}")));
+            observer
+        });
+        let mut fences = observer.fences.lock().unwrap_or_else(|e| e.into_inner());
+        let shared = Arc::downgrade(state);
+        if !fences.iter().any(|f| f.ptr_eq(&shared)) {
+            fences.push(shared);
+        }
+        observer.changed.notify_one();
+    }
+
+    impl Observer {
+        fn run(&self) -> ! {
+            let mut fences = self.fences.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                fences.retain(|weak| {
+                    let Some(state) = weak.upgrade() else { return false; };
+                    let mut waiters = state.waiters.lock().unwrap_or_else(|e| e.into_inner());
+                    let value = state.value.load(Ordering::Acquire);
+                    FenceState::wake_events(&mut waiters, value);
+                    !waiters.is_empty()
+                });
+                fences = if fences.is_empty() {
+                    self.changed.wait(fences).unwrap_or_else(|e| e.into_inner())
+                } else {
+                    self.changed.wait_timeout(fences, Duration::from_millis(5))
+                        .unwrap_or_else(|e| e.into_inner()).0
+                };
+            }
+        }
+    }
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -55,10 +154,14 @@ pub(crate) extern "system" fn create(
     tracing::debug!(initial, flags, "fence");
     let fence = Box::new(Fence {
         object: Object::new(&FUNCTIONS),
-        value: AtomicU64::new(initial),
         flags,
-        waiters: Mutex::new(Vec::new()),
-        published: Condvar::new(),
+        state: Arc::new(FenceState {
+            value: AtomicU64::new(initial),
+            waiters: Mutex::new(Vec::new()),
+            published: Condvar::new(),
+            #[cfg(all(windows, feature = "paged-title"))]
+            address_exposed: std::sync::atomic::AtomicBool::new(false),
+        }),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -113,10 +216,10 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 extern "system" fn completed(this: This) -> u64 {
-    fence(this).value.load(Ordering::Acquire)
+    fence(this).state.value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
-    let fence = fence(this);
+    let fence = &fence(this).state;
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
@@ -138,20 +241,18 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         }
         return S_OK;
     }
-    waiters.push((value, event as usize));
+    let Some(event) = PendingEvent::retain(event) else { return crate::object::E_INVALIDARG; };
+    waiters.push((value, event));
+    drop(waiters);
+    #[cfg(all(windows, feature = "paged-title"))]
+    direct_events::watch(fence);
     S_OK
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
-    let fence = fence(this);
+    let fence = &fence(this).state;
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event)| {
-        let reached = wanted <= value;
-        if reached {
-            set_event(event);
-        }
-        !reached
-    });
+    FenceState::wake_events(&mut waiters, value);
     fence.published.notify_all();
     #[cfg(all(windows, feature = "paged-title"))]
     crate::title_timeline::fence_published();
@@ -163,7 +264,15 @@ extern "system" fn creation_flags(this: This) -> u32 {
 }
 /// Where the value lives (GPU addresses are CPU addresses).
 extern "system" fn gpu_address(this: This) -> u64 {
-    (&raw const fence(this).value) as u64
+    let fence = &fence(this).state;
+    #[cfg(all(windows, feature = "paged-title"))]
+    {
+        if !fence.address_exposed.swap(true, Ordering::AcqRel) {
+            let pending = !fence.waiters.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+            if pending { direct_events::watch(fence); }
+        }
+    }
+    (&raw const fence.value) as u64
 }
 
 /// IUnknown 3, object 4, device child 1, fence 3, fence 1 (2, a console
