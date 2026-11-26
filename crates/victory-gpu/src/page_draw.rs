@@ -444,14 +444,15 @@ impl ClosedDraw {
         let sample = self.sample.as_ref()
             .map(|input| input.prepare(host, list, batch, descriptors)).transpose()?;
         let color_targets: Vec<_> = self.targets.iter().map(|target| target.copy.as_ref()).collect();
-        let words = self.shader.prepare(host, list, batch, descriptors, initialized, dirty, &color_targets)?;
-        let mut fixed_reads = crate::page_view::FixedReads::default();
+        let mut slab_reads = crate::page_view::SlabReads::default();
+        let words = self.shader.prepare(host, list, batch, descriptors, initialized, dirty,
+            &color_targets, &mut slab_reads, false)?;
         let uses_uav = self.shader.uses_uav();
         for &input in &self.inputs {
             if uses_uav {
                 input.encode(host, list, batch)?;
             } else {
-                input.encode_scoped(host, list, batch, &mut fixed_reads)?;
+                input.encode_scoped(host, list, batch, &mut slab_reads)?;
             }
         }
         list.keep(&self.pipeline);
@@ -467,7 +468,7 @@ impl ClosedDraw {
         }
         let dsv = self.depth.as_ref().map(|d| d.begin(host, list, initialized));
         // SAFETY: the proven draw owns its pipeline, root and target. The
-        // inputs were gathered in this same list from admitted pages.
+        // inputs are bound from admitted pages or retained copies of them.
         unsafe {
             let cmd = list.recording();
             // This encoder runs under the direct queue submission lock.
@@ -479,8 +480,8 @@ impl ClosedDraw {
                 }
             }
             words.shared_access.transition(cmd, false);
-            fixed_reads.transition(cmd, false);
-            fixed_reads.bind(list);
+            slab_reads.transition(cmd, false);
+            slab_reads.bind(list);
             cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
             cmd.SetGraphicsRootSignature(&self.root);
             cmd.SetPipelineState(&self.pipeline);
@@ -508,7 +509,7 @@ impl ClosedDraw {
                 }
                 DrawCall::Indirect(_) => indirect.as_ref().expect("indirect arguments prepared").execute(cmd),
             }
-            fixed_reads.transition(cmd, true);
+            slab_reads.transition(cmd, true);
             words.shared_access.transition(cmd, true);
             for (target, before) in self.targets.iter().zip(states) {
                 if before != render_target {

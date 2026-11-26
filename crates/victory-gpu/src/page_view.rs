@@ -91,27 +91,18 @@ impl InputView {
     }
 
     pub(crate) fn encode_scoped(
-        self, host: &Host, list: &HostList, batch: &PinnedBatch, reads: &mut FixedReads,
+        self, host: &Host, list: &HostList, batch: &PinnedBatch, reads: &mut SlabReads,
     ) -> Result<(), BatchError> {
-        let (start, end) = self.range()?;
-        let base = start & !(PAGE_BYTES - 1);
-        let first = batch.pinned_at(start).ok_or(BatchError::NotCaptured(start))?;
-        let mut at = base;
-        while at < end {
-            let page = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?;
-            if page.slab() != first.slab() || page.offset() != first.offset() + at - base {
-                let gathered = self.gather(host, list, batch)?;
-                // SAFETY: a budgeted, contiguous buffer retained by the list.
-                reads.views.push((self, unsafe { gathered.GetGPUVirtualAddress() }));
-                return Ok(());
-            }
-            at += PAGE_BYTES;
-        }
-        let buffer = first.buffer();
-        list.keep(buffer);
-        reads.insert(first.slab(), buffer, self.binding());
-        // SAFETY: the whole view is consecutive within the retained slab.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + first.offset() + start % PAGE_BYTES;
+        let gpu = if let Some((buffer, offset)) =
+            reads.direct(list, batch, self.range()?, 1, self.binding())?
+        {
+            // SAFETY: the full view is consecutive in the retained slab.
+            unsafe { buffer.GetGPUVirtualAddress() + offset }
+        } else {
+            let gathered = self.gather(host, list, batch)?;
+            // SAFETY: a budgeted, contiguous buffer retained by the list.
+            unsafe { gathered.GetGPUVirtualAddress() }
+        };
         reads.views.push((self, gpu));
         Ok(())
     }
@@ -154,14 +145,41 @@ impl InputView {
     }
 }
 
-/// Temporary read-only state on each slab for one fixed-function draw.
+/// Temporary read-only state on each slab for one shader invocation and its IA views.
 #[derive(Default)]
-pub(crate) struct FixedReads {
+pub(crate) struct SlabReads {
     slabs: BTreeMap<u64, (ID3D12Resource, D3D12_RESOURCE_STATES)>,
     views: Vec<(InputView, u64)>,
 }
 
-impl FixedReads {
+impl SlabReads {
+    /// Admit a bounded read only if every byte is in consecutive native
+    /// slots and the native offset meets the consumer's alignment.
+    pub(crate) fn direct(
+        &mut self, list: &HostList, batch: &PinnedBatch, (start, end): (u64, u64),
+        alignment: u64, binding: D3D12_RESOURCE_STATES,
+    ) -> Result<Option<(ID3D12Resource, u64)>, BatchError> {
+        if start >= end || end > ADDRESS_LIMIT {
+            return Err(BatchError::Range(start, end));
+        }
+        let base = start & !(PAGE_BYTES - 1);
+        let first = batch.pinned_at(start).ok_or(BatchError::NotCaptured(start))?;
+        let offset = first.offset() + start - base;
+        if offset % alignment != 0 { return Ok(None); }
+        let mut at = base + PAGE_BYTES;
+        while at < end {
+            let page = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?;
+            if page.slab() != first.slab() || page.offset() != first.offset() + at - base {
+                return Ok(None);
+            }
+            at += PAGE_BYTES;
+        }
+        let buffer = first.buffer();
+        list.keep(buffer);
+        self.insert(first.slab(), buffer, binding);
+        Ok(Some((buffer.clone(), offset)))
+    }
+
     fn insert(&mut self, slab: u64, buffer: &ID3D12Resource, binding: D3D12_RESOURCE_STATES) {
         self.slabs.entry(slab).and_modify(|(_, state)| *state = *state | binding)
             .or_insert_with(|| (buffer.clone(), binding));
@@ -179,7 +197,7 @@ impl FixedReads {
             transition(buffer, before, after)
         }).collect::<Vec<_>>();
         // SAFETY: captured slab lifetime extends to the real fence, no
-        // co-bound shader UAVs, and combined IA uses are all read-only.
+        // co-bound shader UAVs, and combined IA/SRV uses are read-only.
         unsafe { cmd.ResourceBarrier(&barriers) };
     }
 }

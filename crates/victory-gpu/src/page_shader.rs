@@ -296,25 +296,24 @@ impl PreparedShader {
 type ByteSpan = (u64, u64);
 type ReadSpan = (ByteSpan, u32); // zero stride denotes a raw view
 
-/// Descriptor-bounded buffer reads for this operation share a fence-owned
-/// buffer. Root CBVs lack a view-size guard and retain separate storage.
-struct ReadOnlyArena {
-    buffer: ID3D12Resource,
-    offsets: BTreeMap<ReadSpan, u64>,
+/// Bind bounded reads to canonical slabs when possible; pack the remaining
+/// spans into a single fence-owned buffer. Root CBVs retain separate storage.
+struct BoundedReads {
+    views: BTreeMap<ReadSpan, (ID3D12Resource, u64)>,
 }
 
-impl ReadOnlyArena {
-    fn gather(
+impl BoundedReads {
+    fn prepare(
         host: &Host, list: &HostList, batch: &PinnedBatch,
         spans: impl IntoIterator<Item = ReadSpan>,
-    ) -> Result<Option<Self>, BatchError> {
+        mut direct: Option<&mut crate::page_view::SlabReads>,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Result<Self, BatchError> {
         let spans: BTreeSet<_> = spans.into_iter().collect();
-        if spans.is_empty() {
-            return Ok(None);
-        }
+        let mut views = BTreeMap::new();
         let mut size = 0u64;
         let mut offsets = BTreeMap::new();
-        for ((start, end), stride) in spans {
+        for key @ ((start, end), stride) in spans {
             let invalid = || BatchError::Range(start, end);
             let length = end.checked_sub(start).filter(|&len| len != 0).ok_or_else(invalid)?;
             let alignment = if stride == 0 {
@@ -323,22 +322,29 @@ impl ReadOnlyArena {
                 // Least common multiple of element stride and 16-byte alignment.
                 u64::from(stride) << (4 - stride.trailing_zeros().min(4))
             };
+            if let Some(direct) = direct.as_deref_mut() {
+                if let Some(view) = direct.direct(list, batch, (start, end), alignment, state)? {
+                    views.insert(key, view);
+                    continue;
+                }
+            }
             let offset = size.checked_next_multiple_of(alignment).ok_or_else(invalid)?;
             size = offset.checked_add(length).ok_or_else(invalid)?;
-            offsets.insert(((start, end), stride), offset);
+            offsets.insert(key, offset);
         }
-        let buffer = host.default_buffer(size).ok_or_else(|| {
-            BatchError::Native(windows::Win32::Foundation::E_OUTOFMEMORY.into())
-        })?;
-        let reads = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-            | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        crate::page_view::gather_regions(list, batch, offsets.iter().map(|(&(span, _), &at)| (span, at)),
-            &buffer, D3D12_RESOURCE_STATE_COPY_DEST, reads)?;
-        Ok(Some(Self { buffer, offsets }))
+        if !offsets.is_empty() {
+            let buffer = host.default_buffer(size).ok_or_else(|| {
+                BatchError::Native(windows::Win32::Foundation::E_OUTOFMEMORY.into())
+            })?;
+            crate::page_view::gather_regions(list, batch, offsets.iter().map(|(&(span, _), &at)| (span, at)),
+                &buffer, D3D12_RESOURCE_STATE_COPY_DEST, state)?;
+            views.extend(offsets.into_iter().map(|(key, at)| (key, (buffer.clone(), at))));
+        }
+        Ok(Self { views })
     }
 
-    fn slot(arena: Option<&Self>, span: ByteSpan, stride: u32) -> Result<(&ID3D12Resource, u64), BatchError> {
-        arena.and_then(|a| a.offsets.get(&(span, stride)).map(|&at| (&a.buffer, at)))
+    fn slot(&self, span: ByteSpan, stride: u32) -> Result<(&ID3D12Resource, u64), BatchError> {
+        self.views.get(&(span, stride)).map(|(buffer, at)| (buffer, *at))
             .ok_or(BatchError::Range(span.0, span.1))
     }
 }
@@ -566,6 +572,8 @@ impl ShaderBindings {
         plan: &mut crate::page_resource::ResourcePlan,
         dirty: &mut BTreeSet<PhysicalPage>,
         color_targets: &[&crate::resource::HostTexture],
+        slab_reads: &mut crate::page_view::SlabReads,
+        compute: bool,
     ) -> Result<PreparedShader, BatchError> {
         let spans = self.tables.values().flat_map(|table| table.values()).filter_map(|view| {
             match view {
@@ -574,11 +582,14 @@ impl ShaderBindings {
                 _ => None,
             }
         });
-        let arena = ReadOnlyArena::gather(host, list, batch,
-            spans.chain(self.root_srvs.values().map(|&span| (span, 0))))?;
+        let mut state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        if !compute { state |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE; }
+        let bounded_reads = BoundedReads::prepare(host, list, batch,
+            spans.chain(self.root_srvs.values().map(|&span| (span, 0))),
+            (!self.uses_uav()).then_some(slab_reads), state)?;
         let mut root_srv_slots = BTreeMap::new();
         for (&root, &span) in &self.root_srvs {
-            let (buffer, at) = ReadOnlyArena::slot(arena.as_ref(), span, 0)?;
+            let (buffer, at) = bounded_reads.slot(span, 0)?;
             let view = TableDescriptor::Raw(buffer.clone(), at, span.1 - span.0, false);
             let slot = descriptors.reserve_table_run(&[Some(view)]).map_err(BatchError::Native)?;
             root_srv_slots.insert(root, slot);
@@ -612,14 +623,14 @@ impl ShaderBindings {
                     ClosedView::Raw(raw) if raw.unordered() => raw.prepare_uav(batch, &mut shader_dirty, 0)?,
                     ClosedView::Raw(raw) => {
                         let span = raw.range();
-                        let (buffer, at) = ReadOnlyArena::slot(arena.as_ref(), span, 0)?;
+                        let (buffer, at) = bounded_reads.slot(span, 0)?;
                         TableDescriptor::Raw(buffer.clone(), at, span.1 - span.0, false)
                     }
                     ClosedView::Structured(view, stride) if view.unordered() =>
                         view.prepare_uav(batch, &mut shader_dirty, *stride)?,
                     ClosedView::Structured(view, stride) => {
                         let span = view.range();
-                        let (buffer, at) = ReadOnlyArena::slot(arena.as_ref(), span, *stride)?;
+                        let (buffer, at) = bounded_reads.slot(span, *stride)?;
                         let elements = ((span.1 - span.0) / u64::from(*stride)) as u32;
                         TableDescriptor::Structured(buffer.clone(), at, elements, *stride, false)
                     }
