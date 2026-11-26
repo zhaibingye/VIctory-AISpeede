@@ -99,11 +99,10 @@ and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
 `amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
 upscaler for your GPU (the log says so), the title's own DLLs run.
 
-窗口标题显示帧率。默认在游戏 EXE 所在目录的上一级创建 `data` 和 `cache`，
-分别保存存档、设置、`crashes.log` 和可重建的缓存。环境变量和
-`victory.toml` 中显式设置的路径仍优先；旧目录里的文件不会自动搬动。
-没有选中的 EXE 时，使用配置中的游戏目录推导；没有配置游戏目录时，
-沿用系统用户目录。
+窗口标题显示帧率。默认在 `victory.exe` 所在目录创建 `data` 和 `cache`：
+前者保存存档、设置和 `crashes.log`，后者保存可重建的缓存。环境变量和
+`victory.toml` 中显式设置的路径仍优先；旧文件不会自动搬动。可执行文件若
+位于源码仓库内（例如使用 `cargo run`），请显式指定仓库外的缓存和存档路径。
 
 Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
 top-level window to that bounding box. Smaller windows keep their size,

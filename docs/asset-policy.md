@@ -37,7 +37,8 @@ accepted.
 ## Where data lives
 
 游戏、测试标题、缓存和存档必须位于仓库外。可在 `victory.toml` 配置路径。
-未指定缓存或存档路径时，默认在游戏目录的上一级创建 `cache` 和 `data`。
+未指定缓存或存档路径时，默认在 `victory.exe` 所在目录创建 `cache` 和 `data`。
+若程序位于源码仓库内，请显式设置仓库外的路径。
 
 ## Enforcement
 

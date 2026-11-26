@@ -323,17 +323,8 @@ pub fn run(
 /// then the shader pack's pipelines go into the pipeline library
 /// (`prebuild`).
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
-    // 只有一个明确选中的游戏目录时，预编译和启动才使用同一套默认缓存。
-    let mut titles = paths.iter().filter(|path| {
-        path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-    });
-    let selected = titles.next().filter(|first| titles.all(|path| path.parent() == first.parent()));
-    let cfg = if let Some(exe) = selected {
-        victory_core::Config::load_for_title(exe)?
-    } else {
-        victory_core::Config::load()?
-    };
     let paths = crate::default_paths(paths)?;
+    let cfg = victory_core::Config::load()?;
     let shaders = cfg.cache_subdir("shaders")?;
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
         anyhow::bail!("no shader cache in {}", shaders.display());
