@@ -95,6 +95,7 @@ pub(crate) enum TextureInput {
         copy: std::sync::Arc<crate::resource::HostTexture>,
         format: DXGI_FORMAT,
         exact_backing: bool,
+        depth_plane: bool,
         compatible_input: Option<LinearTexture>,
     },
 }
@@ -177,7 +178,7 @@ impl TextureInput {
                 && input.height == desc.Height && !copy.uses_unproven_alias_backing()
         });
         let exact_backing = extended || plain || compatible_input.is_some();
-        Some(Self::Native { copy, format, exact_backing, compatible_input })
+        Some(Self::Native { copy, format, exact_backing, depth_plane: false, compatible_input })
     }
 
     pub(crate) fn scoped_color(
@@ -227,7 +228,7 @@ impl TextureInput {
         {
             return None;
         }
-        Some(Self::Native { copy, format, exact_backing: true, compatible_input: None })
+        Some(Self::Native { copy, format, exact_backing: true, depth_plane: true, compatible_input: None })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -272,7 +273,7 @@ impl TextureInput {
     pub(crate) fn is_native_depth_read_of(
         &self, target: &std::sync::Arc<crate::resource::HostTexture>,
     ) -> bool {
-        matches!(self, Self::Native { copy, exact_backing: true, compatible_input: None, .. }
+        matches!(self, Self::Native { copy, depth_plane: true, .. }
             if std::sync::Arc::ptr_eq(copy, target)
                 && !copy.has_pointer_exposure() && !copy.uses_unproven_alias_backing())
     }
@@ -335,7 +336,7 @@ impl TextureInput {
                 }
                 Ok((input.encode(host, list, batch)?, input.format))
             }
-            Self::Native { copy, format, exact_backing, compatible_input } => {
+            Self::Native { copy, format, exact_backing, depth_plane, compatible_input } => {
                 if shared.is_some() || *exact_backing && (copy.uses_unproven_alias_backing()
                     || copy.twin.get().is_some_and(Option::is_some))
                 {
@@ -353,7 +354,12 @@ impl TextureInput {
                 {
                     return Ok((input.encode(host, list, batch)?, input.format));
                 }
-                plan.require_native(host, list, batch, copy)?;
+                if *depth_plane {
+                    if pointer_backed { return Err(BatchError::UnsupportedTextureMap); }
+                    plan.require_depth_planes(copy, 1)?;
+                } else {
+                    plan.require_native(host, list, batch, copy)?;
+                }
                 let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 plan.transition_texture(list, copy, state.0 as u32)?;
                 list.keep(&copy.texture);

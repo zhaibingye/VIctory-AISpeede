@@ -247,10 +247,6 @@ impl DepthTarget {
         Ok(())
     }
 
-    fn authoritative(&self, plan: &ResourcePlan) -> bool {
-        plan.authoritative(&self.copy)
-    }
-
     fn desired(&self, sampled: bool) -> D3D12_RESOURCE_STATES {
         if !self.read_only {
             return D3D12_RESOURCE_STATE_DEPTH_WRITE;
@@ -309,8 +305,14 @@ impl DepthClear {
         {
             return Err(BatchError::UnsupportedDepth);
         }
-        if (!self.rects.is_empty() || self.flags != planes) && !self.target.authoritative(initialized) {
-            return Err(BatchError::TargetNotInitialized);
+        // SAFETY: the retained texture owns the checked single-mip DSV.
+        let tex = unsafe { self.target.copy.texture.GetDesc() };
+        let replaces_planes = self.rects.is_empty() || self.rects.iter().any(|rect| {
+            rect.left == 0 && rect.top == 0 && rect.right > 0 && rect.bottom > 0
+                && rect.right as u64 == tex.Width && rect.bottom as u32 == tex.Height
+        });
+        if !replaces_planes {
+            initialized.require_depth_planes(&self.target.copy, self.flags)?;
         }
         let desired = self.target.desired(false);
         let (handle, before) = self.target.begin(host, list, initialized, desired);
@@ -321,7 +323,7 @@ impl DepthClear {
                 self.depth, self.stencil, rects);
         }
         self.target.end(list, before, desired);
-        initialized.record_write(&self.target.copy)?;
+        initialized.record_depth_writes(&self.target.copy, self.flags)?;
         Ok(())
     }
 }
@@ -331,6 +333,8 @@ pub(crate) struct ClosedDraw {
     root: ID3D12RootSignature,
     targets: Vec<ColorTarget>,
     depth: Option<DepthTarget>,
+    depth_tests: u32,
+    depth_writes: u32,
     stencil_ref: u32,
     topology: D3D_PRIMITIVE_TOPOLOGY,
     viewport: D3D12_VIEWPORT,
@@ -352,7 +356,7 @@ impl ClosedDraw {
     #[cfg(feature = "paged-title")]
     pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
         out.extend(self.targets.iter().map(|target| &target.copy));
-        if let Some(depth) = &self.depth && !depth.read_only { out.push(&depth.copy); }
+        if let Some(depth) = &self.depth && self.depth_writes != 0 { out.push(&depth.copy); }
     }
 
     // The trusted producer must prove that the pipeline has no shader
@@ -370,7 +374,7 @@ impl ClosedDraw {
         call: DrawCall,
     ) -> Self {
         Self {
-            pipeline, root, targets: vec![target], depth: None, stencil_ref: 0, topology, viewport, scissor, inputs, call,
+            pipeline, root, targets: vec![target], depth: None, depth_tests: 0, depth_writes: 0, stencil_ref: 0, topology, viewport, scissor, inputs, call,
             shader: ShaderBindings::default(),
             blend_factor: [1.0; 4],
             sample: None,
@@ -410,7 +414,8 @@ impl ClosedDraw {
         }
         let shader = ShaderBindings::capture(pipeline, values, view, address)?;
         if depth.as_ref().is_some_and(|d| {
-            d.read_only && pipeline.closed_depth_writes & d.planes != 0
+            pipeline.closed_depth_tests & !d.planes != 0
+                || d.read_only && pipeline.closed_depth_writes != 0
                 || shader.samples_target(&d.copy) && (!d.read_only || !shader.depth_reads_are_exact(&d.copy))
         }) {
             return Err(UnloweredShader::GraphicsState);
@@ -439,7 +444,8 @@ impl ClosedDraw {
         }
         Ok(Self {
             pipeline: pipeline.pso.clone(), root: pipeline.root.clone(),
-            targets, depth, stencil_ref, topology, viewport, scissor, inputs, call, shader,
+            targets, depth, depth_tests: pipeline.closed_depth_tests, depth_writes: pipeline.closed_depth_writes,
+            stencil_ref, topology, viewport, scissor, inputs, call, shader,
             blend_factor: [1.0; 4],
             sample: None,
         })
@@ -475,9 +481,7 @@ impl ClosedDraw {
     ) -> Result<(), BatchError> {
         if let Some(depth) = &self.depth {
             depth.validate_samples()?;
-            if !depth.authoritative(initialized) {
-                return Err(BatchError::TargetNotInitialized);
-            }
+            initialized.require_depth_planes(&depth.copy, self.depth_tests)?;
         }
         let sampled_depth = self.depth.as_ref().is_some_and(|d| self.shader.samples_target(&d.copy));
         if let Some(depth) = &self.depth && depth.read_only
@@ -585,9 +589,7 @@ impl ClosedDraw {
         }
         if let (Some(depth), Some((_, before, desired))) = (&self.depth, dsv) {
             depth.end(list, before, desired);
-            if !depth.read_only {
-                initialized.record_write(&depth.copy)?;
-            }
+            initialized.record_depth_writes(&depth.copy, self.depth_writes)?;
         }
         for target in &self.targets {
             initialized.record_color_write(&target.copy, target.sub)?;

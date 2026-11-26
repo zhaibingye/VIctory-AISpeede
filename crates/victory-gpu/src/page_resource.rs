@@ -138,8 +138,26 @@ impl ResourcePlan {
         }
     }
 
-    pub(crate) fn record_write(&mut self, copy: &Arc<HostTexture>) -> Result<(), BatchError> {
-        self.record_write_at(copy, None)
+    /// DSV formats in the closed renderer have one mip and slice.
+    /// Track depth (plane 0) and stencil (plane 1) independently.
+    pub(crate) fn require_depth_planes(&self, copy: &Arc<HostTexture>, mask: u32) -> Result<(), BatchError> {
+        for plane in 0..2 {
+            if mask & (1 << plane) != 0
+                && !self.version_at(copy, Some(plane)).is_some_and(|v| v.representation == Representation::NativeGpu)
+            {
+                return Err(BatchError::TargetNotInitialized);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_depth_writes(&mut self, copy: &Arc<HostTexture>, mask: u32) -> Result<(), BatchError> {
+        for plane in 0..2 {
+            if mask & (1 << plane) != 0 {
+                self.record_write_at(copy, Some(plane))?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn record_color_write(&mut self, copy: &Arc<HostTexture>, sub: ColorSubresource) -> Result<(), BatchError> {
@@ -446,7 +464,7 @@ impl TextureResolve {
         // SAFETY: typed format, resource extents, samples, source authority
         // and native resolve states are proven; subresource zero is the whole target.
         unsafe { list.recording().ResolveSubresource(&self.dst.texture, 0, &self.src.texture, 0, self.format) };
-        plan.record_write(&self.dst)
+        plan.record_write_at(&self.dst, None)
     }
 }
 
