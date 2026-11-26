@@ -53,6 +53,46 @@ struct Completion {
     digests: BTreeMap<PhysicalPage, blake3::Hash>,
 }
 
+/// Ownership boundary between enqueue and completion. The command
+/// allocator, retained resources, descriptor reservations and targets
+/// all survive until the real render fence is observed.
+#[must_use]
+struct SubmittedRender<'a> {
+    fence: Fence,
+    list: HostList,
+    descriptors: PageDescriptors<'a>,
+    targets: crate::page_resource::ResourcePlan,
+    bitmap: NonNull<u8>,
+    bitmap_words: usize,
+}
+
+struct CompletedRender<'a> {
+    _list: HostList,
+    _descriptors: PageDescriptors<'a>,
+    bitmap: NonNull<u8>,
+    bitmap_words: usize,
+}
+
+impl<'a> SubmittedRender<'a> {
+    fn observe(self, host: &Host) -> CompletedRender<'a> {
+        let completed = host.await_native_group(self.fence)
+            .unwrap_or_else(|e| fail(format_args!("native paged render fence: {e}")));
+        self.targets.commit(self.fence, completed);
+        CompletedRender {
+            _list: self.list, _descriptors: self.descriptors,
+            bitmap: self.bitmap, bitmap_words: self.bitmap_words,
+        }
+    }
+}
+
+impl CompletedRender<'_> {
+    fn bitmap(&self) -> &[u32] {
+        // SAFETY: the fence completed, the bitmap is not writable by
+        // another submission, and the retained list owns the mapping.
+        unsafe { std::slice::from_raw_parts(self.bitmap.as_ptr().cast(), self.bitmap_words) }
+    }
+}
+
 /// One heap's reserved descriptor slots. They are released only after the
 /// direct-queue fence, or when a recording was never executed.
 pub(crate) struct PageDescriptors<'a> {
@@ -357,19 +397,17 @@ fn run(
     list.close();
     let command = list.recording().cast().map_err(native)?;
     let rendered = host
-        .run_native_group(signal, &[Some(command)])
+        .submit_native_group(signal, &[Some(command)])
         .unwrap_or_else(|e| fail(format_args!("native paged render submission: {e}")));
-    let observed = host.completed_fence()
-        .unwrap_or_else(|| fail(format_args!("native paged device was removed")));
+    let render = SubmittedRender {
+        fence: rendered, list, descriptors: pairs, targets,
+        bitmap: bitmap_ptr, bitmap_words,
+    };
+    // Keep CPU-visible semantics unchanged for now. Moving this
+    // observation later requires proving which guest bytes are visible.
+    let completed_render = render.observe(host);
 
-    // VNME publishes the version only after observing its real fence.
-    targets.commit(rendered, observed);
-
-    // SAFETY: the rendering fence completed; this bitmap is fully
-    // initialized and no other submission uses it.
-    let bitmap_slice =
-        unsafe { std::slice::from_raw_parts(bitmap_ptr.as_ptr().cast::<u32>(), bitmap_words) };
-    let mut dirty = leaves.dirty_pages(bitmap_slice).unwrap_or_else(|leaf| {
+    let mut dirty = leaves.dirty_pages(completed_render.bitmap()).unwrap_or_else(|leaf| {
         fail(format_args!(
             "paged dispatch accessed unbound page-table leaf {leaf}"
         ))

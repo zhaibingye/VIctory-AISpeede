@@ -1156,24 +1156,54 @@ impl Host {
         (completed != u64::MAX).then_some(victory_memory::coherence::Fence(completed))
     }
 
-    /// Signal once for an entire native list group. The caller holds the
-    /// submission lock across preparation and physical writeback.
-    pub(crate) fn run_native_group(
+    /// Enqueue closed lists and signal once, without observing completion.
+    /// The caller holds the direct queue lock and keeps all referenced
+    /// objects alive until the returned fence completes.
+    pub(crate) fn submit_native_group(
         &self, submitted: &mut u64, group: &[Option<ID3D12CommandList>],
     ) -> windows::core::Result<victory_memory::coherence::Fence> {
         *submitted = submitted.checked_add(1).filter(|&v| v != u64::MAX)
             .ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
-        // SAFETY: callers supply closed lists and serialize the device event
-        // and queue with the submission lock.
+        // SAFETY: the caller supplies closed lists and serializes submission.
         unsafe {
             self.queue.ExecuteCommandLists(group);
             self.queue.Signal(&self.fence, *submitted)?;
-            self.fence.SetEventOnCompletion(*submitted, self.event)?;
+        }
+        Ok(victory_memory::coherence::Fence(*submitted))
+    }
+
+    /// Observe a native fence. Only the direct queue lock holder may use
+    /// the shared host event. Return the actual observed progress.
+    pub(crate) fn await_native_group(
+        &self, fence: victory_memory::coherence::Fence,
+    ) -> windows::core::Result<victory_memory::coherence::Fence> {
+        use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+        let observed = || self.completed_fence().ok_or_else(|| windows::core::Error::from(DXGI_ERROR_DEVICE_REMOVED));
+        let completed = observed()?;
+        if completed.0 >= fence.0 {
+            return Ok(completed);
+        }
+        // SAFETY: event and fence are live, and the direct queue lock
+        // serializes registration and consumption of the event.
+        unsafe {
+            self.fence.SetEventOnCompletion(fence.0, self.event)?;
             if WaitForSingleObject(self.event, INFINITE) != WAIT_OBJECT_0 {
                 return Err(windows::core::Error::from_thread());
             }
         }
-        Ok(victory_memory::coherence::Fence(*submitted))
+        let completed = observed()?;
+        if completed.0 < fence.0 {
+            return Err(windows::Win32::Foundation::E_FAIL.into());
+        }
+        Ok(completed)
+    }
+
+    pub(crate) fn run_native_group(
+        &self, submitted: &mut u64, group: &[Option<ID3D12CommandList>],
+    ) -> windows::core::Result<victory_memory::coherence::Fence> {
+        let fence = self.submit_native_group(submitted, group)?;
+        self.await_native_group(fence)?;
+        Ok(fence)
     }
 
     pub(crate) fn direct_queue(&self) -> std::sync::MutexGuard<'_, u64> {
