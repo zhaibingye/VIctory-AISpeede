@@ -47,7 +47,10 @@ pub(crate) enum DescriptorSlotReason {
         phase: crate::descriptor::TextureSrvReject,
     },
     UnsupportedBuffer,
-    UnsupportedTextureWrite { title_format: Option<u32>, view_format: Option<i32>, view_dimension: Option<i32> },
+    UnsupportedTextureWrite {
+        title_format: Option<u32>, view_format: Option<i32>, view_dimension: Option<i32>,
+        phase: crate::page_uav::TextureUavReject,
+    },
     TextureWriteRange { host_format: i32, xyz_max: (u32, u32, Option<u32>) },
     UnsupportedAccess,
     OutsideRangeOrConflictingView,
@@ -512,9 +515,9 @@ impl ShaderBindings {
                                 }
                             }
                             StaticViewAccess::TextureWrite { .. } if pipeline.compute => {
-                                ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).ok_or_else(|| {
+                                ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).map_err(|phase| {
                                     let (title_format, view_format, view_dimension) = crate::descriptor::host::paged_uav_format(&actual);
-                                    reason(DescriptorSlotReason::UnsupportedTextureWrite { title_format, view_format, view_dimension })
+                                    reason(DescriptorSlotReason::UnsupportedTextureWrite { title_format, view_format, view_dimension, phase })
                                 })?)
                             }
                             StaticViewAccess::ConstantTable { .. } => {

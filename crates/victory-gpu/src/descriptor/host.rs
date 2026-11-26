@@ -999,14 +999,14 @@ pub(crate) fn paged_texture_uav_desc(
     D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: format, ViewDimension: dimension, Anonymous: fields }
 }
 
-fn exact_texture_uav(view: &View) -> Option<(
+fn exact_texture_uav(view: &View) -> Result<(
     std::sync::Arc<crate::resource::HostTexture>, DXGI_FORMAT, Option<crate::page_uav::TextureUavSelection>,
-)> {
-    use crate::page_uav::TextureUavSelection;
-    let View::Unordered(resource, 0, words) = view else { return None; };
+), crate::page_uav::TextureUavReject> {
+    use crate::page_uav::{TextureUavReject::*, TextureUavSelection};
+    let View::Unordered(resource, 0, words) = view else { return Err(ViewKind); };
     let resource = *resource as crate::object::This;
     if crate::resource::stands_in(resource) {
-        return None;
+        return Err(SurrogateFormat);
     }
     let (format, selection) = if let Some(words) = words {
         let desc = uav_desc(words);
@@ -1014,13 +1014,13 @@ fn exact_texture_uav(view: &View) -> Option<(
             D3D12_UAV_DIMENSION_TEXTURE2D => {
                 // SAFETY: the dimension selects Texture2D.
                 let tex = unsafe { desc.Anonymous.Texture2D };
-                if tex.PlaneSlice != 0 { return None; }
+                if tex.PlaneSlice != 0 { return Err(ViewShape); }
                 TextureUavSelection { mip: tex.MipSlice, slices: None, volume: None }
             }
             D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
                 // SAFETY: the dimension selects Texture2DArray.
                 let tex = unsafe { desc.Anonymous.Texture2DArray };
-                if tex.PlaneSlice != 0 || tex.ArraySize == 0 || tex.ArraySize == u32::MAX { return None; }
+                if tex.PlaneSlice != 0 || tex.ArraySize == 0 || tex.ArraySize == u32::MAX { return Err(ViewShape); }
                 TextureUavSelection {
                     mip: tex.MipSlice,
                     slices: Some(crate::page_texture::MipSelection { first: tex.FirstArraySlice, count: tex.ArraySize }),
@@ -1036,13 +1036,13 @@ fn exact_texture_uav(view: &View) -> Option<(
                     volume: Some(crate::page_texture::MipSelection { first: tex.FirstWSlice, count: tex.WSize }),
                 }
             }
-            _ => return None,
+            _ => return Err(ViewShape),
         };
         (desc.Format, Some(selection))
     } else {
-        (DXGI_FORMAT(crate::resource::title_format(resource)? as i32), None)
+        (DXGI_FORMAT(crate::resource::title_format(resource).ok_or(ViewKind)? as i32), None)
     };
-    Some((crate::resource::host_copy(resource)?, format, selection))
+    Ok((crate::resource::host_copy(resource).ok_or(NativeAllocation)?, format, selection))
 }
 
 /// 只取诊断所需的格式和视图维度，不记录地址或资源内容。
@@ -1057,7 +1057,8 @@ pub(crate) fn paged_uav_format(view: &View) -> (Option<u32>, Option<i32>, Option
     }
 }
 
-pub(crate) fn paged_shader_texture_uav(view: &View) -> Option<crate::page_uav::ShaderTextureUav> {
+pub(crate) fn paged_shader_texture_uav(view: &View)
+    -> Result<crate::page_uav::ShaderTextureUav, crate::page_uav::TextureUavReject> {
     let (target, format, selection) = exact_texture_uav(view)?;
     crate::page_uav::ShaderTextureUav::capture(target, format, selection)
 }
@@ -1065,7 +1066,7 @@ pub(crate) fn paged_shader_texture_uav(view: &View) -> Option<crate::page_uav::S
 pub(crate) fn paged_texture_clear(
     view: &View, values: [u32; 4], float: bool, rects: &[windows::Win32::Foundation::RECT],
 ) -> Option<crate::page_uav::TextureClear> {
-    let (target, format, selection) = exact_texture_uav(view)?;
+    let (target, format, selection) = exact_texture_uav(view).ok()?;
     crate::page_uav::TextureClear::capture(target, format, selection, values, float, rects)
 }
 
