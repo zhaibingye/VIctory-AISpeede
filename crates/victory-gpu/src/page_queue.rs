@@ -235,12 +235,12 @@ pub(crate) struct PageDescriptors<'a> {
     pub(crate) heap: &'a HostHeap,
     slots: Vec<u32>,
     textures: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>,
-    raw_uavs: Vec<u32>,
+    raw_views: Vec<(u32, bool)>,
 }
 
 pub(crate) enum TableDescriptor {
     Texture(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT),
-    RawUav(ID3D12Resource, u64, u64),
+    Raw(ID3D12Resource, u64, u64, bool),
 }
 
 impl PageDescriptors<'_> {
@@ -256,7 +256,7 @@ impl PageDescriptors<'_> {
     ) -> Result<u32> {
         let slot = self.heap.dynamic(1).ok_or_else(oom)?;
         self.heap.raw_view_at(slot, Some(buffer), offset, bytes, true);
-        self.raw_uavs.push(slot);
+        self.raw_views.push((slot, true));
         Ok(slot)
     }
 
@@ -270,9 +270,9 @@ impl PageDescriptors<'_> {
             use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
             let slot = first + offset as u32;
             match view {
-                Some(TableDescriptor::RawUav(buffer, at, len)) => {
-                    self.heap.raw_view_at(slot, Some(buffer), *at, *len, true);
-                    self.raw_uavs.push(slot);
+                Some(TableDescriptor::Raw(buffer, at, len, unordered)) => {
+                    self.heap.raw_view_at(slot, Some(buffer), *at, *len, *unordered);
+                    self.raw_views.push((slot, *unordered));
                 }
                 _ => {
                     let (resource, format) = match view {
@@ -301,8 +301,8 @@ impl PageDescriptors<'_> {
 
 impl Drop for PageDescriptors<'_> {
     fn drop(&mut self) {
-        for slot in self.raw_uavs.drain(..) {
-            self.heap.raw_view_at(slot, None, 0, 0, true);
+        for (slot, unordered) in self.raw_views.drain(..) {
+            self.heap.raw_view_at(slot, None, 0, 0, unordered);
             self.heap.release(slot, 1);
         }
         for (slot, format) in self.textures.drain(..) {
@@ -602,7 +602,7 @@ fn run(
         heap,
         slots: Vec::new(),
         textures: Vec::new(),
-        raw_uavs: Vec::new(),
+        raw_views: Vec::new(),
     };
     let mut raw = RawPageTable::new(pairs.reserve(None, 0).map_err(native)?);
     let leaves = batch.bind(&mut raw, |pin| {

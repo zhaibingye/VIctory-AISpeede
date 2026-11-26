@@ -79,23 +79,28 @@ impl RawClear {
 
 /// A captured descriptor prefix and its independently proven access windows.
 /// Keeping the prefix preserves byte offsets in the translated shader.
-pub(crate) struct BoundedRawUav {
+pub(crate) struct BoundedRawView {
+    unordered: bool,
     start: u64,
     limit: u64,
     end: u64,
     writes: Vec<(u64, u64)>,
 }
 
-impl BoundedRawUav {
-    pub(crate) fn new(start: u64, limit: u64) -> Option<Self> {
-        (start != 0 && start.is_multiple_of(16) && start < limit && limit <= ADDRESS_LIMIT)
-            .then_some(Self { start, limit, end: start, writes: Vec::new() })
+impl BoundedRawView {
+    pub(crate) fn new(start: u64, limit: u64, unordered: bool) -> Option<Self> {
+        let alignment = if unordered { 16 } else { 4 };
+        (start != 0 && start.is_multiple_of(alignment) && start < limit && limit <= ADDRESS_LIMIT)
+            .then_some(Self { unordered, start, limit, end: start, writes: Vec::new() })
     }
+
+    pub(crate) fn unordered(&self) -> bool { self.unordered }
 
     pub(crate) fn allow_access(&mut self, offset: u32, bytes: u32, write: bool) -> Option<()> {
         let start = self.start.checked_add(u64::from(offset))?;
         let end = start.checked_add(u64::from(bytes))?;
-        if bytes == 0 || !offset.is_multiple_of(4) || !bytes.is_multiple_of(4) || end > self.limit {
+        if bytes == 0 || !offset.is_multiple_of(4) || !bytes.is_multiple_of(4)
+            || end > self.limit || write && !self.unordered {
             return None;
         }
         self.end = self.end.max(end);
@@ -108,8 +113,21 @@ impl BoundedRawUav {
     pub(crate) fn range(&self) -> (u64, u64) { (self.start, self.end) }
 
     pub(crate) fn prepare(
-        &self, batch: &PinnedBatch, dirty: &mut BTreeSet<PhysicalPage>,
+        &self, host: &Host, list: &HostList, batch: &PinnedBatch, dirty: &mut BTreeSet<PhysicalPage>,
     ) -> Result<crate::page_queue::TableDescriptor, BatchError> {
+        if !self.unordered {
+            use windows::Win32::Graphics::Direct3D12::*;
+            let bytes = self.end - self.start;
+            let copy = host.default_buffer(bytes).ok_or_else(|| {
+                BatchError::Native(windows::Win32::Foundation::E_OUTOFMEMORY.into())
+            })?;
+            // A slab is in UAV state. Gather to a retained SRV snapshot
+            // at the point of use, after preceding GPU writes.
+            crate::page_view::gather_span(list, batch, self.range(), &copy,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)?;
+            return Ok(crate::page_queue::TableDescriptor::Raw(copy, 0, bytes, false));
+        }
         let first = batch.pinned_at(self.start).ok_or(BatchError::NotCaptured(self.start))?;
         let page_base = self.start & !(PAGE_BYTES - 1);
         let mut at = page_base;
@@ -129,8 +147,8 @@ impl BoundedRawUav {
                 at += PAGE_BYTES;
             }
         }
-        Ok(crate::page_queue::TableDescriptor::RawUav(
-            first.buffer().clone(), first.offset() + self.start % PAGE_BYTES, self.end - self.start,
+        Ok(crate::page_queue::TableDescriptor::Raw(
+            first.buffer().clone(), first.offset() + self.start % PAGE_BYTES, self.end - self.start, true,
         ))
     }
 }

@@ -7,7 +7,7 @@ use crate::page_queue::PageDescriptors;
 use crate::page_slabs::{BatchError, PinnedBatch};
 use crate::descriptor::View;
 use crate::page_texture::TextureInput;
-use crate::page_uav::BoundedRawUav;
+use crate::page_uav::BoundedRawView;
 use crate::page_queue::TableDescriptor;
 use victory_shader::emit::StaticViewAccess;
 use victory_memory::{PAGE_BYTES, physical::PhysicalPage};
@@ -223,7 +223,7 @@ pub(crate) struct ShaderBindings {
 
 enum ClosedView {
     Texture(TextureInput),
-    Raw(BoundedRawUav),
+    Raw(BoundedRawView),
 }
 
 #[derive(Clone, Copy)]
@@ -320,10 +320,16 @@ impl ShaderBindings {
                         let bound = match proof.access {
                             StaticViewAccess::TextureRead => ClosedView::Texture(
                                 actual.paged_texture_srv().ok_or(UnloweredShader::DescriptorTable)?),
+                            StaticViewAccess::RawSrv { .. } => {
+                                let (start, end) = crate::descriptor::host::paged_raw_srv_range(&actual)
+                                    .ok_or(UnloweredShader::DescriptorTable)?;
+                                ClosedView::Raw(BoundedRawView::new(start, end, false)
+                                    .ok_or(UnloweredShader::DescriptorTable)?)
+                            }
                             StaticViewAccess::RawUav { .. } if pipeline.compute => {
                                 let (start, end) = crate::descriptor::host::paged_raw_range(&actual)
                                     .ok_or(UnloweredShader::DescriptorTable)?;
-                                ClosedView::Raw(BoundedRawUav::new(start, end)
+                                ClosedView::Raw(BoundedRawView::new(start, end, true)
                                     .ok_or(UnloweredShader::DescriptorTable)?)
                             }
                             _ => return Err(reject),
@@ -332,7 +338,10 @@ impl ShaderBindings {
                     }
                     match (table.get_mut(&slot.index), proof.access) {
                         (Some(ClosedView::Texture(_)), StaticViewAccess::TextureRead) => {},
-                        (Some(ClosedView::Raw(raw)), StaticViewAccess::RawUav { offset, bytes, write }) => {
+                        (Some(ClosedView::Raw(raw)), StaticViewAccess::RawSrv { offset, bytes }) if !raw.unordered() => {
+                            raw.allow_access(offset, bytes, false).ok_or(UnloweredShader::DescriptorTable)?;
+                        }
+                        (Some(ClosedView::Raw(raw)), StaticViewAccess::RawUav { offset, bytes, write }) if raw.unordered() => {
                             raw.allow_access(offset, bytes, write).ok_or(UnloweredShader::DescriptorTable)?;
                         }
                         _ => return Err(reject),
@@ -366,7 +375,7 @@ impl ShaderBindings {
 
     pub(crate) fn uses_raw_uav(&self) -> bool {
         self.tables.values().flat_map(|table| table.values())
-            .any(|view| matches!(view, ClosedView::Raw(_)))
+            .any(|view| matches!(view, ClosedView::Raw(raw) if raw.unordered()))
     }
 
     pub(crate) fn prepare(
@@ -386,7 +395,7 @@ impl ShaderBindings {
                         let (resource, format) = texture.encode(host, list, batch, plan)?;
                         TableDescriptor::Texture(resource, format)
                     }
-                    ClosedView::Raw(raw) => raw.prepare(batch, &mut shader_dirty)?,
+                    ClosedView::Raw(raw) => raw.prepare(host, list, batch, &mut shader_dirty)?,
                 });
             }
             let first = descriptors.reserve_table_run(&views).map_err(BatchError::Native)?;
@@ -397,8 +406,10 @@ impl ShaderBindings {
             // the same physical pages needs a single directly shared view.
             let mut reads: Vec<_> = self.cbvs.iter().map(|(_, span)| span.range()).collect();
             for view in self.tables.values().flat_map(|table| table.values()) {
-                if let ClosedView::Texture(tex) = view {
-                    tex.ranges(&mut reads)?;
+                match view {
+                    ClosedView::Texture(tex) => tex.ranges(&mut reads)?,
+                    ClosedView::Raw(raw) if !raw.unordered() => reads.push(raw.range()),
+                    _ => {},
                 }
             }
             for (start, end) in reads {

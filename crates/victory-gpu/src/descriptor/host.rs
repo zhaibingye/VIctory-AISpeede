@@ -901,6 +901,22 @@ pub(crate) fn raw_uav_desc(first: u64, elements: u32) -> D3D12_UNORDERED_ACCESS_
     }
 }
 
+pub(crate) fn paged_raw_srv_range(view: &View) -> Option<(u64, u64)> {
+    let View::Shader(resource, Some(words)) = view else { return None; };
+    let desc = srv_desc(words);
+    if desc.Format != DXGI_FORMAT_R32_TYPELESS || desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER
+        || desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+    {
+        return None;
+    }
+    // SAFETY: the dimension selects Buffer.
+    let raw = unsafe { desc.Anonymous.Buffer };
+    if raw.Flags != D3D12_BUFFER_SRV_FLAG_RAW || raw.StructureByteStride != 0 {
+        return None;
+    }
+    checked_raw_buffer(*resource, raw.FirstElement, raw.NumElements)
+}
+
 pub(crate) fn paged_raw_range(view: &View) -> Option<(u64, u64)> {
     let View::Unordered(resource, 0, Some(words)) = view else { return None };
     let desc = uav_desc(words);
@@ -912,12 +928,17 @@ pub(crate) fn paged_raw_range(view: &View) -> Option<(u64, u64)> {
     if raw.Flags != D3D12_BUFFER_UAV_FLAG_RAW || raw.StructureByteStride != 0 || raw.CounterOffsetInBytes != 0 {
         return None;
     }
-    let (base, size) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
-    let offset = raw.FirstElement.checked_mul(4)?;
-    let len = u64::from(raw.NumElements) * 4;
+    checked_raw_buffer(*resource, raw.FirstElement, raw.NumElements)
+}
+
+fn checked_raw_buffer(resource: usize, first: u64, elements: u32) -> Option<(u64, u64)> {
+    let (base, size) = crate::resource::buffer_bytes(resource as crate::object::This)?;
+    let offset = first.checked_mul(4)?;
+    let len = u64::from(elements) * 4;
     let stop = offset.checked_add(len)?;
-    if stop > size { return None; }
-    if base.is_null() { return None; }
+    if len == 0 || stop > size || base.is_null() {
+        return None;
+    }
     Some(((base as u64).checked_add(offset)?, (base as u64).checked_add(stop)?))
 }
 

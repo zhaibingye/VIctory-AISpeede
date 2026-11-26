@@ -21,6 +21,7 @@ pub enum StaticViewAccess {
     TextureRead,
     /// An immediate aligned byte window on a raw UAV, as used by DXIL.
     RawUav { offset: u32, bytes: u32, write: bool },
+    RawSrv { offset: u32, bytes: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -81,10 +82,10 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
         if resources.waterfall.loads.contains(&load) {
             return Ok(None);
         }
-        let Some(slot) = addresses.get(&load).and_then(|a| proven_slot(&native, *a, first, access)) else {
+        let Some(view) = addresses.get(&load).and_then(|a| proven_slot(&native, *a, first, access)) else {
             return Ok(None);
         };
-        slots.insert(StaticViewSlot { slot, access });
+        slots.insert(view);
     }
     Ok(Some(slots.into_iter().collect()))
 }
@@ -130,7 +131,7 @@ fn table_slot(address: Address, first: u8) -> Option<u32> {
 
 fn proven_slot(
     native: &NativeProgram, address: Address, first: u8, access: StaticViewAccess,
-) -> Option<StaticTextureSlot> {
+) -> Option<StaticViewSlot> {
     let param = native.layout.get(address.param)?;
     let index = table_slot(address, first)?;
     if param.root != RootType::Table {
@@ -146,14 +147,20 @@ fn proven_slot(
     if used.slot != param.slot {
         return None;
     }
-    let admitted = match access {
-        StaticViewAccess::TextureRead => used.kind == ResourceType::Srv && used.dwords == 8,
-        StaticViewAccess::RawUav { .. } => {
-            used.kind == ResourceType::Uav && used.dwords == 4 && used.stride == 0
-                && relevant.filter(|u| u.table_offset_dwords == used.table_offset_dwords).count() == 1
+    let unique = || relevant.clone()
+        .filter(|u| u.table_offset_dwords == used.table_offset_dwords).count() == 1;
+    let access = match access {
+        StaticViewAccess::TextureRead if used.kind == ResourceType::Srv && used.dwords == 8 => access,
+        StaticViewAccess::RawUav { offset, bytes, write: false }
+            if used.kind == ResourceType::Srv && used.dwords == 4 && used.stride == 0 && unique() =>
+        {
+            StaticViewAccess::RawSrv { offset, bytes }
         }
+        StaticViewAccess::RawUav { .. }
+            if used.kind == ResourceType::Uav && used.dwords == 4 && used.stride == 0 && unique() => access,
+        _ => return None,
     };
-    admitted.then_some(StaticTextureSlot { root: param.slot, index })
+    Some(StaticViewSlot { slot: StaticTextureSlot { root: param.slot, index }, access })
 }
 
 #[cfg(test)]
