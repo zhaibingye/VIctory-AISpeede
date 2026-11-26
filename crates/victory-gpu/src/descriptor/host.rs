@@ -979,10 +979,10 @@ pub(super) fn paged_2d_srv(words: &[u32; 10]) -> Option<(DXGI_FORMAT, crate::pag
 pub(crate) fn paged_texture_uav_desc(
     format: DXGI_FORMAT, selection: crate::page_uav::TextureUavSelection,
 ) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
-    let (dimension, fields) = if let Some(slice) = selection.slice {
+    let (dimension, fields) = if let Some(slices) = selection.slices {
         (D3D12_UAV_DIMENSION_TEXTURE2DARRAY, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
             Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
-                MipSlice: selection.mip, FirstArraySlice: slice, ArraySize: 1, PlaneSlice: 0,
+                MipSlice: selection.mip, FirstArraySlice: slices.first, ArraySize: slices.count, PlaneSlice: 0,
             },
         })
     } else {
@@ -1009,13 +1009,16 @@ fn exact_texture_uav(view: &View) -> Option<(
                 // SAFETY: the dimension selects Texture2D.
                 let tex = unsafe { desc.Anonymous.Texture2D };
                 if tex.PlaneSlice != 0 { return None; }
-                TextureUavSelection { mip: tex.MipSlice, slice: None }
+                TextureUavSelection { mip: tex.MipSlice, slices: None }
             }
             D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
                 // SAFETY: the dimension selects Texture2DArray.
                 let tex = unsafe { desc.Anonymous.Texture2DArray };
-                if tex.PlaneSlice != 0 || tex.ArraySize != 1 { return None; }
-                TextureUavSelection { mip: tex.MipSlice, slice: Some(tex.FirstArraySlice) }
+                if tex.PlaneSlice != 0 || tex.ArraySize == 0 || tex.ArraySize == u32::MAX { return None; }
+                TextureUavSelection {
+                    mip: tex.MipSlice,
+                    slices: Some(crate::page_texture::MipSelection { first: tex.FirstArraySlice, count: tex.ArraySize }),
+                }
             }
             _ => return None,
         };

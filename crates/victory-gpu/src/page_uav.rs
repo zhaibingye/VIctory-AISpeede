@@ -83,11 +83,11 @@ use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
 #[derive(Clone, Copy)]
 pub(crate) struct TextureUavSelection {
     pub(crate) mip: u32,
-    pub(crate) slice: Option<u32>,
+    pub(crate) slices: Option<crate::page_texture::MipSelection>,
 }
 
 impl TextureUavSelection {
-    const SINGLE: Self = Self { mip: 0, slice: None };
+    const SINGLE: Self = Self { mip: 0, slices: None };
 }
 
 /// Native descriptor identity, bounds and byte authority shared by clears
@@ -96,7 +96,7 @@ struct NativeTextureUav {
     target: std::sync::Arc<crate::resource::HostTexture>,
     format: DXGI_FORMAT,
     selection: TextureUavSelection,
-    sub: ColorSubresource,
+    subresources: Vec<ColorSubresource>,
 }
 
 impl NativeTextureUav {
@@ -104,20 +104,28 @@ impl NativeTextureUav {
         // SAFETY: the retained native allocation is live.
         let desc = unsafe { target.texture.GetDesc() };
         if desc.Format != format || (selection.is_none() && desc.MipLevels != 1)
-            || (selection.and_then(|view| view.slice).is_none() && desc.DepthOrArraySize != 1)
+            || (selection.and_then(|view| view.slices).is_none() && desc.DepthOrArraySize != 1)
             || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
             || target.sparse.is_some() || target.twin.get().is_some_and(Option::is_some)
             || target.uses_unproven_alias_backing()
         {
             return None;
         }
+        use crate::page_texture::MipSelection;
         let selection = selection.unwrap_or(TextureUavSelection::SINGLE);
-        let sub = ColorSubresource::from_mip_slice(desc, selection.mip, selection.slice.unwrap_or(0))?;
-        sub.allows(&target).then_some(Self { target, format, selection, sub })
+        let slices = selection.slices.unwrap_or(MipSelection::SINGLE);
+        let slices = MipSelection::resolve(slices.first, slices.count, u32::from(desc.DepthOrArraySize))?;
+        let mut subresources = Vec::with_capacity(slices.count as usize);
+        for slice in slices.first..slices.first + slices.count {
+            let sub = ColorSubresource::from_mip_slice(desc, selection.mip, slice)?;
+            if !sub.allows(&target) { return None; }
+            subresources.push(sub);
+        }
+        Some(Self { target, format, selection, subresources })
     }
 
     fn check_native(&self, host: &Host) -> Result<(), BatchError> {
-        if !self.sub.allows(&self.target) || self.target.uses_unproven_alias_backing()
+        if !self.subresources.iter().all(|sub| sub.allows(&self.target)) || self.target.uses_unproven_alias_backing()
             || self.target.twin.get().is_some_and(Option::is_some)
         {
             return Err(BatchError::UnsupportedTextureMap);
@@ -145,7 +153,7 @@ pub(crate) struct ShaderTextureUav(NativeTextureUav);
 
 impl ShaderTextureUav {
     pub(crate) fn capture(target: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT, selection: Option<TextureUavSelection>) -> Option<Self> {
-        if selection.is_some_and(|view| view.slice.is_some())
+        if selection.is_some_and(|view| view.slices.is_some())
             || !matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R16G16B16A16_FLOAT) {
             return None;
         }
@@ -156,14 +164,14 @@ impl ShaderTextureUav {
         &self.0.target
     }
 
-    pub(crate) fn subresource(&self) -> ColorSubresource { self.0.sub }
+    pub(crate) fn subresource(&self) -> ColorSubresource { self.0.subresources[0] }
 
     pub(crate) fn allows(&self, x: u32, y: u32) -> bool {
-        u64::from(x) < self.0.sub.width && y < self.0.sub.height
+        u64::from(x) < self.subresource().width && y < self.subresource().height
     }
 
     pub(crate) fn record_write(&self, resources: &mut ResourcePlan) -> Result<(), BatchError> {
-        resources.record_color_write(self.target(), self.0.sub)
+        resources.record_color_write(self.target(), self.subresource())
     }
 
     pub(crate) fn prepare(
@@ -171,11 +179,11 @@ impl ShaderTextureUav {
         shared: Option<&mut crate::page_texture::ScopedTextureAccess>,
     ) -> Result<crate::page_queue::TableDescriptor, BatchError> {
         self.0.check_native(host)?;
-        resources.require_color_subresource(host, list, pages, self.target(), self.0.sub)?;
+        resources.require_color_subresource(host, list, pages, self.target(), self.subresource())?;
         let texture = &self.target().texture;
         let wanted = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         if let Some(scope) = shared {
-            scope.insert(texture, self.0.sub, resources.state(self.target()), wanted)?;
+            scope.insert(texture, self.subresource(), resources.state(self.target()), wanted)?;
         } else {
             resources.transition_texture(list, self.target(), wanted.0 as u32)?;
         }
@@ -184,7 +192,7 @@ impl ShaderTextureUav {
     }
 }
 
-/// A clear of a single typed native texture subresource.
+/// A clear of an exact typed native mip and array interval.
 pub(crate) struct TextureClear {
     view: NativeTextureUav,
     values: [u32; 4],
@@ -206,7 +214,8 @@ impl TextureClear {
         };
         if !typed { return None; }
         let view = NativeTextureUav::capture(target, format, selection)?;
-        let (w, h) = (i32::try_from(view.sub.width).ok()?, i32::try_from(view.sub.height).ok()?);
+        let sub = view.subresources[0];
+        let (w, h) = (i32::try_from(sub.width).ok()?, i32::try_from(sub.height).ok()?);
         if rects.iter().any(|r| r.left < 0 || r.top < 0 || r.left >= r.right || r.top >= r.bottom
             || r.right > w || r.bottom > h)
         {
@@ -231,12 +240,25 @@ impl TextureClear {
         descriptors: &mut PageDescriptors<'_>, resources: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
         self.view.check_native(host)?;
+        let subs = &self.view.subresources;
         if !self.replaces_all {
-            resources.require_color_subresource(host, list, pages, self.target(), self.view.sub)?;
+            for &sub in subs {
+                resources.require_color_subresource(host, list, pages, self.target(), sub)?;
+            }
         }
-        resources.transition_texture(list, self.target(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32)?;
-        PageBarrier::Uav.encode(list, resources)?;
+        let wanted = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let texture = &self.target().texture;
+        let mut scope = crate::page_texture::ScopedTextureAccess::default();
+        if subs[0].is_scoped() {
+            let before = resources.state(self.target());
+            for &sub in subs {
+                scope.insert(texture, sub, before, wanted)?;
+            }
+            scope.transition(list.recording(), false);
+        } else {
+            resources.transition_texture(list, self.target(), wanted.0 as u32)?;
+        }
+        PageBarrier::Uav.encode(list, resources)?;
         list.keep(texture);
         let slot = descriptors.reserve_texture_uav(texture, self.view.format, self.view.selection).map_err(BatchError::Native)?;
         let cpu = host.cpu_view();
@@ -255,7 +277,11 @@ impl TextureClear {
             }
         }
         PageBarrier::Uav.encode(list, resources)?;
-        resources.record_color_write(self.target(), self.view.sub)
+        scope.transition(list.recording(), true);
+        for &sub in subs {
+            resources.record_color_write(self.target(), sub)?;
+        }
+        Ok(())
     }
 }
 
