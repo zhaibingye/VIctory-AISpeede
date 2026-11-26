@@ -267,6 +267,7 @@ impl ConstantSpan {
 pub(crate) struct PreparedShader {
     words: Vec<(u32, Vec<u32>)>,
     cbvs: Vec<(u32, u64)>,
+    pub(crate) shared_reads: crate::page_texture::ScopedShaderReads,
 }
 
 impl PreparedShader {
@@ -505,6 +506,14 @@ impl ShaderBindings {
             .any(|view| matches!(view, ClosedView::Texture(tex) if tex.aliases_target(target)))
     }
 
+    pub(crate) fn conflicts_color(
+        &self, target: &std::sync::Arc<crate::resource::HostTexture>,
+        sub: crate::page_resource::ColorSubresource,
+    ) -> bool {
+        self.tables.values().flat_map(|table| table.values())
+            .any(|view| matches!(view, ClosedView::Texture(tex) if tex.conflicts_color(target, sub)))
+    }
+
     pub(crate) fn uses_uav(&self) -> bool {
         self.tables.values().flat_map(|table| table.values())
             .any(|view| matches!(view, ClosedView::TextureUav(_))
@@ -556,6 +565,7 @@ impl ShaderBindings {
         descriptors: &mut PageDescriptors<'_>,
         plan: &mut crate::page_resource::ResourcePlan,
         dirty: &mut BTreeSet<PhysicalPage>,
+        color_targets: &[&crate::resource::HostTexture],
     ) -> Result<PreparedShader, BatchError> {
         let spans = self.tables.values().flat_map(|table| table.values()).filter_map(|view| {
             match view {
@@ -575,13 +585,16 @@ impl ShaderBindings {
         }
         let mut bases = BTreeMap::new();
         let mut shader_dirty = BTreeSet::new();
+        let mut shared_reads = crate::page_texture::ScopedShaderReads::default();
         for (&root, table) in &self.tables {
             let size = table.last_key_value().expect("captured slots exist").0 + 1;
             let mut views: Vec<_> = (0..size).map(|_| None).collect();
             for (&index, view) in table {
                 views[index as usize] = Some(match view {
                     ClosedView::Texture(texture) => {
-                        let (resource, format) = texture.encode(host, list, batch, plan)?;
+                        let shared = color_targets.iter().any(|target| texture.aliases_target(target));
+                        let (resource, format) = texture.encode(host, list, batch, plan,
+                            shared.then_some(&mut shared_reads))?;
                         TableDescriptor::Texture(resource, format, texture.selection())
                     }
                     ClosedView::TextureUav(view) => view.prepare(host, list, batch, plan)?,
@@ -651,6 +664,6 @@ impl ShaderBindings {
             };
             cbvs.push((param, gpu));
         }
-        Ok(PreparedShader { words, cbvs })
+        Ok(PreparedShader { words, cbvs, shared_reads })
     }
 }

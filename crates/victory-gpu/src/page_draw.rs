@@ -370,7 +370,7 @@ impl ClosedDraw {
             let view_format = target.format;
             if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN
                 || view_format != format
-                || shader.samples_target(&target.copy)
+                || shader.conflicts_color(&target.copy, target.sub)
                 || depth.as_ref().is_some_and(|d| d.copy.texture == target.copy.texture)
             {
                 return Err(UnloweredShader::GraphicsState);
@@ -443,7 +443,8 @@ impl ClosedDraw {
         };
         let sample = self.sample.as_ref()
             .map(|input| input.prepare(host, list, batch, descriptors)).transpose()?;
-        let words = self.shader.prepare(host, list, batch, descriptors, initialized, dirty)?;
+        let color_targets: Vec<_> = self.targets.iter().map(|target| target.copy.as_ref()).collect();
+        let words = self.shader.prepare(host, list, batch, descriptors, initialized, dirty, &color_targets)?;
         for &input in &self.inputs {
             input.encode(host, list, batch)?;
         }
@@ -471,6 +472,7 @@ impl ClosedDraw {
                     cmd.ResourceBarrier(&[target.sub.temporary_transition(&target.copy.texture, before, render_target)]);
                 }
             }
+            words.shared_reads.transition(cmd, false);
             cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
             cmd.SetGraphicsRootSignature(&self.root);
             cmd.SetPipelineState(&self.pipeline);
@@ -498,6 +500,7 @@ impl ClosedDraw {
                 }
                 DrawCall::Indirect(_) => indirect.as_ref().expect("indirect arguments prepared").execute(cmd),
             }
+            words.shared_reads.transition(cmd, true);
             for (target, before) in self.targets.iter().zip(states) {
                 if before != render_target {
                     cmd.ResourceBarrier(&[target.sub.temporary_transition(&target.copy.texture, render_target, before)]);

@@ -5,7 +5,7 @@ use victory_memory::gpu_table::ADDRESS_LIMIT;
 use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::Error;
+use windows::core::{Error, Interface};
 
 use crate::host::{Host, HostList, transition};
 use crate::page_slabs::{BatchError, PinnedBatch};
@@ -37,6 +37,39 @@ pub(crate) struct TextureSelection {
 
 impl TextureSelection {
     pub(crate) const SINGLE: Self = Self { mips: MipSelection::SINGLE, slices: None };
+}
+
+const SHADER_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
+);
+
+/// Draw-local state for SRVs sharing an allocation with a disjoint RTV.
+/// Duplicate views of a subresource must emit just one barrier pair.
+#[derive(Default)]
+pub(crate) struct ScopedShaderReads(std::collections::BTreeMap<
+    (usize, u32), (ID3D12Resource, crate::page_resource::ColorSubresource, D3D12_RESOURCE_STATES),
+>);
+
+impl ScopedShaderReads {
+    fn insert(&mut self, texture: &ID3D12Resource, sub: crate::page_resource::ColorSubresource,
+        before: D3D12_RESOURCE_STATES,
+    ) {
+        if before != SHADER_READ {
+            self.0.entry((texture.as_raw() as usize, sub.index))
+                .or_insert_with(|| (texture.clone(), sub, before));
+        }
+    }
+
+    pub(crate) fn transition(&self, list: &ID3D12GraphicsCommandList, restore: bool) {
+        if self.0.is_empty() { return; }
+        let barriers = self.0.values().map(|(texture, sub, before)| {
+            let (from, to) = if restore { (SHADER_READ, *before) } else { (*before, SHADER_READ) };
+            sub.temporary_transition(texture, from, to)
+        }).collect::<Vec<_>>();
+        // SAFETY: exact live subresources, disjoint from every writable
+        // attachment in this operation, returned to the same baseline.
+        unsafe { list.ResourceBarrier(&barriers) };
+    }
 }
 
 /// One admitted shader view, consumed from ordered native authority or
@@ -214,9 +247,25 @@ impl TextureInput {
         copy.texture == target.texture
     }
 
+    pub(crate) fn conflicts_color(
+        &self, target: &std::sync::Arc<crate::resource::HostTexture>,
+        sub: crate::page_resource::ColorSubresource,
+    ) -> bool {
+        if !self.aliases_target(target) { return false; }
+        let Self::Scoped { copy, selection, .. } = self else { return true; };
+        if !sub.is_scoped() || !std::sync::Arc::ptr_eq(copy, target) { return true; }
+        // SAFETY: the exact resource and its descriptor belong to the view.
+        let mips = u32::from(unsafe { copy.texture.GetDesc() }.MipLevels);
+        if mips == 0 { return true; }
+        let (mip, slice) = (sub.index % mips, sub.index / mips);
+        let slices = selection.slices.unwrap_or(MipSelection::SINGLE);
+        mip >= selection.mips.first && mip - selection.mips.first < selection.mips.count
+            && slice >= slices.first && slice - slices.first < slices.count
+    }
+
     pub(crate) fn encode(
         &self, host: &Host, list: &HostList, batch: &PinnedBatch,
-        plan: &mut crate::page_resource::ResourcePlan,
+        plan: &mut crate::page_resource::ResourcePlan, mut shared: Option<&mut ScopedShaderReads>,
     ) -> Result<(ID3D12Resource, DXGI_FORMAT), BatchError> {
         match self {
             Self::Scoped { copy, format, selection } => {
@@ -233,15 +282,24 @@ impl TextureInput {
                             .ok_or(BatchError::UnsupportedTextureMap)?;
                         if !sub.allows(copy) { return Err(BatchError::UnsupportedTextureMap); }
                         plan.require_color_subresource(host, list, batch, copy, sub)?;
+                        if let Some(reads) = shared.as_deref_mut() {
+                            if !sub.is_scoped() || copy.twin.get().is_some_and(Option::is_some)
+                                || crate::host::legal_state(&copy.texture, SHADER_READ.0 as u32) != SHADER_READ.0 as u32
+                            {
+                                return Err(BatchError::UnsupportedBarrier);
+                            }
+                            reads.insert(&copy.texture, sub, plan.state(copy));
+                        }
                     }
                 }
-                let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                plan.transition_texture(list, copy, state.0 as u32)?;
+                if shared.is_none() {
+                    plan.transition_texture(list, copy, SHADER_READ.0 as u32)?;
+                }
                 list.keep(&copy.texture);
                 Ok((copy.texture.clone(), *format))
             }
             Self::Linear { copy, input } => {
-                if plan.authoritative(copy) {
+                if shared.is_some() || plan.authoritative(copy) {
                     return Err(BatchError::UnsupportedTextureMap);
                 }
                 if !extended_color_support(host, input.format) {
@@ -250,7 +308,7 @@ impl TextureInput {
                 Ok((input.encode(host, list, batch)?, input.format))
             }
             Self::Native { copy, format, exact_backing, compatible_input } => {
-                if *exact_backing && (copy.uses_unproven_alias_backing()
+                if shared.is_some() || *exact_backing && (copy.uses_unproven_alias_backing()
                     || copy.twin.get().is_some_and(Option::is_some))
                 {
                     return Err(BatchError::UnsupportedTextureMap);
