@@ -847,6 +847,8 @@ pub(crate) struct HostTexture {
     pub(crate) host_written: std::sync::atomic::AtomicBool,
     byte_exposure: std::sync::atomic::AtomicU8,
     #[cfg(feature = "paged-title")]
+    committed_linear: std::sync::OnceLock<crate::page_texture::LinearTexture>,
+    #[cfg(feature = "paged-title")]
     mapped_pointers: std::sync::Mutex<MapEpoch>,
     pub(crate) native_authority: std::sync::Mutex<Option<victory_memory::authority::CompletedVersion>>,
     /// Its uploads from title memory (`crate::texture`), made on first use.
@@ -870,6 +872,23 @@ impl HostTexture {
         victory_memory::authority::Observation::from_exposures(
             self.byte_exposure.load(std::sync::atomic::Ordering::Acquire),
         )
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn visible_linear_writeback(&self) -> Result<Option<crate::page_texture::LinearTexture>, crate::page_slabs::BatchError> {
+        use victory_memory::authority::ByteExposure::*;
+        let flags = self.byte_exposure.load(std::sync::atomic::Ordering::Acquire);
+        if flags & ((MappedPointer as u8) | (GuestGpuAddress as u8)) == 0 {
+            return Ok(None);
+        }
+        // A placed/external alias is not yet tied to the same verified
+        // physical extent. Do not publish a completion with stale bytes.
+        if flags & ((SharedHeap as u8) | (ExternalAddress as u8)) == 0 {
+            if let Some(layout) = self.committed_linear.get() {
+                return Ok(Some(*layout));
+            }
+        }
+        Err(crate::page_slabs::BatchError::UnsupportedTextureMap)
     }
 
     #[cfg(feature = "paged-title")]
@@ -925,6 +944,8 @@ impl HostTexture {
             castable,
             host_written: false.into(),
             byte_exposure: 0.into(),
+            #[cfg(feature = "paged-title")]
+            committed_linear: std::sync::OnceLock::new(),
             #[cfg(feature = "paged-title")]
             mapped_pointers: std::sync::Mutex::default(),
             native_authority: std::sync::Mutex::new(None),
@@ -1586,6 +1607,14 @@ fn hand_out_resource(
         use victory_memory::authority::ByteExposure;
         resource.host = shared_texture(resource.data() as u64, &desc, state, clear, sparse_prefix);
         if let Some(texture) = &resource.host {
+            #[cfg(feature = "paged-title")]
+            let _ordered = crate::host::host().map(|host| host.direct_queue());
+            #[cfg(feature = "paged-title")]
+            if matches!(resource.backing, Backing::Committed(_))
+                && let Some(layout) = linear_texture_bytes(resource.data() as u64, &desc)
+            {
+                let _ = texture.committed_linear.set(layout);
+            }
             texture.expose_bytes(match resource.backing {
                 Backing::Committed(_) => ByteExposure::TitleAllocation,
                 Backing::Placed { .. } => ByteExposure::SharedHeap,
@@ -2182,7 +2211,11 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
         let resource = resource(this);
         #[cfg(windows)]
         if let Some(texture) = &resource.host {
-            texture.expose_bytes(victory_memory::authority::ByteExposure::MappedPointer);
+            {
+                #[cfg(feature = "paged-title")]
+                let _ordered = crate::host::host().map(|host| host.direct_queue());
+                texture.expose_bytes(victory_memory::authority::ByteExposure::MappedPointer);
+            }
             #[cfg(feature = "paged-title")]
             {
                 // The read range says what the CPU intends to read, not
@@ -2285,6 +2318,8 @@ extern "system" fn gpu_address(this: This) -> u64 {
     #[cfg(windows)]
     if let Some(texture) = &r.host {
         // The console address here is the actual title VA, not an opaque token.
+        #[cfg(feature = "paged-title")]
+        let _ordered = crate::host::host().map(|host| host.direct_queue());
         texture.expose_bytes(victory_memory::authority::ByteExposure::GuestGpuAddress);
     }
     let at = r.data() as u64;

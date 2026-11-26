@@ -138,6 +138,9 @@ pub(crate) struct TextureUpload {
 }
 
 impl TextureUpload {
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn target(&self) -> &Arc<HostTexture> { &self.target }
+
     pub(crate) fn capture(
         source: crate::page_texture::LinearTexture, target: Arc<HostTexture>,
         (x, y): (u32, u32), bounds: Option<[u32; 6]>,
@@ -231,6 +234,9 @@ struct CopyArea {
 }
 
 impl TextureCopy {
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn target(&self) -> &Arc<HostTexture> { &self.dst }
+
     pub(crate) fn capture(src: Arc<HostTexture>, dst: Arc<HostTexture>) -> Option<Self> {
         Self::capture_copy(src, dst, None)
     }

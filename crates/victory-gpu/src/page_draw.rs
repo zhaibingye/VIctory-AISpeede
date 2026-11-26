@@ -89,6 +89,11 @@ pub(crate) struct ColorClear {
 }
 
 impl ColorClear {
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
+        out.push(&self.target.copy);
+    }
+
     pub(crate) fn encode(
         &self, host: &Host, list: &HostList, initialized: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
@@ -203,6 +208,11 @@ pub(crate) struct DepthClear {
 }
 
 impl DepthClear {
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
+        out.push(&self.target.copy);
+    }
+
     pub(crate) fn encode(
         &self, host: &Host, list: &HostList, initialized: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
@@ -245,6 +255,12 @@ pub(crate) struct ClosedDraw {
 }
 
 impl ClosedDraw {
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
+        out.push(&self.target.copy);
+        if let Some(depth) = &self.depth { out.push(&depth.copy); }
+    }
+
     // The trusted producer must prove that the pipeline has no shader
     // memory dependencies, that all its input slots are represented,
     // and that the target view is compatible with the pipeline.

@@ -47,6 +47,35 @@ pub(crate) enum PageOp {
     ClearRaw(std::sync::Arc<crate::page_uav::RawClear>),
 }
 
+#[cfg(feature = "paged-title")]
+fn physical_footprint(
+    pins: &BackingPins, ranges: &[(u64, u64)],
+) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError> {
+    let mut physical = BTreeSet::new();
+    for &(start, end) in ranges {
+        let mut page = start & !(PAGE_BYTES - 1);
+        while page < end {
+            physical.insert(pins.expected(page as usize).ok_or(BatchError::NotCaptured(page))?);
+            page += PAGE_BYTES;
+        }
+    }
+    Ok(physical)
+}
+
+#[cfg(feature = "paged-title")]
+impl PageOp {
+    fn writes_native<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
+        match self {
+            Self::CopyTexture(copy) => out.push(copy.target()),
+            Self::UploadTexture(upload) => out.push(upload.target()),
+            Self::Draw(draw) => draw.written_targets(out),
+            Self::Clear(clear) => clear.written_targets(out),
+            Self::ClearDepth(clear) => clear.written_targets(out),
+            _ => {},
+        }
+    }
+}
+
 /// Snapshot of a complete title submission, independent of guest command
 /// list lifetime and reset. Guest backing pins are captured later, when
 /// this work is actually eligible to execute.
@@ -336,6 +365,7 @@ impl Host {
         if ops.is_empty() {
             return Ok(PageStats::default());
         }
+        let mut signal = self.direct_queue();
         let mut ranges = Vec::new();
         let mut max_copy = 0;
         for op in ops {
@@ -353,7 +383,42 @@ impl Host {
                 PageOp::CopyTexture(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
             }
         }
-        self.execute_paged_work(heap, backing, &ranges, WriteSet::Declared, |list, _, batch, pins, descriptors, targets| {
+        #[cfg(feature = "paged-title")]
+        let (ordinary_count, visible) = {
+            let ordinary_count = ranges.len();
+            let mut targets = Vec::new();
+            for op in ops {
+                op.writes_native(&mut targets);
+            }
+            let mut seen = BTreeSet::new();
+            let mut visible = Vec::new();
+            for texture in targets {
+                if seen.insert(std::sync::Arc::as_ptr(texture))
+                    && let Some(layout) = texture.visible_linear_writeback()?
+                {
+                    let readback = crate::page_resource::TextureReadback::capture(texture.clone(), layout)
+                        .ok_or(BatchError::UnsupportedTextureMap)?;
+                    let start = ranges.len();
+                    readback.ranges(&mut ranges)?;
+                    visible.push((readback, start..ranges.len()));
+                }
+            }
+            (ordinary_count, visible)
+        };
+        self.execute_paged_work_locked(&mut signal, heap, backing, &ranges, WriteSet::Declared, |list, _, batch, pins, descriptors, targets| {
+            #[cfg(feature = "paged-title")]
+            if !visible.is_empty() {
+                let mut existing = physical_footprint(pins, &ranges[..ordinary_count])?;
+                for (_, span) in &visible {
+                    let mirrors = physical_footprint(pins, &ranges[span.clone()])?;
+                    if !existing.is_disjoint(&mirrors) {
+                        // A native write and a page operation could share
+                        // physical identity; a tail copy cannot resolve it.
+                        return Err(BatchError::UnsupportedTextureMap);
+                    }
+                    existing.extend(mirrors);
+                }
+            }
             let scratch = if max_copy > 0 {
                 let buffer = self.default_buffer(max_copy as u64)
                     .ok_or_else(|| BatchError::Native(oom()))?;
@@ -386,6 +451,10 @@ impl Host {
                     PageOp::ClearRaw(clear) => clear.encode(self, list, batch, descriptors, targets, &mut dirty)?,
                 }
             }
+            #[cfg(feature = "paged-title")]
+            for (readback, _) in &visible {
+                readback.encode(self, list, batch, targets, &mut dirty)?;
+            }
             Ok(dirty)
         })
     }
@@ -406,9 +475,28 @@ impl Host {
         ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
     ) -> std::result::Result<PageStats, BatchError> {
         let mut signal = self.direct_queue();
+        self.execute_paged_work_locked(&mut signal, heap, backing, ranges, writes, record)
+    }
+
+    fn execute_paged_work_locked(
+        &self,
+        signal: &mut u64,
+        heap: &HostHeap,
+        backing: &mut SubmissionBacking,
+        ranges: &[(u64, u64)],
+        writes: WriteSet,
+        record: impl FnOnce(
+            &HostList,
+            PageRoots,
+            &PinnedBatch,
+            &BackingPins,
+            &mut PageDescriptors<'_>,
+            &mut crate::page_resource::ResourcePlan,
+        ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
+    ) -> std::result::Result<PageStats, BatchError> {
         let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
         let batch = PinnedBatch::capture(self, &mut slabs, backing, ranges)?;
-        let result = run(self, &mut signal, heap, backing, &batch, writes, record);
+        let result = run(self, signal, heap, backing, &batch, writes, record);
         match result {
             Ok(completed) => {
                 // The readback was merged before the pins are relinquished.
