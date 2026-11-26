@@ -257,7 +257,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
     if logged.len() < 64 && !logged.contains(&(from as usize, to as usize)) {
         logged.push((from as usize, to as usize));
-        tracing::info!(from = ?from, to = ?to, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, subresources = n, "aliased texture copied");
+        tracing::info!(from = ?from, to = ?to, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, subresources = n, "已复制共用内存的纹理");
     }
 }
 
@@ -469,7 +469,7 @@ impl Staging {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
-                "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
+                "采样纹理的内存全为零（数据尚未流入，或 BCPack 读取失败）"
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
@@ -487,7 +487,7 @@ impl Staging {
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+                tracing::warn!(?e, mip, slice, "纹理解块失败");
                 return false;
             }
         }

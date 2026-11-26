@@ -749,7 +749,7 @@ pub(crate) extern "system" fn create_heap(
     // interface version; find the flag that tells them apart if a title
     // trips over this.
     let placed = placement.address != 0 && placement.size == size;
-    tracing::debug!(?desc, placed, "descriptor heap");
+    tracing::debug!(?desc, placed, "描述符堆");
     let (start, memory) = if placed {
         if placement.address.checked_add(size).is_none() {
             return E_INVALIDARG;

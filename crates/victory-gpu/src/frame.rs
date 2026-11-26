@@ -53,7 +53,7 @@ pub(crate) extern "system" fn set_interval(
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    tracing::info!(?interval, "帧间隔");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -158,7 +158,7 @@ pub(crate) extern "system" fn wait(
         tick,
         wait_us = wait.as_micros() as u64,
         frame = current(),
-        "frame wait"
+        "等待帧事件"
     );
     hr
 }

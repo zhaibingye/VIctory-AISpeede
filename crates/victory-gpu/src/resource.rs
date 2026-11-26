@@ -274,7 +274,7 @@ pub(crate) fn copy_formats_match(dst: This, src: This) -> bool {
         .is_some_and(|(a, b)| unsafe { a.GetDesc().Format == b.GetDesc().Format });
     if !compatible {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!("copy between packed RGB9E5 and its host render target needs format conversion"));
+        ONCE.call_once(|| tracing::warn!("在打包的 RGB9E5 与宿主渲染目标之间复制需要格式转换"));
     }
     compatible
 }
@@ -505,7 +505,7 @@ pub(crate) extern "system" fn copyable_footprints(
         }
     }
     if !known {
-        tracing::warn!(?desc, "no footprint for this resource");
+        tracing::warn!(?desc, "无法计算该资源的内存布局");
     }
     if !total.is_null() {
         // SAFETY: checked non-null.
@@ -590,7 +590,7 @@ fn place<'a>(
     };
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
-            tracing::warn!(?desc, "no size for this resource");
+            tracing::warn!(?desc, "无法确定该资源的大小");
             each(
                 i,
                 AllocationInfo1 {
@@ -604,7 +604,7 @@ fn place<'a>(
                 alignment: 0,
             };
         };
-        tracing::debug!(?desc, ?one, "allocation info");
+        tracing::debug!(?desc, ?one, "资源分配信息");
         let offset = total.size.next_multiple_of(one.alignment);
         each(
             i,
@@ -750,7 +750,7 @@ pub(crate) extern "system" fn create_heap(
         size = desc.size,
         kind = desc.properties.kind,
         flags = format_args!("{:#x}", desc.flags),
-        "heap"
+        "内存堆"
     );
     if desc.alignment != 0 && !desc.alignment.is_power_of_two() {
         return E_INVALIDARG;
@@ -987,7 +987,7 @@ impl HostTexture {
         let mut ordered = host.direct_queue();
         if self.byte_exposure.load(std::sync::atomic::Ordering::Acquire) & GuestGpuAddress as u8 == 0 {
             if let Err(error) = self.prepare_pointer_bytes_locked(host, &mut ordered, &mapped, self.exact_committed_bytes()) {
-                tracing::warn!(?error, "VNME could not materialize a title texture address");
+                tracing::warn!(?error, "VNME 无法为游戏纹理地址准备可访问的数据");
                 return false;
             }
             self.expose_bytes(GuestGpuAddress);
@@ -1535,7 +1535,7 @@ fn shared_texture(
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(?k, "a texture memory's host texture replaced by one with more uses or another format");
+            tracing::debug!(?k, "已将该内存对应的宿主纹理替换为支持更多用途或格式不同的纹理");
         }
         if map.len().is_power_of_two() {
             map.retain(|_, w| w.strong_count() > 0);
@@ -1688,7 +1688,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
                 note_texture_pressure();
             }
-            tracing::warn!(error = %e, desc = ?d, "no host texture");
+            tracing::warn!(error = %e, desc = ?d, "无法创建宿主纹理");
             return None;
         }
     };
@@ -1925,7 +1925,7 @@ impl Drop for Resource {
                 tracing::info!(
                     n,
                     desc = ?self.desc,
-                    "a title texture was released while a list not yet reset names its host copy"
+                    "游戏纹理已释放，但尚未重置的命令列表仍引用该宿主纹理"
                 );
             }
         }
@@ -1970,14 +1970,14 @@ pub(crate) extern "system" fn create_committed(
         return E_INVALIDARG;
     };
     let Some(info) = footprint(&desc) else {
-        tracing::warn!(?desc, "no size for this resource");
+        tracing::warn!(?desc, "无法确定该资源的大小");
         return E_INVALIDARG;
     };
     tracing::debug!(
         dimension = desc.dimension,
         size = info.size,
         heap = heap.kind,
-        "committed resource"
+        "独立分配的资源"
     );
     let memory = match Memory::for_resource(info, heap.kind) {
         Ok(memory) => memory,
@@ -2039,7 +2039,7 @@ pub(crate) extern "system" fn register_page_pool(
     if out.is_null() || pages == 0 || !address.is_multiple_of(KIB_64) {
         return E_INVALIDARG;
     }
-    tracing::debug!(address = format_args!("{address:#x}"), pages, "page pool");
+    tracing::debug!(address = format_args!("{address:#x}"), pages, "页池");
     let mut pools = page_pools();
     pools.push(Some((address, pages)));
     // SAFETY: checked non-null; the title passes room for a handle.
@@ -2098,7 +2098,7 @@ fn address_resource(
         dimension = desc.dimension,
         width = desc.width,
         layout,
-        "resource at an address"
+        "按地址绑定的资源"
     );
     const COMMON: u32 = 0;
     const DEFAULT: HeapProperties = HeapProperties {
@@ -2398,7 +2398,7 @@ pub(crate) extern "system" fn create_placed(
             ?desc,
             offset,
             heap = h.desc.size,
-            "placed resource does not fit"
+            "放置资源的范围或对齐不符合堆要求"
         );
         return E_INVALIDARG;
     }
@@ -2461,7 +2461,7 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
                 let layout = texture.exact_committed_bytes();
                 let Some(next) = mapped.active.checked_add(1) else { return E_INVALIDARG; };
                 if let Err(error) = texture.prepare_pointer_bytes_locked(host, &mut ordered, &mapped, layout) {
-                    tracing::warn!(?error, "VNME texture Map could not materialize bytes");
+                    tracing::warn!(?error, "VNME 无法为纹理 Map 准备可访问的字节");
                     return crate::object::E_NOTIMPL;
                 }
                 // Exposure is committed only for a successful pointer return,
@@ -2575,7 +2575,7 @@ fn cpu_texture_copy(
     if (!replaces_all || mapped.active != 0)
         && let Err(error) = texture.ensure_cpu_bytes_locked(host, &mut ordered, &mapped, Some(layout))
     {
-        tracing::warn!(?error, "VNME CPU texture copy could not preserve native bytes");
+        tracing::warn!(?error, "VNME 的 CPU 纹理复制无法保留原生表示中的字节");
         return E_NOTIMPL;
     }
     // SAFETY: the title provides a valid pitched input/output buffer.
@@ -2660,7 +2660,7 @@ extern "system" fn gpu_address(this: This) -> u64 {
             Backing::Address(_) => "at a title address".into(),
         };
         ONCE[usize::from(r.desc.dimension == BUFFER)].call_once(|| {
-            tracing::warn!(address = format_args!("{at:#x}"), backing, desc = ?r.desc, "a GPU address above 40 bits")
+            tracing::warn!(address = format_args!("{at:#x}"), backing, desc = ?r.desc, "GPU 地址超出 40 位范围")
         });
     }
     at

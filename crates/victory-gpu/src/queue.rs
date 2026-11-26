@@ -54,7 +54,7 @@ pub(crate) extern "system" fn create(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(?desc, "command queue");
+    tracing::debug!(?desc, "命令队列");
     let queue = Box::new(Queue {
         object: if crate::device::newer() {
             Object::new(&NEWER_FUNCTIONS)
@@ -92,7 +92,7 @@ pub(crate) extern "system" fn create_x(
     let Some(&x) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(desc = ?x, "console command queue");
+    tracing::debug!(desc = ?x, "游戏主机命令队列");
     let desc = QueueDesc {
         kind: x.kind,
         priority: 0,

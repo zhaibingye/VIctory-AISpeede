@@ -231,7 +231,7 @@ pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT 
         // SAFETY: `len` units were just read.
         String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, len) })
     };
-    tracing::debug!(object = ?this, %name, "named");
+    tracing::debug!(object = ?this, %name, "已设置对象名称");
     S_OK
 }
 

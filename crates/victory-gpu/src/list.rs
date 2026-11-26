@@ -193,7 +193,7 @@ pub(crate) extern "system" fn create_list_x(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(?desc, "console command list");
+    tracing::debug!(?desc, "游戏主机命令列表");
     new_list(desc.kind, allocator, pipeline, iid, out)
 }
 
@@ -207,7 +207,7 @@ fn new_list(
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    tracing::debug!(kind, "command list");
+    tracing::debug!(kind, "命令列表");
     let list = Box::new(List {
         object: if crate::device::newer() {
             Object::new(&NEWER_LIST_FUNCTIONS)
@@ -226,7 +226,7 @@ fn new_list(
         host: crate::host::host().and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
+                tracing::warn!(error = %e, "无法创建宿主命令列表");
                 None
             }
         }),
@@ -454,7 +454,7 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     let (data, size) = crate::resource::buffer_bytes(buffer)?;
     let end = offset.checked_add(len)?;
     if end > size {
-        tracing::warn!(offset, len, size, "copy outside its buffer");
+        tracing::warn!(offset, len, size, "复制范围超出缓冲区");
         return None;
     }
     // SAFETY: inside the buffer, checked above.
@@ -652,7 +652,7 @@ extern "system" fn copy_texture_region(
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            ONCE.call_once(|| tracing::warn!("尚未实现从纹理复制到缓冲区"));
             return;
         };
         let mut from = src;
@@ -1481,7 +1481,7 @@ mod state {
         }
         if y != 1 || z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+            ONCE.call_once(|| tracing::warn!(x, y, z, "网格任务在 Y 或 Z 维度上有多个线程组"));
         }
         Some(x)
     }
@@ -1505,7 +1505,7 @@ mod state {
         super::count_draw();
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            ONCE.call_once(|| tracing::warn!("已丢弃间接网格任务"));
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1623,7 +1623,7 @@ extern "system" fn execute_indirect(
             max,
             address = ?address.map(|a| format!("{a:#x}")),
             counted = !count.is_null(),
-            "indirect execution dropped (first time for this signature)"
+            "已丢弃间接执行（首次遇到此命令签名）"
         );
     }
 }
