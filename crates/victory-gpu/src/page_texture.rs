@@ -138,6 +138,20 @@ fn extended_color_support(host: &Host, format: DXGI_FORMAT) -> bool {
     })
 }
 
+#[cfg(feature = "paged-title")]
+pub(crate) fn resolve_support(host: &Host, format: DXGI_FORMAT) -> bool {
+    static SUPPORT: std::sync::Mutex<std::collections::BTreeMap<i32, bool>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut formats = SUPPORT.lock().unwrap_or_else(|e| e.into_inner());
+    *formats.entry(format.0).or_insert_with(|| {
+        let mut caps = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+        // SAFETY: this structure matches the feature query.
+        unsafe { host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut caps).cast(), size_of_val(&caps) as u32,
+        ) }.is_ok() && caps.Support1.contains(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE)
+    })
+}
+
 impl TextureInput {
     pub(crate) fn native(
         copy: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT,

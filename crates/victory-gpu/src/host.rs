@@ -2188,6 +2188,11 @@ impl HostList {
     }
 
     #[cfg(feature = "paged-title")]
+    pub(crate) fn record_page_texture_resolve(&self, resolve: crate::page_resource::TextureResolve) {
+        self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::ResolveTexture(std::sync::Arc::new(resolve))));
+    }
+
+    #[cfg(feature = "paged-title")]
     pub(crate) fn record_pipe_write(&self, op: crate::page_queue::PipeWrite) {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::PipeWrite(op)));
     }

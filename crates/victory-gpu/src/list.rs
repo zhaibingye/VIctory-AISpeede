@@ -771,7 +771,21 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "paged-title"))]
+    {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let Some(list) = host_list(this) else { return; };
+        if let (Some(to), Some(from)) = (crate::resource::host_copy(dst), crate::resource::host_copy(src))
+            && !crate::resource::stands_in(dst) && !crate::resource::stands_in(src)
+            && let Some(op) = crate::page_resource::TextureResolve::capture(from, src_sub, to, dst_sub,
+                DXGI_FORMAT(crate::resource::pc_view_format(dst, format) as i32))
+        {
+            list.record_page_texture_resolve(op);
+        } else {
+            list.mark_unlowered();
+        }
+    }
+    #[cfg(all(windows, not(feature = "paged-title")))]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),

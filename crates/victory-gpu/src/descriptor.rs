@@ -264,8 +264,15 @@ impl RtvRecord {
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        use windows::Win32::Graphics::Direct3D12::{D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_DSV_DIMENSION_TEXTURE2DMS};
+        let dimension = if self.described == 0 && crate::resource::host_resource(self.resource)
+            .is_some_and(|resource| unsafe { resource.GetDesc() }.SampleDesc.Count > 1)
+        {
+            D3D12_DSV_DIMENSION_TEXTURE2DMS
+        } else {
+            D3D12_DSV_DIMENSION_TEXTURE2D
+        };
+        self.host_desc(dimension.0 as u32)
     }
 
     /// The description words as a host type, the format as the host has it.

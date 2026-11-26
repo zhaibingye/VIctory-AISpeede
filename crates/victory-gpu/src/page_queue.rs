@@ -36,6 +36,8 @@ pub(crate) struct PageStats {
 pub(crate) enum PageOp {
     Copy(GuestCopy),
     CopyTexture(std::sync::Arc<crate::page_resource::TextureCopy>),
+    #[cfg(feature = "paged-title")]
+    ResolveTexture(std::sync::Arc<crate::page_resource::TextureResolve>),
     ReadbackTexture(std::sync::Arc<crate::page_resource::TextureReadback>),
     UploadTexture(std::sync::Arc<crate::page_resource::TextureUpload>),
     Input(InputView),
@@ -191,6 +193,8 @@ impl PageOp {
         let operation = match self {
             Self::Copy(_) => "buffer copy",
             Self::CopyTexture(_) => "texture copy",
+            #[cfg(feature = "paged-title")]
+            Self::ResolveTexture(_) => "texture resolve",
             Self::ReadbackTexture(_) => "texture readback",
             Self::UploadTexture(_) => "texture upload",
             Self::Input(_) => "input binding",
@@ -253,6 +257,7 @@ impl PageOp {
     fn writes_native<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
         match self {
             Self::CopyTexture(copy) => out.push(copy.target()),
+            Self::ResolveTexture(resolve) => out.push(resolve.target()),
             Self::UploadTexture(upload) => out.push(upload.target()),
             Self::Draw(draw) => draw.written_targets(out),
             Self::Dispatch(dispatch) => dispatch.written_targets(out),
@@ -319,7 +324,7 @@ impl ClosedTitleBatch {
         // the direct queue lock, which also orders pointer publication.
         self.0.iter().all(|op| matches!(op,
             PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
-            | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Draw(_)
+            | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::ResolveTexture(_) | PageOp::Draw(_)
             | PageOp::Dispatch(_) | PageOp::Input(_) | PageOp::UploadTexture(_) | PageOp::UploadLease(_)))
     }
 
@@ -367,7 +372,7 @@ impl ClosedFootprint {
     fn permits_read_window(&self, ops: &[PageOp]) -> bool {
         self.preserved.is_empty() && self.visible.is_empty() && ops.iter().all(|op| match op {
             PageOp::Draw(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
-            | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Input(_) | PageOp::UploadTexture(_)
+            | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::ResolveTexture(_) | PageOp::Input(_) | PageOp::UploadTexture(_)
             | PageOp::UploadLease(_) => true,
             PageOp::Dispatch(dispatch) => dispatch.reads_guest_only(),
             PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) | PageOp::Query(_) | PageOp::PipeWrite(_) => false,
@@ -399,6 +404,8 @@ impl ClosedFootprint {
                     PageOp::ClearRaw(clear) => ranges.push(clear.range()?),
                     PageOp::Dispatch(dispatch) => dispatch.ranges(&mut ranges)?,
                     PageOp::CopyTexture(copy) => copy.ranges(&mut ranges)?,
+                    #[cfg(feature = "paged-title")]
+                    PageOp::ResolveTexture(_) => {},
                     PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_) | PageOp::Barrier(_) => {},
                 }
                 Ok(())
@@ -848,6 +855,8 @@ impl Host {
                         }
                     }
                     PageOp::CopyTexture(copy) => copy.encode(self, list, batch, targets)?,
+                    #[cfg(feature = "paged-title")]
+                    PageOp::ResolveTexture(resolve) => resolve.encode(self, list, targets)?,
                     PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty, true)?,
                     PageOp::UploadTexture(upload) => upload.encode(self, list, batch, targets)?,
                     PageOp::Input(input) => input.encode(self, list, batch)?,

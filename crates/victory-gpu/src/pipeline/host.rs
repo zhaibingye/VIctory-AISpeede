@@ -344,6 +344,7 @@ pub(crate) struct HostPipeline {
     pub(crate) stages: Vec<Stage>,
     pub(crate) closed_color_formats: Option<Vec<DXGI_FORMAT>>,
     pub(crate) closed_depth_format: Option<DXGI_FORMAT>,
+    pub(crate) closed_samples: Option<DXGI_SAMPLE_DESC>,
     /// Planes to which this host PSO can write: depth (1), stencil (2).
     pub(crate) closed_depth_writes: u32,
     /// A graphics pipeline of the console's rectangle lists whose geometry
@@ -622,6 +623,7 @@ impl HostPipeline {
                 stages: bound,
                 closed_color_formats: None,
                 closed_depth_format: None,
+                closed_samples: None,
                 closed_depth_writes: 0,
                 name: format!("{shaders:?}"),
                 rectangles: false,
@@ -659,6 +661,7 @@ impl HostPipeline {
                 stages: bound,
                 closed_color_formats: None,
                 closed_depth_format: None,
+                closed_samples: None,
                 closed_depth_writes: 0,
                 name: format!("{shaders:?}"),
                 rectangles: false,
@@ -746,7 +749,7 @@ impl HostPipeline {
             root,
             stages: bound,
             closed_color_formats: (g.targets.NumRenderTargets <= 8
-                && g.samples.Count == 1 && g.samples.Quality == 0
+                && crate::page_resource::supported_samples(g.samples)
                 && if g.targets.NumRenderTargets == 0 {
                     // A DSV-only pass must have a real output and a
                     // shader/rasterizer state that actually uses it.
@@ -758,6 +761,7 @@ impl HostPipeline {
                 })
                 .then(|| g.targets.RTFormats[..g.targets.NumRenderTargets as usize].to_vec()),
             closed_depth_format: (g.depth_format != DXGI_FORMAT_UNKNOWN).then_some(g.depth_format),
+            closed_samples: Some(g.samples),
             closed_depth_writes: u32::from(g.depth.DepthEnable.as_bool()
                 && g.depth.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO)
                 | (u32::from(g.depth.StencilEnable.as_bool() && g.depth.StencilWriteMask != 0) << 1),

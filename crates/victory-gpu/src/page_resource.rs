@@ -329,6 +329,21 @@ pub(crate) struct ColorSubresource {
 }
 
 impl ColorSubresource {
+    /// Multisample color attachments are whole, single-plane 2D resources.
+    /// Keep this separate from byte-footprint and region-copy admission.
+    pub(crate) fn multisample(desc: D3D12_RESOURCE_DESC) -> Option<Self> {
+        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
+            || !supported_samples(desc.SampleDesc) || desc.SampleDesc.Count == 1
+            || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+            || desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        {
+            return None;
+        }
+        crate::page_texture::linear_texel_bytes(desc.Format)?;
+        Some(Self { index: 0, width: desc.Width, height: desc.Height, scoped: false })
+    }
+
     pub(crate) fn from_mip_slice(desc: D3D12_RESOURCE_DESC, mip: u32, slice: u32) -> Option<Self> {
         let mips = u32::from(desc.MipLevels);
         if mip >= mips || slice >= u32::from(desc.DepthOrArraySize) { return None; }
@@ -371,6 +386,67 @@ impl ColorSubresource {
 
     pub(crate) fn allows(self, copy: &HostTexture) -> bool {
         !self.scoped || (!copy.uses_unproven_alias_backing() && !copy.has_pointer_exposure())
+    }
+}
+
+pub(crate) fn supported_samples(samples: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC) -> bool {
+    samples.Quality == 0 && matches!(samples.Count, 1 | 2 | 4 | 8 | 16)
+}
+
+#[cfg(feature = "paged-title")]
+pub(crate) struct TextureResolve {
+    src: Arc<HostTexture>,
+    dst: Arc<HostTexture>,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+}
+
+#[cfg(feature = "paged-title")]
+impl TextureResolve {
+    pub(crate) fn capture(
+        src: Arc<HostTexture>, src_index: u32, dst: Arc<HostTexture>, dst_index: u32,
+        format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    ) -> Option<Self> {
+        // SAFETY: the retained resources own these descriptions.
+        let (a, b) = unsafe { (src.texture.GetDesc(), dst.texture.GetDesc()) };
+        ColorSubresource::multisample(a)?;
+        let dest = ColorSubresource::capture(b, dst_index)?;
+        if src_index != 0 || dest.is_scoped() || (a.Width, a.Height) != (b.Width, b.Height)
+            || a.Format != format || b.Format != format
+        {
+            return None;
+        }
+        let resolve = Self { src, dst, format };
+        resolve.exact_backing().then_some(resolve)
+    }
+
+    fn exact_backing(&self) -> bool {
+        self.src.texture != self.dst.texture && !self.src.has_pointer_exposure()
+            && [&self.src, &self.dst].into_iter().all(|copy| {
+                copy.sparse.is_none() && !copy.uses_unproven_alias_backing()
+                    && !copy.twin.get().is_some_and(Option::is_some)
+            })
+    }
+
+    pub(crate) fn target(&self) -> &Arc<HostTexture> { &self.dst }
+
+    pub(crate) fn encode(&self, host: &crate::host::Host, list: &HostList, plan: &mut ResourcePlan)
+        -> Result<(), BatchError>
+    {
+        if !self.exact_backing() { return Err(BatchError::UnsupportedTextureMap); }
+        if !plan.authoritative(&self.src) { return Err(BatchError::TargetNotInitialized); }
+        // Resource allocation alone does not establish resolve support for
+        // a format. Verify the adapter's flag before issuing the command.
+        if !crate::page_texture::resolve_support(host, self.format) {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
+        plan.transition_texture(list, &self.src, D3D12_RESOURCE_STATE_RESOLVE_SOURCE.0 as u32)?;
+        plan.transition_texture(list, &self.dst, D3D12_RESOURCE_STATE_RESOLVE_DEST.0 as u32)?;
+        list.keep(&self.src.texture);
+        list.keep(&self.dst.texture);
+        // SAFETY: typed format, resource extents, samples, source authority
+        // and native resolve states are proven; subresource zero is the whole target.
+        unsafe { list.recording().ResolveSubresource(&self.dst.texture, 0, &self.src.texture, 0, self.format) };
+        plan.record_write(&self.dst)
     }
 }
 

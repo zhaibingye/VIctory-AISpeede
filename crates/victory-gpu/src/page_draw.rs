@@ -36,6 +36,7 @@ pub(crate) struct ColorTarget {
     copy: Arc<HostTexture>,
     desc: Option<D3D12_RENDER_TARGET_VIEW_DESC>,
     sub: ColorSubresource,
+    samples: u32,
     format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
 }
 
@@ -64,6 +65,18 @@ impl ColorTarget {
         {
             return None;
         }
+        if tex.SampleDesc.Count > 1 {
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+            let sub = ColorSubresource::multisample(tex)?;
+            if desc.as_ref().is_some_and(|d| d.ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2DMS
+                || d.Format != tex.Format && d.Format != DXGI_FORMAT_UNKNOWN)
+                || copy.uses_unproven_alias_backing() || copy.has_pointer_exposure()
+            {
+                return None;
+            }
+            let desc = desc.map(|d| D3D12_RENDER_TARGET_VIEW_DESC { Format: tex.Format, ..d });
+            return Some(Self { copy, desc, sub, samples: tex.SampleDesc.Count, format: tex.Format });
+        }
         let (mip, slice) = match desc.as_ref() {
             None if tex.DepthOrArraySize == 1 => (0, 0),
             Some(d) if d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D
@@ -87,13 +100,15 @@ impl ColorTarget {
         if !sub.allows(&copy) || sub.is_scoped() && format != tex.Format {
             return None;
         }
-        Some(Self { copy, desc, sub, format })
+        Some(Self { copy, desc, sub, samples: 1, format })
     }
 
     fn extent(&self) -> (u64, u32) { (self.sub.width, self.sub.height) }
 
     fn validate_native(&self) -> Result<(), BatchError> {
-        if self.sub.allows(&self.copy) && !self.copy.twin.get().is_some_and(Option::is_some) {
+        if self.sub.allows(&self.copy) && !self.copy.twin.get().is_some_and(Option::is_some)
+            && (self.samples == 1 || !self.copy.uses_unproven_alias_backing() && !self.copy.has_pointer_exposure())
+        {
             Ok(())
         } else {
             Err(BatchError::UnsupportedTextureMap)
@@ -172,6 +187,7 @@ pub(crate) struct DepthTarget {
     format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
     planes: u32,
     read_only: bool,
+    samples: u32,
 }
 
 impl DepthTarget {
@@ -183,18 +199,19 @@ impl DepthTarget {
         let tex = unsafe { copy.texture.GetDesc() };
         if copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
             || tex.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-            || tex.SampleDesc.Count != 1 || tex.SampleDesc.Quality != 0
+            || !crate::page_resource::supported_samples(tex.SampleDesc)
+            || tex.SampleDesc.Count > 1 && (copy.uses_unproven_alias_backing() || copy.has_pointer_exposure())
             || tex.DepthOrArraySize != 1 || tex.MipLevels != 1
             || tex.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0
         {
             return None;
         }
         let format = if let Some(d) = &desc {
-            if d.ViewDimension != D3D12_DSV_DIMENSION_TEXTURE2D {
-                return None;
-            }
-            // SAFETY: dimension selects Texture2D.
-            if unsafe { d.Anonymous.Texture2D }.MipSlice != 0 {
+            if tex.SampleDesc.Count == 1 {
+                if d.ViewDimension != D3D12_DSV_DIMENSION_TEXTURE2D { return None; }
+                // SAFETY: dimension selects Texture2D.
+                if unsafe { d.Anonymous.Texture2D }.MipSlice != 0 { return None; }
+            } else if d.ViewDimension != D3D12_DSV_DIMENSION_TEXTURE2DMS {
                 return None;
             }
             if d.Format == DXGI_FORMAT_UNKNOWN { tex.Format } else { d.Format }
@@ -218,7 +235,16 @@ impl DepthTarget {
             flags if flags == planes => true,
             _ => return None,
         };
-        Some(Self { copy, desc, format, planes, read_only })
+        Some(Self { copy, desc, format, planes, read_only, samples: tex.SampleDesc.Count })
+    }
+
+    fn validate_samples(&self) -> Result<(), BatchError> {
+        if self.samples > 1 && (self.copy.uses_unproven_alias_backing() || self.copy.has_pointer_exposure()
+            || self.copy.twin.get().is_some_and(Option::is_some))
+        {
+            return Err(BatchError::UnsupportedDepth);
+        }
+        Ok(())
     }
 
     fn authoritative(&self, plan: &ResourcePlan) -> bool {
@@ -276,6 +302,7 @@ impl DepthClear {
     pub(crate) fn encode(
         &self, host: &Host, list: &HostList, initialized: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
+        self.target.validate_samples()?;
         let planes = self.target.planes;
         if self.target.read_only || self.flags == 0 || self.flags & !planes != 0
             || self.flags & 1 != 0 && !(0.0..=1.0).contains(&self.depth)
@@ -372,9 +399,12 @@ impl ClosedDraw {
             return Err(UnloweredShader::UnknownUserData);
         }
         let formats = pipeline.closed_color_formats.as_ref().ok_or(UnloweredShader::GraphicsState)?;
+        let samples = pipeline.closed_samples.ok_or(UnloweredShader::GraphicsState)?.Count;
         if formats.len() != targets.len()
             || (targets.is_empty() && depth.is_none())
             || pipeline.closed_depth_format != depth.as_ref().map(|d| d.format)
+            || depth.as_ref().is_some_and(|d| d.samples != samples)
+            || targets.iter().any(|target| target.samples != samples)
         {
             return Err(UnloweredShader::GraphicsState);
         }
@@ -396,7 +426,7 @@ impl ClosedDraw {
             {
                 return Err(UnloweredShader::GraphicsState);
             }
-            if targets.len() > 1 || target.sub.is_scoped() {
+            if targets.len() > 1 || target.sub.is_scoped() || samples > 1 {
                 if target.copy.uses_unproven_alias_backing()
                     || targets[..index].iter().any(|other| other.copy.texture == target.copy.texture)
                     || *first_extent.get_or_insert_with(|| target.extent()) != target.extent()
@@ -443,8 +473,11 @@ impl ClosedDraw {
         initialized: &mut ResourcePlan,
         dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
     ) -> Result<(), BatchError> {
-        if self.depth.as_ref().is_some_and(|d| !d.authoritative(initialized)) {
-            return Err(BatchError::TargetNotInitialized);
+        if let Some(depth) = &self.depth {
+            depth.validate_samples()?;
+            if !depth.authoritative(initialized) {
+                return Err(BatchError::TargetNotInitialized);
+            }
         }
         let sampled_depth = self.depth.as_ref().is_some_and(|d| self.shader.samples_target(&d.copy));
         if let Some(depth) = &self.depth && depth.read_only
