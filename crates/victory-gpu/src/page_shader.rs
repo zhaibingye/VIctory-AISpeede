@@ -274,6 +274,49 @@ impl PreparedShader {
     }
 }
 
+type ByteSpan = (u64, u64);
+
+/// Descriptor-bounded RAW reads for this operation share a fence-owned
+/// buffer. Root CBVs lack a view-size guard and retain separate storage.
+struct ReadOnlyArena {
+    buffer: ID3D12Resource,
+    offsets: BTreeMap<ByteSpan, u64>,
+}
+
+impl ReadOnlyArena {
+    fn gather(
+        host: &Host, list: &HostList, batch: &PinnedBatch,
+        spans: impl IntoIterator<Item = ByteSpan>,
+    ) -> Result<Option<Self>, BatchError> {
+        let spans: BTreeSet<_> = spans.into_iter().collect();
+        if spans.is_empty() {
+            return Ok(None);
+        }
+        let mut size = 0u64;
+        let mut offsets = BTreeMap::new();
+        for (start, end) in spans {
+            let invalid = || BatchError::Range(start, end);
+            let length = end.checked_sub(start).filter(|&len| len != 0).ok_or_else(invalid)?;
+            let offset = size.checked_next_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)).ok_or_else(invalid)?;
+            size = offset.checked_add(length).ok_or_else(invalid)?;
+            offsets.insert((start, end), offset);
+        }
+        let buffer = host.default_buffer(size).ok_or_else(|| {
+            BatchError::Native(windows::Win32::Foundation::E_OUTOFMEMORY.into())
+        })?;
+        let reads = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        crate::page_view::gather_regions(list, batch, offsets.iter().map(|(&span, &at)| (span, at)),
+            &buffer, D3D12_RESOURCE_STATE_COPY_DEST, reads)?;
+        Ok(Some(Self { buffer, offsets }))
+    }
+
+    fn slot(arena: Option<&Self>, span: ByteSpan) -> Result<(&ID3D12Resource, u64), BatchError> {
+        arena.and_then(|a| a.offsets.get(&span).map(|&at| (&a.buffer, at)))
+            .ok_or(BatchError::Range(span.0, span.1))
+    }
+}
+
 impl ShaderBindings {
     pub(crate) fn capture(
         pipeline: &HostPipeline,
@@ -384,6 +427,13 @@ impl ShaderBindings {
         plan: &mut crate::page_resource::ResourcePlan,
         dirty: &mut BTreeSet<PhysicalPage>,
     ) -> Result<PreparedShader, BatchError> {
+        let spans = self.tables.values().flat_map(|table| table.values()).filter_map(|view| {
+            match view {
+                ClosedView::Raw(raw) if !raw.unordered() => Some(raw.range()),
+                _ => None,
+            }
+        });
+        let arena = ReadOnlyArena::gather(host, list, batch, spans)?;
         let mut bases = BTreeMap::new();
         let mut shader_dirty = BTreeSet::new();
         for (&root, table) in &self.tables {
@@ -395,7 +445,12 @@ impl ShaderBindings {
                         let (resource, format) = texture.encode(host, list, batch, plan)?;
                         TableDescriptor::Texture(resource, format)
                     }
-                    ClosedView::Raw(raw) => raw.prepare(host, list, batch, &mut shader_dirty)?,
+                    ClosedView::Raw(raw) if raw.unordered() => raw.prepare_uav(batch, &mut shader_dirty)?,
+                    ClosedView::Raw(raw) => {
+                        let span = raw.range();
+                        let (buffer, at) = ReadOnlyArena::slot(arena.as_ref(), span)?;
+                        TableDescriptor::Raw(buffer.clone(), at, span.1 - span.0, false)
+                    }
                 });
             }
             let first = descriptors.reserve_table_run(&views).map_err(BatchError::Native)?;

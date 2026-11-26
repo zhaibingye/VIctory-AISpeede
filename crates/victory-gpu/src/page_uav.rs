@@ -112,21 +112,11 @@ impl BoundedRawView {
 
     pub(crate) fn range(&self) -> (u64, u64) { (self.start, self.end) }
 
-    pub(crate) fn prepare(
-        &self, host: &Host, list: &HostList, batch: &PinnedBatch, dirty: &mut BTreeSet<PhysicalPage>,
+    pub(crate) fn prepare_uav(
+        &self, batch: &PinnedBatch, dirty: &mut BTreeSet<PhysicalPage>,
     ) -> Result<crate::page_queue::TableDescriptor, BatchError> {
         if !self.unordered {
-            use windows::Win32::Graphics::Direct3D12::*;
-            let bytes = self.end - self.start;
-            let copy = host.default_buffer(bytes).ok_or_else(|| {
-                BatchError::Native(windows::Win32::Foundation::E_OUTOFMEMORY.into())
-            })?;
-            // A slab is in UAV state. Gather to a retained SRV snapshot
-            // at the point of use, after preceding GPU writes.
-            crate::page_view::gather_span(list, batch, self.range(), &copy,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)?;
-            return Ok(crate::page_queue::TableDescriptor::Raw(copy, 0, bytes, false));
+            return Err(BatchError::Range(self.start, self.end));
         }
         let first = batch.pinned_at(self.start).ok_or(BatchError::NotCaptured(self.start))?;
         let page_base = self.start & !(PAGE_BYTES - 1);
