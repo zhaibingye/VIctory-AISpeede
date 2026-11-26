@@ -563,7 +563,7 @@ impl ShaderBindings {
                         (Some(ClosedView::NullTexture(_, selection)), StaticViewAccess::TextureRead { array })
                             if selection.slices.is_some() == array => {},
                         (Some(ClosedView::TextureUav(view)), StaticViewAccess::TextureWrite { x, y, z, sources, exec_guard, dispatch }) => {
-                            if !view.allows(x, y, z) {
+                            if !view.allows(x, y, z) && !view.allows_dispatch_edge(x, y, z, dispatch) {
                                 return Err(reason(DescriptorSlotReason::TextureWriteRange {
                                     host_format: view.format_id(), xyz_max: (x, y, z),
                                     view_width_height_w_window: view.view_extent(),

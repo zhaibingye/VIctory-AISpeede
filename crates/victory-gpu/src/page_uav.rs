@@ -260,6 +260,34 @@ impl ShaderTextureUav {
             }
     }
 
+    /// 让精确的全体 RGBA16F 写视图处理直接派发最后一组的 XY 边缘。
+    /// 依赖的是有类型纹理的坐标语义，不是动态描述符索引的行为。
+    pub(crate) fn allows_dispatch_edge(&self, x: u32, y: u32, z: Option<u32>,
+        dispatch: Option<([u32; 3], [u32; 3])>,
+    ) -> bool {
+        #[cfg(not(feature = "paged-title"))]
+        { let _ = (x, y, z, dispatch); false }
+        #[cfg(feature = "paged-title")]
+        {
+            let (Some(z), Some((groups, threads)), Some(backing)) = (z, dispatch, self.byte_backing())
+                else { return false; };
+            let Some(extent) = backing.blocked_extent() else { return false; };
+            let (w, h, depth) = self.view_extent();
+            if self.0.format != DXGI_FORMAT_R16G16B16A16_FLOAT || self.0.selection.mip != 0
+                || (w, h, depth) != (u64::from(extent[0]), extent[1], Some((0, extent[2])))
+            {
+                return false;
+            }
+            // 原生对象与来宾的范围完全一致才允许由原生有类型写处理边缘。
+            // 安全：此 UAV 保留宿主对象的强引用。
+            let desc = unsafe { self.target().texture.GetDesc() };
+            desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                && desc.MipLevels == 1 && desc.SampleDesc.Count == 1
+                && u32::from(desc.DepthOrArraySize) == extent[2]
+                && dispatch_edge_domain(extent, [x, y, z], groups, threads)
+        }
+    }
+
     #[cfg(feature = "paged-title")]
     pub(crate) fn byte_backing(&self) -> Option<&crate::page_texture::VolumeBytes> { self.1.as_ref() }
 
@@ -311,6 +339,33 @@ impl ShaderTextureUav {
         list.keep(texture);
         Ok(crate::page_queue::TableDescriptor::TextureUav(texture.clone(), self.0.format, self.0.selection))
     }
+}
+
+#[cfg(feature = "paged-title")]
+fn dispatch_edge_domain(extent: [u32; 3], upper: [u32; 3], groups: [u32; 3], threads: [u32; 3]) -> bool {
+    if extent.contains(&0) || groups.contains(&0) || threads.contains(&0) || upper[2] >= extent[2] {
+        return false;
+    }
+    // 不扩张任何资源；XY 只接受恰好覆盖视图所需的组，Z 不接受溢出。
+    (0..3).all(|axis| {
+        let (size, bound, n, t) = (extent[axis], upper[axis], groups[axis], threads[axis]);
+        n.checked_mul(t).is_some_and(|span| {
+            bound < span && if axis == 2 { span <= size } else { n == size.div_ceil(t) }
+        })
+    })
+}
+
+#[cfg(all(test, feature = "paged-title"))]
+#[test]
+fn dispatch_edge_uses_only_the_exact_xy_tail_group() {
+    let (extent, groups, threads) = ([33; 3], [5, 5, 33], [8, 8, 1]);
+    assert!(dispatch_edge_domain(extent, [39, 39, 32], groups, threads));
+    assert!(!dispatch_edge_domain(extent, [40, 39, 32], groups, threads));
+    assert!(!dispatch_edge_domain(extent, [39, 39, 33], groups, threads));
+    assert!(!dispatch_edge_domain(extent, [39, 39, 32], [6, 5, 33], threads));
+    assert!(!dispatch_edge_domain(extent, [39, 39, 32], [5, 5, 34], threads));
+    assert!(!dispatch_edge_domain(extent, [39, 39, 32], groups, [0, 8, 1]));
+    assert!(!dispatch_edge_domain(extent, [39, 39, 32], [u32::MAX, 5, 33], threads));
 }
 
 /// A clear of an exact typed native mip and array interval.

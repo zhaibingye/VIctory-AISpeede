@@ -442,6 +442,11 @@ struct VolumeRegion {
 
 #[cfg(feature = "paged-title")]
 impl VolumeBytes {
+    pub(crate) fn blocked_extent(&self) -> Option<[u32; 3]> {
+        matches!(self.layout, VolumeLayout::Blocked { .. })
+            .then_some([self.width, self.height, u32::from(self.depth)])
+    }
+
     pub(crate) fn new(base: u64, format: DXGI_FORMAT, layout: &victory_formats::texture::Layout)
         -> Option<Self>
     {
