@@ -160,12 +160,13 @@ impl TextureInput {
         // SAFETY: the resource is retained by the view.
         let desc = unsafe { copy.texture.GetDesc() };
         let extended = EXTENDED_COLOR.contains(&format);
+        let plain = desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+            | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0;
         if !sample_color(format)
-            || extended && copy.uses_unproven_alias_backing()
+            || (extended || plain) && copy.uses_unproven_alias_backing()
             || desc.Format != format || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
             || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
             || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
-            || desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0
             || desc.Flags.0 & (D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0) != 0
             || copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
         {
@@ -175,7 +176,7 @@ impl TextureInput {
             input.format == format && u64::from(input.width) == desc.Width
                 && input.height == desc.Height && !copy.uses_unproven_alias_backing()
         });
-        let exact_backing = extended || compatible_input.is_some();
+        let exact_backing = extended || plain || compatible_input.is_some();
         Some(Self::Native { copy, format, exact_backing, compatible_input })
     }
 

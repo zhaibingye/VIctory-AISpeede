@@ -481,8 +481,7 @@ impl TextureUpload {
         let desc = unsafe { target.texture.GetDesc() };
         let sub = ColorSubresource::capture(desc, index)?;
         let exact_backing = !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-        if (!sub.scoped && desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0)
-            || exact_backing && target.uses_unproven_alias_backing()
+        if exact_backing && target.uses_unproven_alias_backing()
             || !sub.allows(&target)
             || target.sparse.is_some()
             || target.twin.get().is_some_and(Option::is_some)
@@ -521,6 +520,7 @@ pub(crate) struct TextureReadback {
     source: Arc<HostTexture>,
     target: crate::page_texture::LinearTexture,
     sub: ColorSubresource,
+    plain: bool,
 }
 
 impl TextureReadback {
@@ -534,8 +534,10 @@ impl TextureReadback {
         // SAFETY: the retained resource is live.
         let desc = unsafe { source.texture.GetDesc() };
         let sub = ColorSubresource::capture(desc, index)?;
+        let plain = desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+            | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0;
         if !sub.allows(&source)
-            || (!sub.scoped && desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0)
+            || plain && source.uses_unproven_alias_backing()
             || source.sparse.is_some()
             || source.twin.get().is_some_and(Option::is_some)
             || sub.width != u64::from(target.width) || sub.height != target.height
@@ -543,7 +545,7 @@ impl TextureReadback {
         {
             return None;
         }
-        Some(Self { source, target, sub })
+        Some(Self { source, target, sub, plain })
     }
 
     #[cfg(feature = "paged-title")]
@@ -565,16 +567,30 @@ impl TextureReadback {
         Ok(())
     }
 
+    pub(crate) fn explicit_ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
+        self.ranges(ranges)?;
+        collect_compatible_source(&self.source, ranges)
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn pointer_source(&self) -> Option<&Arc<HostTexture>> {
+        self.source.has_pointer_exposure().then_some(&self.source)
+    }
+
     pub(crate) fn encode(
         &self, host: &crate::host::Host, list: &HostList, batch: &crate::page_slabs::PinnedBatch,
         plan: &mut ResourcePlan,
         dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
         guest_copy: bool,
     ) -> Result<(), BatchError> {
-        if !self.sub.allows(&self.source) {
+        if !self.sub.allows(&self.source) || self.plain && self.source.uses_unproven_alias_backing() {
             return Err(BatchError::UnsupportedTextureMap);
         }
-        if self.sub.scoped {
+        // An explicit guest command consumes the latest ordered resource,
+        // including certified escaped CPU bytes if no native write superseded
+        // them in this batch. Internal mirrors instead publish the existing
+        // native version; never re-upload bytes into the version they expose.
+        if guest_copy || self.sub.scoped {
             plan.require_color_subresource(host, list, batch, &self.source, self.sub)?;
         } else if !plan.authoritative(&self.source) {
             return Err(BatchError::TargetNotInitialized);
@@ -668,7 +684,8 @@ impl TextureCopy {
             && source.scoped && destination.scoped && source.index != destination.index;
         if same_allocation && !separate_subresources
             || !source.allows(&src) || !destination.allows(&dst)
-            || (!scoped && (a.Flags.0 & writable == 0 || b.Flags.0 & writable == 0))
+            || (a.Flags.0 & writable == 0 || b.Flags.0 & writable == 0)
+                && crate::page_texture::linear_texel_bytes(a.Format).is_none()
             || exact_backing && (src.uses_unproven_alias_backing() || dst.uses_unproven_alias_backing())
             || a.Format != b.Format
             || src.sparse.is_some() || dst.sparse.is_some()

@@ -435,7 +435,9 @@ impl View {
         let compatible = copy.exact_committed_bytes();
         #[cfg(not(feature = "paged-title"))]
         let compatible = None;
-        TextureInput::native(copy.clone(), format, compatible).or_else(|| {
+        // Pick between the canonical native image and the original linear
+        // bytes at execution, after earlier resolves/uploads are ordered.
+        TextureInput::native(copy.clone(), format, compatible.or(plain_linear)).or_else(|| {
             plain_linear.map(|input| TextureInput::Linear { copy, input })
         })
     }

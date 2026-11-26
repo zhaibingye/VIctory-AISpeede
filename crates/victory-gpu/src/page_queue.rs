@@ -245,6 +245,7 @@ impl PageOp {
                 copy.preserves_color()
             },
             Self::UploadTexture(upload) => upload.preserves_color(),
+            Self::ReadbackTexture(readback) => readback.pointer_source(),
             Self::Draw(draw) => return draw.preserved_colors(out),
             Self::Dispatch(dispatch) => return dispatch.preserved_colors(out),
             Self::Clear(clear) => clear.preserves_color(),
@@ -398,7 +399,7 @@ impl ClosedFootprint {
                         if let QueryOp::Resolve { span, .. } = op.as_ref() { ranges.push(*span); }
                     }
                     PageOp::Input(input) => ranges.push(input.range()?),
-                    PageOp::ReadbackTexture(readback) => readback.ranges(&mut ranges)?,
+                    PageOp::ReadbackTexture(readback) => readback.explicit_ranges(&mut ranges)?,
                     PageOp::UploadTexture(upload) => upload.ranges(&mut ranges)?,
                     PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
                     PageOp::ClearRaw(clear) => ranges.push(clear.range()?),
