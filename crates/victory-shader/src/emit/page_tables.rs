@@ -92,36 +92,70 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
     Ok(Some(slots.into_iter().collect()))
 }
 
+/// One instruction set for raw atomic admission and DXIL lowering.
+/// Compare-exchange is separately encoded; the others use atomicBinOp.
+pub(super) fn raw_atomic_opcode(name: &str) -> Option<u32> {
+    Some(match name.strip_prefix("buffer_atomic_")? {
+        "add" => 0,
+        "and" => 1,
+        "or" => 2,
+        "xor" => 3,
+        "smin" => 4,
+        "smax" => 5,
+        "umin" => 6,
+        "umax" => 7,
+        "swap" => 8,
+        "cmpswap" => u32::MAX,
+        _ => return None,
+    })
+}
+
 fn bounded_raw_access(inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>) -> Option<StaticViewAccess> {
-    let (operation, width) = inst.name().strip_prefix("buffer_")?.split_once('_')?;
-    let write = match operation {
-        "store" => true,
-        "load" => false,
-        _ => return None,
-    };
-    let bytes = match width {
-        "dword" => 4,
-        "dwordx2" => 8,
-        "dwordx3" => 12,
-        "dwordx4" => 16,
-        _ => return None,
+    let name = inst.name();
+    let (write, bytes) = if raw_atomic_opcode(name).is_some() {
+        // Even compare-exchange's two input operands modify one dword.
+        (true, 4)
+    } else {
+        let (operation, width) = name.strip_prefix("buffer_")?.split_once('_')?;
+        let write = match operation {
+            "store" => true,
+            "load" => false,
+            _ => return None,
+        };
+        let bytes = match width {
+            "dword" => 4,
+            "dwordx2" => 8,
+            "dwordx3" => 12,
+            "dwordx4" => 16,
+            _ => return None,
+        };
+        (write, bytes)
     };
     let Fields::Buffer {
         addr, offset, soffset, offen, idxen: false, format: None, lds: false, tfe: false, ..
     } = &inst.fields else { return None };
-    if !matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128))
-        || !offset.is_multiple_of(4)
-    {
+    if !offset.is_multiple_of(4) {
         return None;
     }
     let offset = u32::from(*offset);
-    let dynamic = if *offen {
+    let vector_hi = if *offen {
         let Operand::Vector { reg, .. } = *addr else { return None; };
         bounds.dword_offset_hi(inst.read(crate::ir::Reg::V(reg))?)?
     } else {
         0
     };
-    let span = dynamic.checked_add(bytes)?;
+    let (offset, scalar_hi) = match *soffset {
+        Operand::Scalar { code: NULL, .. } => (offset, 0),
+        Operand::Const(n @ 128..=192) => {
+            let constant = u32::from(n - 128);
+            if !constant.is_multiple_of(4) { return None; }
+            (offset.checked_add(constant)?, 0)
+        }
+        Operand::Scalar { code: code @ 0..=105, dwords: 1 } =>
+            (offset, bounds.dword_offset_hi(inst.read(crate::ir::Reg::S(code))?)?),
+        _ => return None,
+    };
+    let span = vector_hi.checked_add(scalar_hi)?.checked_add(bytes)?;
     // The renderer may treat this entire conservative interval as
     // dirty, but never bind outside the proven descriptor footprint.
     (offset.checked_add(span)? <= 65536)

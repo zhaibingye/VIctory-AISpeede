@@ -8947,21 +8947,10 @@ impl<'a> Lower<'a> {
         let guard = self.guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
-        // DXIL atomic operations: add, and, or, xor, signed and unsigned
-        // min and max, exchange; compare-exchange apart.
-        let atomic = match name.strip_prefix("buffer_atomic_") {
-            None => None,
-            Some("add") => Some(0),
-            Some("and") => Some(1),
-            Some("or") => Some(2),
-            Some("xor") => Some(3),
-            Some("smin") => Some(4),
-            Some("smax") => Some(5),
-            Some("umin") => Some(6),
-            Some("umax") => Some(7),
-            Some("swap") => Some(8),
-            Some("cmpswap") => Some(u32::MAX),
-            Some(_) => return Err(name),
+        let atomic = if name.starts_with("buffer_atomic_") {
+            Some(super::page_tables::raw_atomic_opcode(name).ok_or(name)?)
+        } else {
+            None
         };
         // d16: two 16-bit channels per VGPR, low half first (buffer and
         // tbuffer formats alike).
