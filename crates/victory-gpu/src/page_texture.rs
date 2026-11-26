@@ -20,9 +20,30 @@ pub(crate) enum TextureInput {
     Native {
         copy: std::sync::Arc<crate::resource::HostTexture>,
         format: DXGI_FORMAT,
-        depth_plane: bool,
+        exact_backing: bool,
         compatible_input: Option<LinearTexture>,
     },
+}
+
+const EXTENDED_COLOR: [DXGI_FORMAT; 6] = [
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT,
+    DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+];
+
+fn extended_color_support(host: &Host, format: DXGI_FORMAT) -> bool {
+    static SUPPORT: [std::sync::OnceLock<bool>; EXTENDED_COLOR.len()] =
+        [const { std::sync::OnceLock::new() }; EXTENDED_COLOR.len()];
+    let Some(index) = EXTENDED_COLOR.iter().position(|&f| f == format) else { return true; };
+    // There is one process host adapter. Avoid querying the same native
+    // format for each draw while still checking optional sampling support.
+    *SUPPORT[index].get_or_init(|| {
+        let mut caps = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+        // SAFETY: the feature query fills this local structure.
+        unsafe { host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut caps).cast(), size_of_val(&caps) as u32,
+        ) }.is_ok()
+            && caps.Support1.contains(D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)
+    })
 }
 
 impl TextureInput {
@@ -32,7 +53,10 @@ impl TextureInput {
     ) -> Option<Self> {
         // SAFETY: the resource is retained by the view.
         let desc = unsafe { copy.texture.GetDesc() };
-        if !matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM)
+        let basic = matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM);
+        let extended = EXTENDED_COLOR.contains(&format);
+        if !(basic || extended)
+            || extended && copy.uses_unproven_alias_backing()
             || desc.Format != format || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
             || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
             || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
@@ -46,7 +70,8 @@ impl TextureInput {
             input.format == format && u64::from(input.width) == desc.Width
                 && input.height == desc.Height && !copy.uses_unproven_alias_backing()
         });
-        Some(Self::Native { copy, format, depth_plane: false, compatible_input })
+        let exact_backing = extended || compatible_input.is_some();
+        Some(Self::Native { copy, format, exact_backing, compatible_input })
     }
 
     pub(crate) fn native_depth(
@@ -69,7 +94,7 @@ impl TextureInput {
         {
             return None;
         }
-        Some(Self::Native { copy, format, depth_plane: true, compatible_input: None })
+        Some(Self::Native { copy, format, exact_backing: true, compatible_input: None })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -107,8 +132,8 @@ impl TextureInput {
                 }
                 Ok((input.encode(host, list, batch)?, input.format))
             }
-            Self::Native { copy, format, depth_plane, compatible_input } => {
-                if (*depth_plane || compatible_input.is_some()) && (copy.uses_unproven_alias_backing()
+            Self::Native { copy, format, exact_backing, compatible_input } => {
+                if *exact_backing && (copy.uses_unproven_alias_backing()
                     || copy.twin.get().is_some_and(Option::is_some))
                 {
                     return Err(BatchError::UnsupportedTextureMap);
@@ -117,6 +142,9 @@ impl TextureInput {
                     && !plan.authoritative(copy)
                 {
                     return Ok((input.encode(host, list, batch)?, input.format));
+                }
+                if !extended_color_support(host, *format) {
+                    return Err(BatchError::UnsupportedTextureMap);
                 }
                 plan.require_native(host, list, batch, copy)?;
                 let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;

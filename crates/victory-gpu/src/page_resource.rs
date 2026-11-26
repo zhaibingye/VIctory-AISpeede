@@ -295,6 +295,7 @@ pub(crate) struct TextureCopy {
     src: Arc<HostTexture>,
     dst: Arc<HostTexture>,
     area: Option<CopyArea>,
+    exact_backing: bool,
 }
 
 struct CopyArea {
@@ -328,10 +329,13 @@ impl TextureCopy {
     ) -> Option<Self> {
         // SAFETY: the references retain both native resources.
         let (a, b) = unsafe { (src.texture.GetDesc(), dst.texture.GetDesc()) };
+        let writable = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
+        let exact_backing = !a.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+            || !b.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         if Arc::ptr_eq(&src, &dst) || src.texture == dst.texture
             || !single_color(a) || !single_color(b)
-            || !a.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
-            || !b.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+            || a.Flags.0 & writable == 0 || b.Flags.0 & writable == 0
+            || exact_backing && (src.uses_unproven_alias_backing() || dst.uses_unproven_alias_backing())
             || a.Format != b.Format
             || src.sparse.is_some() || dst.sparse.is_some()
             || src.twin.get().is_some_and(Option::is_some)
@@ -345,7 +349,8 @@ impl TextureCopy {
             use windows::Win32::Graphics::Dxgi::Common::*;
             if !matches!(a.Format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
                 | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
-                | DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R10G10B10A2_UNORM)
+                | DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R10G10B10A2_UNORM
+                | DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R11G11B10_FLOAT)
             {
                 return None;
             }
@@ -372,7 +377,7 @@ impl TextureCopy {
             }
             None
         };
-        Some(Self { src, dst, area })
+        Some(Self { src, dst, area, exact_backing })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -383,6 +388,9 @@ impl TextureCopy {
         &self, host: &crate::host::Host, list: &HostList,
         batch: &crate::page_slabs::PinnedBatch, plan: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
+        if self.exact_backing && (self.src.uses_unproven_alias_backing() || self.dst.uses_unproven_alias_backing()) {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
         plan.require_native(host, list, batch, &self.src)?;
         if self.area.as_ref().is_some_and(|area| !area.fills_destination) {
             plan.require_native(host, list, batch, &self.dst)?;

@@ -387,25 +387,33 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
-    /// An exact single-mip SRV from linear pages or a native target.
-    /// An explicit depth SRV may select the typed depth plane only.
+    /// A canonical one-mip 2D view. An explicit override must describe
+    /// exactly the same shape, with a matching color format or depth plane.
     #[cfg(windows)]
     pub(crate) fn paged_texture_srv(&self) -> Option<crate::page_texture::TextureInput> {
         use crate::page_texture::TextureInput;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         let Self::Shader(resource, desc) = *self else { return None };
         let resource = resource as This;
-        if let Some(words) = desc {
-            let format = host::paged_depth_srv_format(&words)?;
-            return TextureInput::native_depth(crate::resource::host_copy(resource)?, format);
-        }
         let copy = crate::resource::host_copy(resource)?;
-        let plain_linear = crate::resource::paged_linear_texture(resource);
+        let format = if let Some(words) = desc {
+            host::paged_exact_2d_srv_format(&words)?
+        } else {
+            DXGI_FORMAT(crate::resource::title_format(resource)? as i32)
+        };
+        if desc.is_some()
+            && let Some(depth) = TextureInput::native_depth(copy.clone(), format)
+        {
+            return Some(depth);
+        }
+        if crate::resource::stands_in(resource) {
+            return None; // a different host format needs its own semantics
+        }
+        let plain_linear = crate::resource::paged_linear_texture(resource).filter(|input| input.format == format);
         #[cfg(feature = "paged-title")]
         let compatible = copy.exact_committed_bytes();
         #[cfg(not(feature = "paged-title"))]
         let compatible = None;
-        let format = DXGI_FORMAT(crate::resource::title_format(resource)? as i32);
         TextureInput::native(copy.clone(), format, compatible).or_else(|| {
             plain_linear.map(|input| TextureInput::Linear { copy, input })
         })
