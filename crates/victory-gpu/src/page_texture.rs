@@ -381,6 +381,147 @@ pub(crate) struct LinearTexture {
     pub(crate) format: DXGI_FORMAT,
 }
 
+/// 给当前队列核对原生传输足迹；来宾和宿主的 padding 彼此独立。
+fn checked_texture_footprint(host: &Host, desc: D3D12_RESOURCE_DESC)
+    -> Result<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64), BatchError>
+{
+    let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        u32::from(desc.DepthOrArraySize)
+    } else {
+        1
+    };
+    let texel = linear_texel_bytes(desc.Format).ok_or(BatchError::UnsupportedTextureMap)?;
+    let width = desc.Width.checked_mul(u64::from(texel)).ok_or(BatchError::UnsupportedTextureMap)?;
+    let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let (mut rows, mut row_bytes, mut total) = (0, 0, 0);
+    // 安全：两种调用方都已验证要复制的 subresource 0 与尺寸。
+    unsafe {
+        host.device.GetCopyableFootprints(&desc, 0, 1, 0,
+            Some(&mut footprint), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
+    }
+    let pitch = u64::from(footprint.Footprint.RowPitch);
+    let last = u64::from(depth).checked_mul(u64::from(rows))
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|n| n.checked_mul(pitch))
+        .and_then(|n| n.checked_add(width))
+        .and_then(|n| n.checked_add(footprint.Offset));
+    if rows != desc.Height || row_bytes != width || width > pitch || total == u64::MAX || total == 0
+        || footprint.Footprint.Depth != depth || last.is_none_or(|end| end > total)
+    {
+        return Err(BatchError::UnsupportedTextureMap);
+    }
+    Ok((footprint, total))
+}
+
+/// 地址式三维资源的线性字节表示。只有每行和每层都已证明后才可构造。
+/// GPU 保留顺序：从当前物理页复制，随后将需要发布的写入散回相同的页。
+#[cfg(feature = "paged-title")]
+#[derive(Clone, Copy)]
+pub(crate) struct LinearVolume {
+    pub(crate) plane: LinearTexture,
+    pub(crate) depth: u16,
+    pub(crate) slice_pitch: u64,
+}
+
+#[cfg(feature = "paged-title")]
+impl LinearVolume {
+    pub(crate) fn rows(self) -> Result<impl DoubleEndedIterator<Item = (u64, u64)>, BatchError> {
+        const LIMIT: u32 = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION;
+        let invalid = || BatchError::Range(self.plane.address, self.plane.address);
+        let texel = linear_texel_bytes(self.plane.format).ok_or_else(invalid)?;
+        let width = u64::from(self.plane.width) * u64::from(texel);
+        let pitch = u64::from(self.plane.row_pitch);
+        let depth = u64::from(self.depth);
+        let height = u64::from(self.plane.height);
+        if self.plane.address == 0 || depth == 0 || height == 0 || width == 0
+            || u32::from(self.depth) > LIMIT || self.plane.height > LIMIT || self.plane.width > LIMIT
+            || width > pitch
+        {
+            return Err(invalid());
+        }
+        let slice_bytes = ((height - 1) * pitch).checked_add(width).ok_or_else(invalid)?;
+        let end = self.slice_pitch.checked_mul(depth - 1)
+            .and_then(|n| n.checked_add(slice_bytes))
+            .and_then(|n| self.plane.address.checked_add(n)).ok_or_else(invalid)?;
+        if (depth > 1 && self.slice_pitch < slice_bytes) || end > ADDRESS_LIMIT {
+            return Err(BatchError::Range(self.plane.address, end));
+        }
+        Ok((0..depth * height).map(move |index| {
+            let at = self.plane.address + index / height * self.slice_pitch + index % height * pitch;
+            (at, at + width)
+        }))
+    }
+
+    fn footprint(self, host: &Host, texture: &ID3D12Resource)
+        -> Result<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64), BatchError>
+    {
+        // 安全：查询保留的宿主资源，不读取其像素。
+        let desc = unsafe { texture.GetDesc() };
+        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || desc.MipLevels != 1
+            || desc.Width != u64::from(self.plane.width) || desc.Height != self.plane.height
+            || desc.DepthOrArraySize != self.depth || desc.Format != self.plane.format
+            || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
+        {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
+        checked_texture_footprint(host, desc)
+    }
+
+    /// 调用方保证上传/读回所需状态；只交换有效行，不覆盖来宾填充字节。
+    pub(crate) fn transfer(
+        self, host: &Host, list: &HostList, batch: &PinnedBatch, texture: &ID3D12Resource,
+        written_pages: Option<&mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>>,
+    ) -> Result<(), BatchError> {
+        let rows = self.rows()?;
+        let (footprint, total) = self.footprint(host, texture)?;
+        let staging = host.default_buffer(total).ok_or_else(|| BatchError::Native(E_OUTOFMEMORY.into()))?;
+        let pitch = u64::from(footprint.Footprint.RowPitch);
+        let regions = rows.enumerate().map(|(row, range)| (range, footprint.Offset + row as u64 * pitch));
+        let native = D3D12_TEXTURE_COPY_LOCATION {
+            // 安全：对象由调用方持有，并在本命令列表保留到 Fence。
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let bytes = D3D12_TEXTURE_COPY_LOCATION {
+            // 安全：暂存缓冲区按原生足迹分配，指针不取得独立所有权。
+            pResource: unsafe { std::mem::transmute_copy(&staging) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+        };
+        list.keep(texture);
+        list.keep(&staging);
+        if let Some(dirty) = written_pages {
+            // 安全：调用方将纹理放在 COPY_SOURCE，暂存从 COPY_DEST 开始。
+            unsafe { list.recording().CopyTextureRegion(&bytes, 0, 0, 0, &native, None); }
+            crate::page_view::scatter_regions(list, batch, regions, &staging, dirty, None)
+        } else {
+            crate::page_view::gather_regions(list, batch, regions, &staging,
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)?;
+            // 安全：调用方将纹理放在 COPY_DEST；gather 已转换暂存状态。
+            unsafe { list.recording().CopyTextureRegion(&native, 0, 0, 0, &bytes, None); }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(all(test, feature = "paged-title"))]
+#[test]
+fn linear_volume_excludes_all_padding_and_rejects_overlapping_slices() {
+    let volume = LinearVolume {
+        plane: LinearTexture {
+            address: 0x10000, row_pitch: 32, width: 2, height: 2,
+            format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+        },
+        depth: 2,
+        slice_pitch: 128,
+    };
+    assert_eq!(volume.rows().unwrap().collect::<Vec<_>>(),
+        [(0x10000, 0x10010), (0x10020, 0x10030), (0x10080, 0x10090), (0x100a0, 0x100b0)]);
+    assert!((LinearVolume { slice_pitch: 47, ..volume }).rows().is_err());
+    assert!((LinearVolume { slice_pitch: u64::MAX, ..volume }).rows().is_err());
+}
+
 impl LinearTexture {
     pub(crate) fn rows(self) -> Result<impl Iterator<Item = (u64, u64)>, BatchError> {
         let texel = linear_texel_bytes(self.format).ok_or(BatchError::Range(self.address, self.address))?;
@@ -455,21 +596,7 @@ impl LinearTexture {
     }
 
     fn native_footprint(self, host: &Host) -> Result<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64), BatchError> {
-        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-        let (mut row_count, mut row_bytes, mut total) = (0, 0, 0);
-        // SAFETY: staging describes the cropped source, not the target,
-        // with one subresource and correctly sized output locations.
-        unsafe {
-            host.device.GetCopyableFootprints(&self.native_desc(), 0, 1, 0,
-                Some(&mut footprint), Some(&mut row_count), Some(&mut row_bytes), Some(&mut total));
-        }
-        let texel = linear_texel_bytes(self.format).ok_or(BatchError::Range(self.address, self.address))?;
-        if row_count != self.height || row_bytes != u64::from(self.width) * u64::from(texel)
-            || total == u64::MAX || total == 0 || footprint.Footprint.Depth != 1
-        {
-            return Err(BatchError::Native(E_FAIL.into()));
-        }
-        Ok((footprint, total))
+        checked_texture_footprint(host, self.native_desc())
     }
 
     /// Keep a native texture-to-linear copy on the GPU so subsequent
