@@ -24,7 +24,9 @@ pub(crate) struct SubmittedTail {
 #[derive(Default)]
 struct NativeWriteTrace {
     pages: std::collections::BTreeSet<PhysicalPage>,
-    incomplete: bool,
+    without_layout: usize,
+    without_mapping: usize,
+    truncated: bool,
 }
 
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
@@ -42,14 +44,18 @@ impl NativeWriteTrace {
         backing.flush();
         let mut result = Self::default();
         for span in spans {
-            let Some(runs) = span.and_then(|(start, end)| backing.pins().physical_runs(start as usize, end as usize)) else {
-                result.incomplete = true;
+            let Some((start, end)) = span else {
+                result.without_layout += 1;
+                continue;
+            };
+            let Some(runs) = backing.pins().physical_runs(start as usize, end as usize) else {
+                result.without_mapping += 1;
                 continue;
             };
             for (first, count) in runs {
                 for i in 0..count {
                     if result.pages.len() == Self::MAX_PAGES {
-                        result.incomplete = true;
+                        result.truncated = true;
                         return result;
                     }
                     result.pages.insert(first.offset(i));
@@ -59,11 +65,17 @@ impl NativeWriteTrace {
         result
     }
 
+    fn incomplete(&self) -> bool {
+        self.without_layout != 0 || self.without_mapping != 0 || self.truncated
+    }
+
     fn merge(&mut self, other: Self) {
-        self.incomplete |= other.incomplete;
+        self.without_layout = self.without_layout.saturating_add(other.without_layout);
+        self.without_mapping = self.without_mapping.saturating_add(other.without_mapping);
+        self.truncated |= other.truncated;
         for id in other.pages {
             if self.pages.len() == Self::MAX_PAGES && !self.pages.contains(&id) {
-                self.incomplete = true;
+                self.truncated = true;
                 break;
             }
             self.pages.insert(id);
@@ -81,8 +93,11 @@ pub(crate) fn trace_rejected_shared_read(span: Option<(u64, u64)>) {
         known_overlap = !writers.pages.is_disjoint(&read.pages),
         read_pages = read.pages.len(),
         completed_write_pages = writers.pages.len(),
-        incomplete_read = read.incomplete,
-        incomplete_history = writers.incomplete,
+        incomplete_read = read.incomplete(),
+        incomplete_history = writers.incomplete(),
+        writers_without_layout = writers.without_layout,
+        writers_without_mapping = writers.without_mapping,
+        history_truncated = writers.truncated,
         "共享纹理拒绝：已完成原生写入与读取物理范围对比"
     );
 }

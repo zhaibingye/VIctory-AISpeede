@@ -174,10 +174,11 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
 #[cfg(all(windows, feature = "paged-title"))]
 fn native_writer_candidate_span(address: u64, desc: &ResourceDesc) -> Option<(u64, u64)> {
     let layout = texture_layout(desc)?;
-    if layout.planes.iter().any(|plane| !plane.layout.addressable()) { return None; }
+    // XOR 或多样本可能没有逐 texel 寻址，但完整分配的尺寸仍已知。
+    // 这里只查询物理身份，不将超过着色器地址表的范围用于 GPU 读取。
     let end = address.checked_add(layout.size)?;
-    (address != 0 && address < end && end <= victory_memory::gpu_table::ADDRESS_LIMIT
-        && address.is_multiple_of(layout.alignment)).then_some((address, end))
+    usize::try_from(end).ok()?;
+    (address != 0 && address < end && address.is_multiple_of(layout.alignment)).then_some((address, end))
 }
 
 #[cfg(all(windows, feature = "paged-title", test))]
@@ -191,7 +192,17 @@ fn candidate_span_bounds_the_layout_not_the_live_texels() {
     assert_eq!(native_writer_candidate_span(0x10000, &desc), Some((0x10000, 0x10100)));
     assert_eq!(native_writer_candidate_span(0x10001, &desc), None);
     assert_eq!(native_writer_candidate_span(0x10000, &ResourceDesc { layout: 0xff, ..desc }), None);
-    assert_eq!(native_writer_candidate_span(victory_memory::gpu_table::ADDRESS_LIMIT, &desc), None);
+    let high = victory_memory::gpu_table::ADDRESS_LIMIT;
+    assert_eq!(native_writer_candidate_span(high, &desc), Some((high, high + 256)));
+    assert_eq!(native_writer_candidate_span(u64::MAX - 255, &desc), None);
+    let render = ResourceDesc { width: 1920, height: 1080, format: 28, layout: 0, flags: 1, ..desc };
+    let tiled = texture_layout(&render).unwrap();
+    assert!(!tiled.planes[0].layout.addressable());
+    assert_eq!(native_writer_candidate_span(0x20000, &render), Some((0x20000, 0x20000 + tiled.size)));
+    let depth = ResourceDesc { format: 20, flags: 2, ..render };
+    let tiled_depth = texture_layout(&depth).unwrap();
+    assert_eq!(tiled_depth.planes.len(), 2);
+    assert_eq!(native_writer_candidate_span(0x20000, &depth), Some((0x20000, 0x20000 + tiled_depth.size)));
 }
 
 /// Bytes and alignment a resource takes: buffers their width (64 KiB
