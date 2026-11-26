@@ -18,6 +18,75 @@ pub(crate) struct SubmittedTail {
     states: BTreeMap<usize, D3D12_RESOURCE_STATES>,
 }
 
+/// 仅用于诊断已完成的 GPU 写入。记录的是可能与共享字节相交的页，
+/// 不是最新版本；写回、CPU 再写和未完成的批次都不由这张表裁决。
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[derive(Default)]
+struct NativeWriteTrace {
+    pages: std::collections::BTreeSet<PhysicalPage>,
+    incomplete: bool,
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+static NATIVE_WRITES: std::sync::LazyLock<std::sync::Mutex<NativeWriteTrace>> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+impl NativeWriteTrace {
+    const MAX_PAGES: usize = 32_768;
+
+    fn capture(spans: impl Iterator<Item = Option<(u64, u64)>> + Clone) -> Self {
+        let mut backing = crate::title_backing::SubmissionBacking::default();
+        for (start, end) in spans.clone().flatten() {
+            backing.include(start as usize, end as usize);
+        }
+        backing.flush();
+        let mut result = Self::default();
+        for span in spans {
+            let Some(runs) = span.and_then(|(start, end)| backing.pins().physical_runs(start as usize, end as usize)) else {
+                result.incomplete = true;
+                continue;
+            };
+            for (first, count) in runs {
+                for i in 0..count {
+                    if result.pages.len() == Self::MAX_PAGES {
+                        result.incomplete = true;
+                        return result;
+                    }
+                    result.pages.insert(first.offset(i));
+                }
+            }
+        }
+        result
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.incomplete |= other.incomplete;
+        for id in other.pages {
+            if self.pages.len() == Self::MAX_PAGES && !self.pages.contains(&id) {
+                self.incomplete = true;
+                break;
+            }
+            self.pages.insert(id);
+        }
+    }
+}
+
+/// 只在拒绝位置记录无地址、无内容的证据；未发现重叠不承诺字节有效。
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+pub(crate) fn trace_rejected_shared_read(span: Option<(u64, u64)>) {
+    if !tracing::enabled!(tracing::Level::TRACE) { return; }
+    let read = NativeWriteTrace::capture(std::iter::once(span));
+    let writers = NATIVE_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    tracing::trace!(
+        known_overlap = !writers.pages.is_disjoint(&read.pages),
+        read_pages = read.pages.len(),
+        completed_write_pages = writers.pages.len(),
+        incomplete_read = read.incomplete,
+        incomplete_history = writers.incomplete,
+        "共享纹理拒绝：已完成原生写入与读取物理范围对比"
+    );
+}
+
 #[derive(Default)]
 pub(crate) struct ResourcePlan {
     inherited: SubmittedTail,
@@ -26,6 +95,10 @@ pub(crate) struct ResourcePlan {
     #[cfg(feature = "paged-title")]
     snapshot: Option<crate::page_slabs::SnapshotDigests>,
     pending: BTreeMap<(usize, Option<u32>), (Arc<HostTexture>, Version)>,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    trace_writers: BTreeMap<usize, Option<(u64, u64)>>,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    trace_capture: Option<NativeWriteTrace>,
     guest_overwrites: BTreeMap<PhysicalPage, Vec<std::ops::Range<usize>>>,
     state: BTreeMap<usize, (Arc<HostTexture>, D3D12_RESOURCE_STATES)>,
     #[cfg(feature = "paged-title")]
@@ -164,12 +237,18 @@ impl ResourcePlan {
         self.record_write_at(copy, sub.authority())
     }
 
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn capture_trace_writers(&mut self) {
+        if !self.trace_writers.is_empty() {
+            self.trace_capture = Some(NativeWriteTrace::capture(self.trace_writers.values().copied()));
+        }
+    }
+
     fn record_write_at(&mut self, copy: &Arc<HostTexture>, subresource: Option<u32>) -> Result<(), BatchError> {
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-        tracing::trace!(
-            subresource, layout_span_known = copy.candidate_guest_span.is_some(),
-            "已记录原生纹理写入；是否有布局范围不代表已固定物理页"
-        );
+        if tracing::enabled!(tracing::Level::TRACE) {
+            self.trace_writers.insert(Self::key(copy), copy.candidate_guest_span);
+        }
         let version = Version::successor(
             self.version_at(copy, subresource), Representation::NativeGpu, copy.byte_observation(),
         ).ok_or_else(|| BatchError::Native(windows::Win32::Foundation::E_FAIL.into()))?;
@@ -252,6 +331,11 @@ impl ResourcePlan {
 
     pub(crate) fn commit(self, submitted: Fence, observed: Fence, batch: &crate::page_slabs::PinnedBatch) {
         assert!(observed.0 >= submitted.0, "resource authority requires a completed fence");
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if let Some(observed_writes) = self.trace_capture {
+            NATIVE_WRITES.lock().unwrap_or_else(|e| e.into_inner()).merge(observed_writes);
+        }
+
         #[cfg(feature = "paged-title")]
         if let Some(snapshot) = &self.snapshot {
             for (key, copy) in &self.refreshed {

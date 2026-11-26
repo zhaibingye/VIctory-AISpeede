@@ -471,9 +471,17 @@ impl View {
         // Pick between the canonical native image and the original linear
         // bytes at execution, after earlier resolves/uploads are ordered.
         let external_alias = copy.uses_unproven_alias_backing();
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        let observed_span = copy.candidate_guest_span;
         TextureInput::native(copy.clone(), format, compatible.or(plain_linear)).or_else(|| {
             plain_linear.map(|input| TextureInput::Linear { copy, input })
-        }).ok_or(NativeOrBytes { external_alias, host_format: actual.Format.0 })
+        }).ok_or_else(|| {
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            if external_alias {
+                crate::page_resource::trace_rejected_shared_read(observed_span);
+            }
+            NativeOrBytes { external_alias, host_format: actual.Format.0 }
+        })
     }
 
     /// 仅游戏显式绑定的带类型空 SRV 才可生成宿主空视图，绝不替代真实纹理。
