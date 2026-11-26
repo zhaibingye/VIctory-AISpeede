@@ -3020,6 +3020,24 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// 整张复制不做缩放、颜色转换或 MSAA 解析。只有布局对应且同格式族才走快路径。
+fn present_copy_compatible(src: &D3D12_RESOURCE_DESC, dst: &D3D12_RESOURCE_DESC) -> bool {
+    src.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && dst.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && src.Width != 0
+        && src.Height != 0
+        && src.Width == dst.Width
+        && src.Height == dst.Height
+        && src.DepthOrArraySize == 1
+        && dst.DepthOrArraySize == 1
+        && src.MipLevels == 1
+        && dst.MipLevels == 1
+        && src.SampleDesc.Count == 1
+        && dst.SampleDesc.Count == 1
+        && src.SampleDesc.Quality == dst.SampleDesc.Quality
+        && swap_format(src.Format) == Some(dst.Format)
+}
+
 const BUFFERS: u32 = 2;
 const MAX_PLANES: u32 = 8;
 
@@ -3444,6 +3462,20 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        if planes.len() > 1 && p.compositor.as_ref().is_none_or(|c| c.format != format) {
+            match create_compositor(&self.device, format) {
+                Ok(c) => p.compositor = Some(c),
+                Err(error) => {
+                    tracing::warn!(%error, "无法建立画面合成器，将尝试仅呈现第一个平面");
+                    p.compositor = None;
+                }
+            }
+        }
+        let plans_to_composite = planes.len() > 1 && p.compositor.is_some();
+        if !plans_to_composite {
+            // 降级为单平面时仍按源纹理的尺寸配置后台缓冲区；整张复制不能缩放。
+            (width, height) = (primary_desc.Width as u32, primary_desc.Height);
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             let resized = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
@@ -3465,26 +3497,7 @@ impl Host {
                 }
             }
         }
-        // Leave the copy list closed if compositor initialization fails.
-        let compositor = if planes.len() > 1 {
-            if p.compositor.as_ref().is_none_or(|c| c.format != format) {
-                match create_compositor(&self.device, format) {
-                    Ok(c) => p.compositor = Some(c),
-                    Err(e) => {
-                        // The frame is still shown: its first plane alone, as
-                        // a single-plane present would.
-                        tracing::warn!(
-                            error = %e,
-                            "无法建立画面合成器，仅呈现第一个平面"
-                        );
-                        p.compositor = None;
-                    }
-                }
-            }
-            p.compositor.as_ref()
-        } else {
-            None
-        };
+        let compositor = if plans_to_composite { p.compositor.as_ref() } else { None };
         // SAFETY: our swap chain, list and live source textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -3495,10 +3508,25 @@ impl Host {
                     return None;
                 }
             };
+            let copy_only = compositor.is_none();
+            if copy_only {
+                let back_desc = back.GetDesc();
+                if primary.as_raw() == back.as_raw()
+                    || !present_copy_compatible(&primary_desc, &back_desc)
+                {
+                    tracing::warn!(
+                        frame,
+                        source = ?primary_desc,
+                        destination = ?back_desc,
+                        "源纹理与交换链后台缓冲区不兼容，不能整张复制"
+                    );
+                    return None;
+                }
+            }
             p.copy.reset();
             let list = p.copy.recording();
-            // One plane, or no compositor to combine several: copy the first.
-            let (capture, probe) = if planes.len() == 1 || compositor.is_none() {
+            // 单平面或合成器不可用时，仅允许用整张复制呈现第一个平面。
+            let (capture, probe) = if copy_only {
                 let (texture, state) = planes[0];
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);
@@ -4416,6 +4444,31 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 #[cfg(all(test, feature = "diagnostics"))]
 mod present_plane_tests {
     use super::*;
+
+    #[test]
+    fn present_copy_rejects_mismatched_shapes_and_formats() {
+        let rgba = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 32,
+            Height: 32,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        assert!(present_copy_compatible(&rgba, &rgba));
+        assert!(present_copy_compatible(&D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_R8G8B8A8_TYPELESS, ..rgba }, &rgba));
+        for src in [
+            D3D12_RESOURCE_DESC { Width: 64, ..rgba },
+            D3D12_RESOURCE_DESC { DepthOrArraySize: 2, ..rgba },
+            D3D12_RESOURCE_DESC { MipLevels: 2, ..rgba },
+            D3D12_RESOURCE_DESC { SampleDesc: DXGI_SAMPLE_DESC { Count: 4, Quality: 0 }, ..rgba },
+            D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_B8G8R8A8_UNORM, ..rgba },
+        ] {
+            assert!(!present_copy_compatible(&src, &rgba));
+        }
+    }
 
     #[test]
     fn compositor_failure_preserves_single_plane_presentation() {
