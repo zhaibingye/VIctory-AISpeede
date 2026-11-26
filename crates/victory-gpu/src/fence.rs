@@ -1,9 +1,9 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Guest fences: a CPU-visible value and its waiters. Native GPU
+//! completion alone must not publish this value for work with writeback.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
@@ -37,6 +37,7 @@ struct Fence {
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
+    published: Condvar,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -57,6 +58,7 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        published: Condvar::new(),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -95,10 +97,18 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
-        return E_NOTIMPL;
+        if !cfg!(feature = "paged-title") {
+            return E_NOTIMPL;
+        }
+        // CPU wait only: release the fence lock while sleeping. Explicit
+        // signals wake this immediately. Occasional rechecks observe
+        // title writes through the exposed value address, which do not notify.
+        while fence.value.load(Ordering::Acquire) < value {
+            (waiters, _) = fence.published
+                .wait_timeout(waiters, std::time::Duration::from_millis(10))
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        return S_OK;
     }
     waiters.push((value, event as usize));
     S_OK
@@ -114,6 +124,7 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
         }
         !reached
     });
+    fence.published.notify_all();
     S_OK
 }
 
@@ -168,7 +179,15 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        if cfg!(feature = "paged-title") {
+            let handle = f as usize;
+            std::thread::scope(|scope| {
+                scope.spawn(move || { assert_eq!(signal(handle as This, 9), S_OK); });
+                assert_eq!(wait(f, 9, std::ptr::null_mut()), S_OK);
+            });
+        } else {
+            assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        }
         // Grand Theft Auto VI reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
