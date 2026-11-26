@@ -17,7 +17,7 @@ use crate::copy_plan::{GuestCopy, Unbound};
 use crate::descriptor::host::HostHeap;
 use crate::host::{Host, HostList, fail, transition};
 use crate::page_view::InputView;
-use crate::page_slabs::{BatchError, CapturedUploads, PinnedBatch, Transfer, download};
+use crate::page_slabs::{BatchError, BoundLeaves, CapturedUploads, PinnedBatch, Transfer, download};
 use crate::title_backing::SubmissionBacking;
 
 #[derive(Clone, Copy)]
@@ -199,15 +199,13 @@ struct SubmittedRender<'a> {
     list: HostList,
     descriptors: PageDescriptors<'a>,
     targets: crate::page_resource::ResourcePlan,
-    bitmap: NonNull<u8>,
-    bitmap_words: usize,
+    tracking: Option<BitmapTracking>,
 }
 
 struct CompletedRender<'a> {
     _list: HostList,
     _descriptors: PageDescriptors<'a>,
-    bitmap: NonNull<u8>,
-    bitmap_words: usize,
+    tracking: Option<BitmapTracking>,
 }
 
 impl<'a> SubmittedRender<'a> {
@@ -217,16 +215,28 @@ impl<'a> SubmittedRender<'a> {
         self.targets.commit(self.fence, completed);
         CompletedRender {
             _list: self.list, _descriptors: self.descriptors,
-            bitmap: self.bitmap, bitmap_words: self.bitmap_words,
+            tracking: self.tracking,
         }
     }
 }
 
+struct BitmapTracking {
+    leaves: BoundLeaves,
+    mapped: NonNull<u8>,
+    words: usize,
+}
+
 impl CompletedRender<'_> {
-    fn bitmap(&self) -> &[u32] {
-        // SAFETY: the fence completed, the bitmap is not writable by
-        // another submission, and the retained list owns the mapping.
-        unsafe { std::slice::from_raw_parts(self.bitmap.as_ptr().cast(), self.bitmap_words) }
+    fn discovered_writes(&self) -> BTreeSet<PhysicalPage> {
+        let Some(tracking) = &self.tracking else { return BTreeSet::new() };
+        // SAFETY: the fence completed, and the retained list exclusively
+        // owns this submission's bitmap mapping.
+        let words = unsafe {
+            std::slice::from_raw_parts(tracking.mapped.as_ptr().cast(), tracking.words)
+        };
+        tracking.leaves.dirty_pages(words).unwrap_or_else(|leaf| {
+            fail(format_args!("paged dispatch accessed unbound page-table leaf {leaf}"))
+        })
     }
 }
 
@@ -335,7 +345,7 @@ impl Host {
         record: impl FnOnce(&HostList, PageRoots) -> Result<()>,
     ) -> std::result::Result<PageStats, BatchError> {
         self.execute_paged_work(heap, backing, ranges, WriteSet::ShaderBitmap, |list, roots, _, _, _, _| {
-            record(list, roots).map_err(BatchError::Native)?;
+            record(list, roots.expect("bitmap mode provides shader roots")).map_err(BatchError::Native)?;
             Ok(BTreeSet::new())
         })
     }
@@ -538,7 +548,7 @@ impl Host {
         writes: WriteSet,
         record: impl FnOnce(
             &HostList,
-            PageRoots,
+            Option<PageRoots>,
             &PinnedBatch,
             &BackingPins,
             &mut PageDescriptors<'_>,
@@ -558,7 +568,7 @@ impl Host {
         writes: WriteSet,
         record: impl FnOnce(
             &HostList,
-            PageRoots,
+            Option<PageRoots>,
             &PinnedBatch,
             &BackingPins,
             &mut PageDescriptors<'_>,
@@ -593,7 +603,7 @@ fn run(
     writes: WriteSet,
     record: impl FnOnce(
         &HostList,
-        PageRoots,
+        Option<PageRoots>,
         &PinnedBatch,
         &BackingPins,
         &mut PageDescriptors<'_>,
@@ -607,23 +617,39 @@ fn run(
         textures: Vec::new(),
         raw_views: Vec::new(),
     };
-    let mut raw = RawPageTable::new(pairs.reserve(None, 0).map_err(native)?);
-    let leaves = batch.bind(&mut raw, |pin| {
-        pairs.reserve(Some(pin.buffer()), crate::page_slabs::SLAB_BYTES)
-    })?;
-    let (words, blocks) = raw.into_parts();
-    let table_bytes = words.len() * 4;
-    let bitmap_words = blocks.len() * victory_memory::gpu_table::BLOCK / 32;
-    let (table, table_ptr) = host
-        .upload_buffer(table_bytes as u64)
-        .ok_or_else(|| native(oom()))?;
-    let (bitmap, bitmap_ptr) = host
-        .shared_buffer((bitmap_words * 4) as u64)
-        .ok_or_else(|| native(oom()))?;
-    let table_ptr = NonNull::new(table_ptr).ok_or_else(|| native(oom()))?;
-    let bitmap_ptr = NonNull::new(bitmap_ptr).ok_or_else(|| native(oom()))?;
-    let uploads = CapturedUploads::stage(host, batch, backing)?;
     let list = host.new_list().map_err(native)?;
+    // Only the low-level page shader API uses a shader-visible virtual
+    // page table. Closed title ops bind physical resources directly and
+    // provide exact or conservative write sets, including translated UAVs.
+    let (roots, tracking) = if matches!(writes, WriteSet::ShaderBitmap) {
+        let mut raw = RawPageTable::new(pairs.reserve(None, 0).map_err(native)?);
+        let leaves = batch.bind(&mut raw, |pin| {
+            pairs.reserve(Some(pin.buffer()), crate::page_slabs::SLAB_BYTES)
+        })?;
+        let (words, blocks) = raw.into_parts();
+        let table_bytes = words.len() * 4;
+        let bitmap_words = blocks.len() * victory_memory::gpu_table::BLOCK / 32;
+        let (table, table_ptr) = host.upload_buffer(table_bytes as u64).ok_or_else(|| native(oom()))?;
+        let (bitmap, bitmap_ptr) = host.shared_buffer((bitmap_words * 4) as u64).ok_or_else(|| native(oom()))?;
+        let table_ptr = NonNull::new(table_ptr).ok_or_else(|| native(oom()))?;
+        let bitmap_ptr = NonNull::new(bitmap_ptr).ok_or_else(|| native(oom()))?;
+        list.keep(&table);
+        list.keep(&bitmap);
+        // SAFETY: the resources are mapped for their allocated sizes
+        // and have not been submitted to the GPU.
+        let roots = unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), table_ptr.as_ptr(), table_bytes);
+            bitmap_ptr.as_ptr().write_bytes(0, bitmap_words * 4);
+            PageRoots {
+                table: table.GetGPUVirtualAddress(),
+                dirty: bitmap.GetGPUVirtualAddress(),
+            }
+        };
+        (Some(roots), Some(BitmapTracking { leaves, mapped: bitmap_ptr, words: bitmap_words }))
+    } else {
+        (None, None)
+    };
+    let uploads = CapturedUploads::stage(host, batch, backing)?;
     let slabs: BTreeMap<_, _> = batch
         .pages()
         .map(|(_, _, page)| (page.slab(), page.buffer()))
@@ -631,19 +657,7 @@ fn run(
     for buffer in slabs.values() {
         list.keep(*buffer);
     }
-    list.keep(&bitmap);
-    list.keep(&table);
     list.keep(&heap.heap);
-    // SAFETY: mapped backings with the allocated sizes; the queue has not
-    // run. No CPU slice into bitmap data exists while commands run.
-    let roots = unsafe {
-        std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), table_ptr.as_ptr(), table_bytes);
-        bitmap_ptr.as_ptr().write_bytes(0, bitmap_words * 4);
-        PageRoots {
-            table: table.GetGPUVirtualAddress(),
-            dirty: bitmap.GetGPUVirtualAddress(),
-        }
-    };
     let uploaded = uploads.as_ref().map_or(0, |stage| stage.record(&list));
     barrier(&list, slabs.values().copied(), false);
     let mut targets = crate::page_resource::ResourcePlan::default();
@@ -664,22 +678,20 @@ fn run(
         .submit_native_group(signal, &[Some(command)])
         .unwrap_or_else(|e| fail(format_args!("native paged render submission: {e}")));
     let render = SubmittedRender {
-        fence: rendered, list, descriptors: pairs, targets,
-        bitmap: bitmap_ptr, bitmap_words,
+        fence: rendered, list, descriptors: pairs, targets, tracking,
     };
     // Keep CPU-visible semantics unchanged for now. Moving this
     // observation later requires proving which guest bytes are visible.
     let completed_render = render.observe(host);
 
-    let mut dirty = leaves.dirty_pages(completed_render.bitmap()).unwrap_or_else(|leaf| {
-        fail(format_args!(
-            "paged dispatch accessed unbound page-table leaf {leaf}"
-        ))
-    });
-    if matches!(writes, WriteSet::Declared) && !dirty.is_subset(&declared_dirty) {
-        fail(format_args!("closed title submission produced an undeclared page write"));
-    }
-    dirty.extend(declared_dirty);
+    let dirty = match writes {
+        WriteSet::Declared => declared_dirty,
+        WriteSet::ShaderBitmap => {
+            let mut dirty = completed_render.discovered_writes();
+            dirty.extend(declared_dirty);
+            dirty
+        }
+    };
     let mut digests = uploads
         .as_ref()
         .map_or_else(BTreeMap::new, CapturedUploads::digests);
