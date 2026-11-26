@@ -69,11 +69,12 @@ impl QueryOp {
         heap: std::sync::Arc<crate::query::NativeQueryHeap>, kind: D3D12_QUERY_TYPE, first: u32, count: u32,
         base: u64, buffer_size: u64, offset: u64,
     ) -> Option<Self> {
-        let size = u64::from(count) * 8;
+        let size = u64::from(count).checked_mul(crate::query::result_bytes(kind)?)?;
         let start = base.checked_add(offset)?;
         let end = start.checked_add(size)?;
         if count == 0 || first.checked_add(count)? > heap.count
-            || base == 0 || !start.is_multiple_of(8) || offset.checked_add(size)? > buffer_size
+            || base == 0 || !start.is_multiple_of(8) || !offset.is_multiple_of(8)
+            || offset.checked_add(size)? > buffer_size
             || end > victory_memory::gpu_table::ADDRESS_LIMIT
         {
             return None;

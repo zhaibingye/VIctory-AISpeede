@@ -1,4 +1,4 @@
-//! Title query heaps. The VNME path admits actual direct-queue timestamps and visibility.
+//! Title query heaps. The VNME path admits actual direct-queue timestamps, visibility and pipeline counters.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
@@ -46,12 +46,23 @@ struct Heap {
 }
 
 #[cfg(all(windows, feature = "paged-title"))]
+pub(crate) fn result_bytes(kind: D3D12_QUERY_TYPE) -> Option<u64> {
+    const _: () = assert!(size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>() == 88);
+    match kind {
+        D3D12_QUERY_TYPE_TIMESTAMP | D3D12_QUERY_TYPE_OCCLUSION | D3D12_QUERY_TYPE_BINARY_OCCLUSION => Some(8),
+        D3D12_QUERY_TYPE_PIPELINE_STATISTICS => Some(size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>() as u64),
+        _ => None,
+    }
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
 pub(crate) fn native_heap(this: This, kind: u32) -> Option<(Arc<NativeQueryHeap>, D3D12_QUERY_TYPE)> {
     if this.is_null() { return None; }
     let query_type = D3D12_QUERY_TYPE(i32::try_from(kind).ok()?);
     let heap_type = match query_type {
         D3D12_QUERY_TYPE_TIMESTAMP => D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
         D3D12_QUERY_TYPE_OCCLUSION | D3D12_QUERY_TYPE_BINARY_OCCLUSION => D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+        D3D12_QUERY_TYPE_PIPELINE_STATISTICS => D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
         _ => return None,
     };
     // SAFETY: the query API receives a retained title query heap.
