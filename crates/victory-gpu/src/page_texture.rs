@@ -332,17 +332,23 @@ impl LinearTexture {
     /// supplies a matching native subresource zero in COPY_DEST.
     pub(crate) fn copy_to(
         self, host: &Host, list: &HostList, batch: &PinnedBatch, texture: &ID3D12Resource,
-        (x, y): (u32, u32),
+        origin: (u32, u32),
+    ) -> Result<(), BatchError> {
+        self.copy_to_subresource(host, list, batch, texture, 0, origin)
+    }
+
+    pub(crate) fn copy_to_subresource(
+        self, host: &Host, list: &HostList, batch: &PinnedBatch, texture: &ID3D12Resource,
+        index: u32, (x, y): (u32, u32),
     ) -> Result<(), BatchError> {
         let rows = self.rows()?;
-        // SAFETY: live native resource. Only an exact single subresource
-        // is consumed here, regardless of the guest's pitch.
+        // SAFETY: the native resource is live and retained by the caller.
         let desc = unsafe { texture.GetDesc() };
-        if x.checked_add(self.width).is_none_or(|end| u64::from(end) > desc.Width)
-            || y.checked_add(self.height).is_none_or(|end| end > desc.Height)
-            || desc.Format != self.format || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-            || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
-            || desc.MipLevels != 1 || desc.DepthOrArraySize != 1
+        let sub = crate::page_resource::ColorSubresource::capture(desc, index)
+            .ok_or_else(|| BatchError::Native(E_FAIL.into()))?;
+        if x.checked_add(self.width).is_none_or(|end| u64::from(end) > sub.width)
+            || y.checked_add(self.height).is_none_or(|end| end > sub.height)
+            || desc.Format != self.format
         {
             return Err(BatchError::Native(E_FAIL.into()));
         }
@@ -362,7 +368,7 @@ impl LinearTexture {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(texture),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&staging),

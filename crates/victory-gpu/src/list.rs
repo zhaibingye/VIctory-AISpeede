@@ -573,28 +573,31 @@ extern "system" fn copy_texture_region(
         if cfg!(feature = "paged-title") {
             // In subresource form the ABI initializes only the 32-bit
             // union member, not the rest of the placed-footprint storage.
-            let subresource_zero = |location: *const CopyLocation| {
+            let subresource = |location: *const CopyLocation| {
                 if location.is_null() {
                     return None;
                 }
                 // SAFETY: the title supplies a readable copy location.
                 unsafe {
-                    ((*location).kind == 0
-                        && (&raw const (*location).footprint).cast::<u32>().read() == 0)
-                        .then(|| (*location).resource)
+                    ((*location).kind == 0).then(|| (
+                        (*location).resource, (&raw const (*location).footprint).cast::<u32>().read(),
+                    ))
                 }
             };
+            let native = |location| subresource(location).and_then(|(resource, index)| {
+                crate::resource::host_copy(resource).map(|copy| (copy, index))
+            });
             // SAFETY: the ABI supplies either a readable six-field box or null.
             let bounds = unsafe { source_box.as_ref() }.copied();
             // SAFETY: the discriminator is initialized for every
             // readable location; read the footprint only in that variant.
             if !src.is_null() && unsafe { (*src).kind } == FOOTPRINT {
-                let target = subresource_zero(dst).and_then(crate::resource::host_copy);
+                let target = native(dst);
                 let upload = if z == 0 {
                     // SAFETY: the initialized footprint variant.
                     unsafe { (*src).footprint.linear_page_view((*src).resource) }
                         .zip(target)
-                        .and_then(|(from, to)| crate::page_resource::TextureUpload::capture(from, to, (x, y), bounds))
+                        .and_then(|(from, (to, index))| crate::page_resource::TextureUpload::capture(from, to, index, (x, y), bounds))
                 } else {
                     None
                 };
@@ -611,7 +614,7 @@ extern "system" fn copy_texture_region(
                 let readback = if x == 0 && y == 0 && z == 0 && bounds.is_none() {
                     // SAFETY: the initialized footprint variant.
                     let target = unsafe { (*dst).footprint.linear_page_view((*dst).resource) };
-                    subresource_zero(src).and_then(crate::resource::host_copy).zip(target)
+                    native(src).and_then(|(copy, index)| (index == 0).then_some(copy)).zip(target)
                         .and_then(|(from, to)| crate::page_resource::TextureReadback::capture(from, to))
                 } else {
                     None
@@ -627,9 +630,10 @@ extern "system" fn copy_texture_region(
                 list.mark_unlowered();
                 return;
             }
-            if let Some(copy) = subresource_zero(src).and_then(crate::resource::host_copy)
-                .zip(subresource_zero(dst).and_then(crate::resource::host_copy))
-                .and_then(|(from, to)| crate::page_resource::TextureCopy::capture_region(from, to, x, y, bounds))
+            if let Some(copy) = native(src).zip(native(dst))
+                .and_then(|((from, src_index), (to, dst_index))| {
+                    crate::page_resource::TextureCopy::capture_region(from, src_index, to, dst_index, x, y, bounds)
+                })
             {
                 list.record_page_texture_copy(copy);
             } else {

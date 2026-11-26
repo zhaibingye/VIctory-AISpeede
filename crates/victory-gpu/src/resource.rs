@@ -872,7 +872,7 @@ pub(crate) struct HostTexture {
     mapped_pointers: std::sync::Mutex<MapEpoch>,
     #[cfg(feature = "paged-title")]
     byte_mirror: std::sync::Mutex<Option<ByteMirror>>,
-    pub(crate) native_authority: std::sync::Mutex<Option<victory_memory::authority::CompletedVersion>>,
+    pub(crate) native_authority: std::sync::Mutex<std::collections::BTreeMap<Option<u32>, victory_memory::authority::CompletedVersion>>,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -914,13 +914,12 @@ impl HostTexture {
     pub(crate) fn compatible_texture_source(&self) -> Option<crate::page_texture::LinearTexture> {
         use victory_memory::authority::Representation;
         let value = self.native_authority.lock().unwrap_or_else(|e| e.into_inner());
-        if value.as_ref()?.version.representation != Representation::CompatibleBytes {
+        if value.get(&None)?.version.representation != Representation::CompatibleBytes {
             return None;
         }
         self.exact_committed_bytes()
     }
 
-    #[cfg(feature = "paged-title")]
     pub(crate) fn has_pointer_exposure(&self) -> bool {
         use victory_memory::authority::ByteExposure::{GuestGpuAddress, MappedPointer};
         let flags = self.byte_exposure.load(std::sync::atomic::Ordering::Acquire);
@@ -948,6 +947,13 @@ impl HostTexture {
         layout: Option<crate::page_texture::LinearTexture>,
     ) -> Result<(), crate::page_slabs::BatchError> {
         use crate::page_slabs::BatchError;
+        // A collection of initialized native subresources is not a
+        // CPU-compatible allocation. No pointer may expose stale pages.
+        if self.native_authority.lock().unwrap_or_else(|e| e.into_inner())
+            .keys().any(Option::is_some)
+        {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
         if self.completed_native_version().is_none() {
             return Ok(());
         }
@@ -993,7 +999,7 @@ impl HostTexture {
     fn completed_native_version(&self) -> Option<u64> {
         use victory_memory::authority::Representation;
         self.native_authority.lock().unwrap_or_else(|e| e.into_inner())
-            .as_ref().filter(|v| v.version.representation == Representation::NativeGpu)
+            .get(&None).filter(|v| v.version.representation == Representation::NativeGpu)
             .map(|v| v.version.number)
     }
 
@@ -1119,10 +1125,10 @@ impl HostTexture {
     fn record_cpu_bytes(&self) {
         use victory_memory::{authority::{CompletedVersion, Representation, Version}, coherence::Fence};
         let mut completed = self.native_authority.lock().unwrap_or_else(|e| e.into_inner());
-        let old = *completed;
+        let old = completed.get(&None).copied();
         let version = Version::successor(old.map(|v| v.version), Representation::CompatibleBytes,
             self.byte_observation()).unwrap_or_else(|| crate::host::fail(format_args!("VNME version exhausted")));
-        *completed = Some(CompletedVersion { version, fence: old.map_or(Fence(0), |v| v.fence) });
+        completed.insert(None, CompletedVersion { version, fence: old.map_or(Fence(0), |v| v.fence) });
         self.host_written.store(false, std::sync::atomic::Ordering::Release);
         use victory_memory::authority::ByteExposure::{GuestGpuAddress, MappedPointer};
         let mut mirror = self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner());
@@ -1174,7 +1180,7 @@ impl HostTexture {
             mapped_pointers: std::sync::Mutex::default(),
             #[cfg(feature = "paged-title")]
             byte_mirror: std::sync::Mutex::default(),
-            native_authority: std::sync::Mutex::new(None),
+            native_authority: std::sync::Mutex::default(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,

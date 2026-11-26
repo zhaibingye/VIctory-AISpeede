@@ -14,7 +14,7 @@ use crate::resource::HostTexture;
 /// bounded window sees these; guest-visible completion is independent.
 #[derive(Clone, Default)]
 pub(crate) struct SubmittedTail {
-    versions: BTreeMap<usize, Version>,
+    versions: BTreeMap<(usize, Option<u32>), Version>,
     states: BTreeMap<usize, D3D12_RESOURCE_STATES>,
 }
 
@@ -25,7 +25,7 @@ pub(crate) struct ResourcePlan {
     refreshed: BTreeMap<usize, Arc<HostTexture>>,
     #[cfg(feature = "paged-title")]
     snapshot: Option<crate::page_slabs::SnapshotDigests>,
-    pending: BTreeMap<usize, (Arc<HostTexture>, Version)>,
+    pending: BTreeMap<(usize, Option<u32>), (Arc<HostTexture>, Version)>,
     state: BTreeMap<usize, (Arc<HostTexture>, D3D12_RESOURCE_STATES)>,
 }
 
@@ -43,12 +43,16 @@ impl ResourcePlan {
         Arc::as_ptr(copy) as usize
     }
 
-    fn version(&self, copy: &Arc<HostTexture>) -> Option<Version> {
-        let key = Self::key(copy);
+    fn version_at(&self, copy: &Arc<HostTexture>, subresource: Option<u32>) -> Option<Version> {
+        let key = (Self::key(copy), subresource);
         self.pending.get(&key).map(|(_, version)| *version)
             .or_else(|| self.inherited.versions.get(&key).copied())
             .or_else(|| copy.native_authority.lock().unwrap_or_else(|e| e.into_inner())
-                .as_ref().map(|complete| complete.version))
+                .get(&subresource).map(|complete| complete.version))
+    }
+
+    fn version(&self, copy: &Arc<HostTexture>) -> Option<Version> {
+        self.version_at(copy, None)
     }
 
     pub(crate) fn authoritative(&self, copy: &Arc<HostTexture>) -> bool {
@@ -76,8 +80,8 @@ impl ResourcePlan {
             // read current bytes. Never replace writes produced earlier in
             // the same ordered native stream with the old CPU snapshot.
             if copy.has_pointer_exposure()
-                && !self.pending.contains_key(&key)
-                && !self.inherited.versions.contains_key(&key)
+                && !self.pending.contains_key(&(key, None))
+                && !self.inherited.versions.contains_key(&(key, None))
                 && !self.refreshed.contains_key(&key)
             {
                 let source = copy.visible_linear_writeback()?.ok_or(BatchError::UnsupportedTextureMap)?;
@@ -103,18 +107,36 @@ impl ResourcePlan {
             self.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
             source.copy_to(host, list, batch, &copy.texture, (0, 0))?;
             version.representation = Representation::NativeGpu;
-            self.pending.insert(Self::key(copy), (copy.clone(), version));
+            self.pending.insert((Self::key(copy), None), (copy.clone(), version));
             return Ok(());
         }
         let _ = (host, list, batch);
         Err(BatchError::TargetNotInitialized)
     }
 
+    fn require_color_subresource(
+        &mut self, host: &crate::host::Host, list: &HostList, batch: &crate::page_slabs::PinnedBatch,
+        copy: &Arc<HostTexture>, sub: ColorSubresource,
+    ) -> Result<(), BatchError> {
+        if !sub.scoped {
+            return self.require_native(host, list, batch, copy);
+        }
+        if self.version_at(copy, Some(sub.index)).is_some_and(|v| v.representation == Representation::NativeGpu) {
+            Ok(())
+        } else {
+            Err(BatchError::TargetNotInitialized)
+        }
+    }
+
     pub(crate) fn record_write(&mut self, copy: &Arc<HostTexture>) -> Result<(), BatchError> {
+        self.record_write_at(copy, None)
+    }
+
+    fn record_write_at(&mut self, copy: &Arc<HostTexture>, subresource: Option<u32>) -> Result<(), BatchError> {
         let version = Version::successor(
-            self.version(copy), Representation::NativeGpu, copy.byte_observation(),
+            self.version_at(copy, subresource), Representation::NativeGpu, copy.byte_observation(),
         ).ok_or_else(|| BatchError::Native(windows::Win32::Foundation::E_FAIL.into()))?;
-        self.pending.insert(Self::key(copy), (copy.clone(), version));
+        self.pending.insert((Self::key(copy), subresource), (copy.clone(), version));
         Ok(())
     }
 
@@ -159,7 +181,7 @@ impl ResourcePlan {
         #[cfg(feature = "paged-title")]
         if let Some(snapshot) = &self.snapshot {
             for (key, copy) in &self.refreshed {
-                if !self.pending.contains_key(key) {
+                if !self.pending.contains_key(&(*key, None)) {
                     copy.record_native_snapshot(batch, snapshot);
                 }
             }
@@ -168,13 +190,14 @@ impl ResourcePlan {
         for (copy, state) in self.state.into_values() {
             copy.state.store(state.0 as u32, Ordering::Release);
         }
-        for (copy, mut version) in self.pending.into_values() {
-            // An alias or pointer can escape after recording the write.
+        for ((_, subresource), (copy, mut version)) in self.pending {
             version.observation = copy.byte_observation();
-            *copy.native_authority.lock().unwrap_or_else(|e| e.into_inner()) =
-                version.complete(submitted, observed);
-            // Existing consumers still use the native-content flag.
-            copy.host_written.store(true, Ordering::Release);
+            let complete = version.complete(submitted, observed).expect("fence observed above");
+            copy.native_authority.lock().unwrap_or_else(|e| e.into_inner()).insert(subresource, complete);
+            if subresource.is_none() {
+                // Never advertise a partial native texture as whole.
+                copy.host_written.store(true, Ordering::Release);
+            }
         }
     }
 }
@@ -230,12 +253,51 @@ fn single_color(d: D3D12_RESOURCE_DESC) -> bool {
         && !d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
 }
 
+/// Plane zero of an exact 2D color texture. State transitions remain
+/// whole-resource for now, but byte authority is scoped to the copy.
+#[derive(Clone, Copy)]
+pub(crate) struct ColorSubresource {
+    pub(crate) index: u32,
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    scoped: bool,
+}
+
+impl ColorSubresource {
+    pub(crate) fn capture(desc: D3D12_RESOURCE_DESC, index: u32) -> Option<Self> {
+        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
+            || desc.SampleDesc.Quality != 0 || desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        {
+            return None;
+        }
+        let mips = u32::from(desc.MipLevels);
+        let total = mips.checked_mul(u32::from(desc.DepthOrArraySize))?;
+        if index >= total { return None; }
+        let scoped = total != 1;
+        if scoped {
+            crate::page_texture::linear_texel_bytes(desc.Format)?;
+        }
+        let mip = index % mips;
+        Some(Self {
+            index, width: desc.Width.checked_shr(mip)?.max(1),
+            height: desc.Height.checked_shr(mip)?.max(1), scoped,
+        })
+    }
+
+    fn authority(self) -> Option<u32> { self.scoped.then_some(self.index) }
+
+    fn allows(self, copy: &HostTexture) -> bool {
+        !self.scoped || (!copy.uses_unproven_alias_backing() && !copy.has_pointer_exposure())
+    }
+}
+
 /// An exact region from a placed linear source into a native target.
 /// Partial uploads consume existing target authority; full ones establish it.
 pub(crate) struct TextureUpload {
     source: crate::page_texture::LinearTexture,
     target: Arc<HostTexture>,
     offset: (u32, u32),
+    sub: ColorSubresource,
     fills_target: bool,
     exact_backing: bool,
 }
@@ -250,7 +312,7 @@ impl TextureUpload {
     pub(crate) fn target(&self) -> &Arc<HostTexture> { &self.target }
 
     pub(crate) fn capture(
-        source: crate::page_texture::LinearTexture, target: Arc<HostTexture>,
+        source: crate::page_texture::LinearTexture, target: Arc<HostTexture>, index: u32,
         (x, y): (u32, u32), bounds: Option<[u32; 6]>,
     ) -> Option<Self> {
         let source = source.crop(bounds)?;
@@ -258,19 +320,20 @@ impl TextureUpload {
         let end_y = y.checked_add(source.height)?;
         // SAFETY: the retained resource is live.
         let desc = unsafe { target.texture.GetDesc() };
+        let sub = ColorSubresource::capture(desc, index)?;
         let exact_backing = !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-        if !single_color(desc)
-            || desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0
+        if (!sub.scoped && desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0)
             || exact_backing && target.uses_unproven_alias_backing()
+            || !sub.allows(&target)
             || target.sparse.is_some()
             || target.twin.get().is_some_and(Option::is_some)
-            || end_x > desc.Width || end_y > desc.Height
+            || end_x > sub.width || end_y > sub.height
             || desc.Format != source.format
         {
             return None;
         }
-        let fills_target = x == 0 && y == 0 && end_x == desc.Width && end_y == desc.Height;
-        Some(Self { source, target, offset: (x, y), fills_target, exact_backing })
+        let fills_target = x == 0 && y == 0 && end_x == sub.width && end_y == sub.height;
+        Some(Self { source, target, offset: (x, y), sub, fills_target, exact_backing })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -281,15 +344,15 @@ impl TextureUpload {
     pub(crate) fn encode(&self, host: &crate::host::Host, list: &HostList,
         batch: &crate::page_slabs::PinnedBatch, plan: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
-        if self.exact_backing && self.target.uses_unproven_alias_backing() {
+        if !self.sub.allows(&self.target) || self.exact_backing && self.target.uses_unproven_alias_backing() {
             return Err(BatchError::UnsupportedTextureMap);
         }
         if !self.fills_target {
-            plan.require_native(host, list, batch, &self.target)?;
+            plan.require_color_subresource(host, list, batch, &self.target, self.sub)?;
         }
         plan.transition_texture(list, &self.target, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
-        self.source.copy_to(host, list, batch, &self.target.texture, self.offset)?;
-        plan.record_write(&self.target)?;
+        self.source.copy_to_subresource(host, list, batch, &self.target.texture, self.sub.index, self.offset)?;
+        plan.record_write_at(&self.target, self.sub.authority())?;
         Ok(())
     }
 }
@@ -358,6 +421,8 @@ pub(crate) struct TextureCopy {
     dst: Arc<HostTexture>,
     area: Option<CopyArea>,
     exact_backing: bool,
+    source: ColorSubresource,
+    destination: ColorSubresource,
 }
 
 struct CopyArea {
@@ -382,26 +447,32 @@ impl TextureCopy {
     pub(crate) fn target(&self) -> &Arc<HostTexture> { &self.dst }
 
     pub(crate) fn capture(src: Arc<HostTexture>, dst: Arc<HostTexture>) -> Option<Self> {
-        Self::capture_copy(src, dst, None)
+        Self::capture_copy(src, 0, dst, 0, None)
     }
 
     pub(crate) fn capture_region(
-        src: Arc<HostTexture>, dst: Arc<HostTexture>, x: u32, y: u32, bounds: Option<[u32; 6]>,
+        src: Arc<HostTexture>, src_index: u32, dst: Arc<HostTexture>, dst_index: u32,
+        x: u32, y: u32, bounds: Option<[u32; 6]>,
     ) -> Option<Self> {
-        Self::capture_copy(src, dst, Some((x, y, bounds)))
+        Self::capture_copy(src, src_index, dst, dst_index, Some((x, y, bounds)))
     }
 
     fn capture_copy(
-        src: Arc<HostTexture>, dst: Arc<HostTexture>, region: Option<(u32, u32, Option<[u32; 6]>)>,
+        src: Arc<HostTexture>, src_index: u32, dst: Arc<HostTexture>, dst_index: u32,
+        region: Option<(u32, u32, Option<[u32; 6]>)>,
     ) -> Option<Self> {
         // SAFETY: the references retain both native resources.
         let (a, b) = unsafe { (src.texture.GetDesc(), dst.texture.GetDesc()) };
+        let source = ColorSubresource::capture(a, src_index)?;
+        let destination = ColorSubresource::capture(b, dst_index)?;
+        let scoped = source.scoped || destination.scoped;
         let writable = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
-        let exact_backing = !a.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+        let exact_backing = scoped || !a.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
             || !b.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         if Arc::ptr_eq(&src, &dst) || src.texture == dst.texture
-            || !single_color(a) || !single_color(b)
-            || a.Flags.0 & writable == 0 || b.Flags.0 & writable == 0
+            || (region.is_none() && scoped)
+            || !source.allows(&src) || !destination.allows(&dst)
+            || (!scoped && (a.Flags.0 & writable == 0 || b.Flags.0 & writable == 0))
             || exact_backing && (src.uses_unproven_alias_backing() || dst.uses_unproven_alias_backing())
             || a.Format != b.Format
             || src.sparse.is_some() || dst.sparse.is_some()
@@ -413,22 +484,22 @@ impl TextureCopy {
         let area = if let Some((x, y, bounds)) = region {
             // Partial copies use texel bounds only on exact pixel formats.
             crate::page_texture::linear_texel_bytes(a.Format)?;
-            let width = u32::try_from(a.Width).ok()?;
-            let [left, top, front, right, bottom, back] = bounds.unwrap_or([0, 0, 0, width, a.Height, 1]);
+            let width = u32::try_from(source.width).ok()?;
+            let [left, top, front, right, bottom, back] = bounds.unwrap_or([0, 0, 0, width, source.height, 1]);
             if front != 0 || back != 1 || left >= right || top >= bottom
-                || right > width || bottom > a.Height
+                || right > width || bottom > source.height
             {
                 return None;
             }
             let end_x = x.checked_add(right - left)?;
             let end_y = y.checked_add(bottom - top)?;
-            if u64::from(end_x) > b.Width || end_y > b.Height {
+            if u64::from(end_x) > destination.width || end_y > destination.height {
                 return None;
             }
             Some(CopyArea {
                 x, y,
                 source: D3D12_BOX { left, top, front, right, bottom, back },
-                fills_destination: x == 0 && y == 0 && u64::from(end_x) == b.Width && end_y == b.Height,
+                fills_destination: x == 0 && y == 0 && u64::from(end_x) == destination.width && end_y == destination.height,
             })
         } else {
             if a.Width != b.Width || a.Height != b.Height {
@@ -436,7 +507,7 @@ impl TextureCopy {
             }
             None
         };
-        Some(Self { src, dst, area, exact_backing })
+        Some(Self { src, dst, area, exact_backing, source, destination })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -447,12 +518,13 @@ impl TextureCopy {
         &self, host: &crate::host::Host, list: &HostList,
         batch: &crate::page_slabs::PinnedBatch, plan: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
-        if self.exact_backing && (self.src.uses_unproven_alias_backing() || self.dst.uses_unproven_alias_backing()) {
+        if !self.source.allows(&self.src) || !self.destination.allows(&self.dst)
+            || self.exact_backing && (self.src.uses_unproven_alias_backing() || self.dst.uses_unproven_alias_backing()) {
             return Err(BatchError::UnsupportedTextureMap);
         }
-        plan.require_native(host, list, batch, &self.src)?;
+        plan.require_color_subresource(host, list, batch, &self.src, self.source)?;
         if self.area.as_ref().is_some_and(|area| !area.fills_destination) {
-            plan.require_native(host, list, batch, &self.dst)?;
+            plan.require_color_subresource(host, list, batch, &self.dst, self.destination)?;
         }
         plan.transition_texture(list, &self.src, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)?;
         plan.transition_texture(list, &self.dst, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
@@ -463,18 +535,18 @@ impl TextureCopy {
         unsafe {
             let cmd = list.recording();
             if let Some(area) = &self.area {
-                let location = |texture: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                let location = |texture: &ID3D12Resource, index| D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(texture),
                     Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
                 };
-                cmd.CopyTextureRegion(&location(&self.dst.texture), area.x, area.y, 0,
-                    &location(&self.src.texture), Some(&area.source));
+                cmd.CopyTextureRegion(&location(&self.dst.texture, self.destination.index), area.x, area.y, 0,
+                    &location(&self.src.texture, self.source.index), Some(&area.source));
             } else {
                 cmd.CopyResource(&self.dst.texture, &self.src.texture);
             }
         }
-        plan.record_write(&self.dst)?;
+        plan.record_write_at(&self.dst, self.destination.authority())?;
         Ok(())
     }
 }
