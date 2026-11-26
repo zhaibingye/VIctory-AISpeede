@@ -267,6 +267,8 @@ pub(crate) enum ListRejection {
     },
     NativeState,
     DeferredEffects,
+    #[cfg(feature = "paged-title")]
+    QueryPairing,
 }
 
 #[derive(Debug)]

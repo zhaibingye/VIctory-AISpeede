@@ -47,7 +47,7 @@ pub(crate) enum PageOp {
     ClearRaw(std::sync::Arc<crate::page_uav::RawClear>),
     ClearUavTexture(std::sync::Arc<crate::page_uav::TextureClear>),
     #[cfg(feature = "paged-title")]
-    Timestamp(std::sync::Arc<TimestampOp>),
+    Query(std::sync::Arc<QueryOp>),
     #[cfg(feature = "paged-title")]
     PipeWrite(PipeWrite),
     /// Holds private XMem stable through this submission even if the guest
@@ -57,15 +57,16 @@ pub(crate) enum PageOp {
 }
 
 #[cfg(feature = "paged-title")]
-pub(crate) enum TimestampOp {
-    End { heap: std::sync::Arc<crate::query::TimestampHeap>, index: u32 },
-    Resolve { heap: std::sync::Arc<crate::query::TimestampHeap>, first: u32, count: u32, span: (u64, u64) },
+pub(crate) enum QueryOp {
+    Begin { heap: std::sync::Arc<crate::query::NativeQueryHeap>, kind: D3D12_QUERY_TYPE, index: u32 },
+    End { heap: std::sync::Arc<crate::query::NativeQueryHeap>, kind: D3D12_QUERY_TYPE, index: u32 },
+    Resolve { heap: std::sync::Arc<crate::query::NativeQueryHeap>, kind: D3D12_QUERY_TYPE, first: u32, count: u32, span: (u64, u64) },
 }
 
 #[cfg(feature = "paged-title")]
-impl TimestampOp {
+impl QueryOp {
     pub(crate) fn resolve(
-        heap: std::sync::Arc<crate::query::TimestampHeap>, first: u32, count: u32,
+        heap: std::sync::Arc<crate::query::NativeQueryHeap>, kind: D3D12_QUERY_TYPE, first: u32, count: u32,
         base: u64, buffer_size: u64, offset: u64,
     ) -> Option<Self> {
         let size = u64::from(count) * 8;
@@ -77,7 +78,7 @@ impl TimestampOp {
         {
             return None;
         }
-        Some(Self::Resolve { heap, first, count, span: (start, end) })
+        Some(Self::Resolve { heap, kind, first, count, span: (start, end) })
     }
 
     fn encode(
@@ -85,14 +86,20 @@ impl TimestampOp {
         plan: &mut crate::page_resource::ResourcePlan, dirty: &mut BTreeSet<PhysicalPage>,
     ) -> std::result::Result<(), BatchError> {
         match self {
-            Self::End { heap, index } => {
+            Self::Begin { heap, kind, index } => {
                 list.keep(&heap.native);
-                // SAFETY: this exact timestamp slot is in range and the heap is fence-owned.
-                unsafe { list.recording().EndQuery(&heap.native, D3D12_QUERY_TYPE_TIMESTAMP, *index) };
-                plan.record_timestamp(heap, *index);
+                // SAFETY: slot, query type and pairing were validated at admission.
+                unsafe { list.recording().BeginQuery(&heap.native, *kind, *index) };
+                plan.record_query(heap, *index, None);
             }
-            Self::Resolve { heap, first, count, span } => {
-                if !plan.timestamps_initialized(heap, *first..*first + *count) {
+            Self::End { heap, kind, index } => {
+                list.keep(&heap.native);
+                // SAFETY: this slot and its pairing are valid; the heap is fence-owned.
+                unsafe { list.recording().EndQuery(&heap.native, *kind, *index) };
+                plan.record_query(heap, *index, Some(*kind));
+            }
+            Self::Resolve { heap, kind, first, count, span } => {
+                if !plan.queries_initialized(heap, *first..*first + *count, *kind) {
                     return Err(BatchError::TargetNotInitialized);
                 }
                 let stage = host.default_buffer(span.1 - span.0).ok_or_else(|| BatchError::Native(oom()))?;
@@ -100,7 +107,7 @@ impl TimestampOp {
                 // SAFETY: all requested slots are ordered and initialized;
                 // the new buffer is in COPY_DEST and fits every result word.
                 unsafe { list.recording().ResolveQueryData(
-                    &heap.native, D3D12_QUERY_TYPE_TIMESTAMP, *first, *count, &stage, 0,
+                    &heap.native, *kind, *first, *count, &stage, 0,
                 ) };
                 crate::page_view::scatter_regions(list, batch, [(*span, 0)], &stage, dirty)?;
             }
@@ -196,9 +203,10 @@ impl PageOp {
             #[cfg(feature = "paged-title")]
             Self::UploadLease(_) => "list upload backing",
             #[cfg(feature = "paged-title")]
-            Self::Timestamp(op) => match op.as_ref() {
-                TimestampOp::End { .. } => "timestamp end",
-                TimestampOp::Resolve { .. } => "timestamp resolve",
+            Self::Query(op) => match op.as_ref() {
+                QueryOp::Begin { .. } => "query begin",
+                QueryOp::End { .. } => "query end",
+                QueryOp::Resolve { .. } => "query resolve",
             },
         };
         BatchError::Operation { phase, index, operation, cause: Box::new(cause) }
@@ -253,6 +261,24 @@ impl PageOp {
     }
 }
 
+#[cfg(feature = "paged-title")]
+fn valid_query_pairs(ops: &[PageOp]) -> bool {
+    let mut open = BTreeMap::new();
+    for op in ops {
+        let PageOp::Query(query) = op else { continue; };
+        match query.as_ref() {
+            QueryOp::Begin { heap, kind, index } => {
+                if open.insert((std::sync::Arc::as_ptr(heap) as usize, *index), *kind).is_some() { return false; }
+            }
+            QueryOp::End { heap, kind, index } if *kind != D3D12_QUERY_TYPE_TIMESTAMP => {
+                if open.remove(&(std::sync::Arc::as_ptr(heap) as usize, *index)) != Some(*kind) { return false; }
+            }
+            _ => {},
+        }
+    }
+    open.is_empty()
+}
+
 /// Snapshot of a complete title submission, independent of guest command
 /// list lifetime and reset. Guest backing pins are captured later, when
 /// this work is actually eligible to execute.
@@ -267,8 +293,14 @@ impl ClosedTitleBatch {
     pub(crate) fn capture(lists: &[&HostList]) -> std::result::Result<Self, BatchError> {
         let mut ops = Vec::new();
         for (index, list) in lists.iter().enumerate() {
+            #[cfg(feature = "paged-title")]
+            let start = ops.len();
             list.append_closed_page_ops(&mut ops)
                 .map_err(|reason| BatchError::UnloweredList { index, reason })?;
+            #[cfg(feature = "paged-title")]
+            if !valid_query_pairs(&ops[start..]) {
+                return Err(BatchError::UnloweredList { index, reason: crate::page_slabs::ListRejection::QueryPairing });
+            }
         }
         Ok(Self(ops))
     }
@@ -335,7 +367,7 @@ impl ClosedFootprint {
             | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Input(_) | PageOp::UploadTexture(_)
             | PageOp::UploadLease(_) => true,
             PageOp::Dispatch(dispatch) => dispatch.reads_guest_only(),
-            PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) | PageOp::Timestamp(_) | PageOp::PipeWrite(_) => false,
+            PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) | PageOp::Query(_) | PageOp::PipeWrite(_) => false,
         })
     }
 
@@ -354,8 +386,8 @@ impl ClosedFootprint {
                     #[cfg(feature = "paged-title")]
                     PageOp::UploadLease(_) => {},
                     #[cfg(feature = "paged-title")]
-                    PageOp::Timestamp(op) => {
-                        if let TimestampOp::Resolve { span, .. } = op.as_ref() { ranges.push(*span); }
+                    PageOp::Query(op) => {
+                        if let QueryOp::Resolve { span, .. } = op.as_ref() { ranges.push(*span); }
                     }
                     PageOp::Input(input) => ranges.push(input.range()?),
                     PageOp::ReadbackTexture(readback) => readback.ranges(&mut ranges)?,
@@ -822,7 +854,7 @@ impl Host {
                     PageOp::ClearRaw(clear) => clear.encode(self, list, batch, descriptors, targets, &mut dirty)?,
                     PageOp::ClearUavTexture(clear) => clear.encode(self, list, batch, descriptors, targets)?,
                     #[cfg(feature = "paged-title")]
-                    PageOp::Timestamp(op) => op.encode(self, list, batch, targets, &mut dirty)?,
+                    PageOp::Query(op) => op.encode(self, list, batch, targets, &mut dirty)?,
                     #[cfg(feature = "paged-title")]
                     PageOp::PipeWrite(op) => op.encode(self, list, batch, &mut pipe_timestamp, &mut dirty)?,
                     #[cfg(feature = "paged-title")]

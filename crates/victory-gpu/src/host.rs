@@ -2193,8 +2193,8 @@ impl HostList {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn record_page_query(&self, query: crate::page_queue::TimestampOp) {
-        self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Timestamp(std::sync::Arc::new(query))));
+    pub(crate) fn record_page_query(&self, query: crate::page_queue::QueryOp) {
+        self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Query(std::sync::Arc::new(query))));
     }
 
     pub(crate) fn record_page_barrier(&self, barrier: crate::page_resource::PageBarrier) {

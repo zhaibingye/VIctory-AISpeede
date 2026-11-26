@@ -1,4 +1,4 @@
-//! Title query heaps. The VNME path admits actual direct-queue timestamps.
+//! Title query heaps. The VNME path admits actual direct-queue timestamps and visibility.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
@@ -6,15 +6,15 @@ use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(all(windows, feature = "paged-title"))]
 use {
-    std::{collections::BTreeSet, sync::{Arc, Mutex, OnceLock}},
+    std::{collections::BTreeMap, sync::{Arc, Mutex, OnceLock}},
     windows::Win32::Graphics::Direct3D12::*,
 };
 
 #[cfg(all(windows, feature = "paged-title"))]
-pub(crate) struct TimestampHeap {
+pub(crate) struct NativeQueryHeap {
     pub(crate) native: ID3D12QueryHeap,
     pub(crate) count: u32,
-    pub(crate) initialized: Mutex<BTreeSet<u32>>,
+    pub(crate) initialized: Mutex<BTreeMap<u32, D3D12_QUERY_TYPE>>,
 }
 
 const HEAP_IIDS: [Iid; 4] = [
@@ -42,15 +42,21 @@ struct Heap {
     object: Object,
     desc: Desc,
     #[cfg(all(windows, feature = "paged-title"))]
-    native: OnceLock<Option<Arc<TimestampHeap>>>,
+    native: OnceLock<Option<Arc<NativeQueryHeap>>>,
 }
 
 #[cfg(all(windows, feature = "paged-title"))]
-pub(crate) fn timestamp_heap(this: This, kind: u32) -> Option<Arc<TimestampHeap>> {
-    if this.is_null() || kind != D3D12_QUERY_TYPE_TIMESTAMP.0 as u32 { return None; }
+pub(crate) fn native_heap(this: This, kind: u32) -> Option<(Arc<NativeQueryHeap>, D3D12_QUERY_TYPE)> {
+    if this.is_null() { return None; }
+    let query_type = D3D12_QUERY_TYPE(i32::try_from(kind).ok()?);
+    let heap_type = match query_type {
+        D3D12_QUERY_TYPE_TIMESTAMP => D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+        D3D12_QUERY_TYPE_OCCLUSION | D3D12_QUERY_TYPE_BINARY_OCCLUSION => D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+        _ => return None,
+    };
     // SAFETY: the query API receives a retained title query heap.
     let heap = unsafe { &*this.cast::<Heap>() };
-    if heap.desc.kind != D3D12_QUERY_HEAP_TYPE_TIMESTAMP.0 as u32
+    if heap.desc.kind != heap_type.0 as u32
         || !matches!(heap.desc.nodes, 0 | 1) || !(1..=65536).contains(&heap.desc.count)
     {
         return None;
@@ -60,12 +66,12 @@ pub(crate) fn timestamp_heap(this: This, kind: u32) -> Option<Arc<TimestampHeap>
         let mut native = None;
         // SAFETY: the native description names this host's direct node.
         unsafe { host.device.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC {
-            Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: heap.desc.count, NodeMask: 0,
+            Type: heap_type, Count: heap.desc.count, NodeMask: 0,
         }, &mut native) }.ok()?;
-        Some(Arc::new(TimestampHeap {
+        Some(Arc::new(NativeQueryHeap {
             native: native?, count: heap.desc.count, initialized: Mutex::default(),
         }))
-    }).clone()
+    }).clone().map(|heap| (heap, query_type))
 }
 
 /// Device method.

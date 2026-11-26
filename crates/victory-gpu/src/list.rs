@@ -1007,20 +1007,29 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
 
 extern "system" fn begin_query(this: This, _heap: This, _kind: u32, _index: u32) {
     #[cfg(all(windows, feature = "paged-title"))]
-    if let Some(list) = host_list(this) { list.mark_unlowered(); }
+    record_query_boundary(this, _heap, _kind, _index, true);
     let _ = this;
 }
 
 extern "system" fn end_query(this: This, _heap: This, _kind: u32, _index: u32) {
     #[cfg(all(windows, feature = "paged-title"))]
-    if let Some(list) = host_list(this) {
-        if let Some(heap) = crate::query::timestamp_heap(_heap, _kind).filter(|heap| _index < heap.count) {
-            list.record_page_query(crate::page_queue::TimestampOp::End { heap, index: _index });
-        } else {
-            list.mark_unlowered();
-        }
-    }
+    record_query_boundary(this, _heap, _kind, _index, false);
     let _ = this;
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+fn record_query_boundary(this: This, query_heap: This, kind: u32, index: u32, begin: bool) {
+    use crate::page_queue::QueryOp;
+    use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE_TIMESTAMP;
+    let Some(list) = host_list(this) else { return; };
+    let query = crate::query::native_heap(query_heap, kind)
+        .filter(|(heap, kind)| index < heap.count && (!begin || *kind != D3D12_QUERY_TYPE_TIMESTAMP));
+    if let Some((heap, kind)) = query {
+        list.record_page_query(if begin { QueryOp::Begin { heap, kind, index } }
+            else { QueryOp::End { heap, kind, index } });
+    } else {
+        list.mark_unlowered();
+    }
 }
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
@@ -1042,10 +1051,10 @@ extern "system" fn resolve_queries(
     {
         if let Some(list) = host_list(this) {
             if count == 0 { return; }
-            let op = crate::query::timestamp_heap(_heap, kind)
+            let op = crate::query::native_heap(_heap, kind)
                 .zip(crate::resource::buffer_bytes(buffer))
-                .and_then(|(heap, (data, size))| crate::page_queue::TimestampOp::resolve(
-                    heap, _first, count, data as u64, size, offset,
+                .and_then(|((heap, kind), (data, size))| crate::page_queue::QueryOp::resolve(
+                    heap, kind, _first, count, data as u64, size, offset,
                 ));
             if let Some(op) = op { list.record_page_query(op); }
             else { list.mark_unlowered(); }

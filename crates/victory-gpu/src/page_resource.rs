@@ -28,7 +28,7 @@ pub(crate) struct ResourcePlan {
     pending: BTreeMap<(usize, Option<u32>), (Arc<HostTexture>, Version)>,
     state: BTreeMap<usize, (Arc<HostTexture>, D3D12_RESOURCE_STATES)>,
     #[cfg(feature = "paged-title")]
-    timestamp_writes: BTreeMap<usize, (Arc<crate::query::TimestampHeap>, std::collections::BTreeSet<u32>)>,
+    query_writes: BTreeMap<usize, (Arc<crate::query::NativeQueryHeap>, BTreeMap<u32, Option<D3D12_QUERY_TYPE>>)>,
 }
 
 impl ResourcePlan {
@@ -190,17 +190,19 @@ impl ResourcePlan {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn record_timestamp(&mut self, heap: &Arc<crate::query::TimestampHeap>, index: u32) {
-        self.timestamp_writes.entry(Arc::as_ptr(heap) as usize)
-            .or_insert_with(|| (heap.clone(), Default::default())).1.insert(index);
+    pub(crate) fn record_query(&mut self, heap: &Arc<crate::query::NativeQueryHeap>, index: u32, state: Option<D3D12_QUERY_TYPE>) {
+        self.query_writes.entry(Arc::as_ptr(heap) as usize)
+            .or_insert_with(|| (heap.clone(), Default::default())).1.insert(index, state);
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn timestamps_initialized(&self, heap: &Arc<crate::query::TimestampHeap>, indices: std::ops::Range<u32>) -> bool {
-        let ordered = self.timestamp_writes.get(&(Arc::as_ptr(heap) as usize));
+    pub(crate) fn queries_initialized(&self, heap: &Arc<crate::query::NativeQueryHeap>, indices: std::ops::Range<u32>, kind: D3D12_QUERY_TYPE) -> bool {
+        let ordered = self.query_writes.get(&(Arc::as_ptr(heap) as usize));
         let completed = heap.initialized.lock().unwrap_or_else(|e| e.into_inner());
-        indices.into_iter().all(|index| ordered.is_some_and(|(_, slots)| slots.contains(&index))
-            || completed.contains(&index))
+        indices.into_iter().all(|index| match ordered.and_then(|(_, slots)| slots.get(&index)) {
+            Some(state) => *state == Some(kind),
+            None => completed.get(&index) == Some(&kind),
+        })
     }
 
     pub(crate) fn commit(self, submitted: Fence, observed: Fence, batch: &crate::page_slabs::PinnedBatch) {
@@ -215,8 +217,8 @@ impl ResourcePlan {
         }
         let _ = batch;
         #[cfg(feature = "paged-title")]
-        for (heap, slots) in self.timestamp_writes.into_values() {
-            heap.initialized.lock().unwrap_or_else(|e| e.into_inner()).extend(slots);
+        for (heap, slots) in self.query_writes.into_values() {
+            heap.initialized.lock().unwrap_or_else(|e| e.into_inner()).extend(slots.into_iter().filter_map(|(index, state)| state.map(|kind| (index, kind))));
         }
         for (copy, state) in self.state.into_values() {
             copy.state.store(state.0 as u32, Ordering::Release);
