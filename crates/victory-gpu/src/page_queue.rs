@@ -108,43 +108,150 @@ impl ClosedTitleBatch {
         Ok(Self(ops))
     }
 
-    /// Fold only native work with no guest backing snapshots or merge.
-    /// This does not turn two separately budgeted page sets into one
-    /// larger resident set, or suppress any CPU-visible byte updates.
     #[cfg(feature = "paged-title")]
-    pub(crate) fn may_fold(&self, next: &Self) -> bool {
-        let native_only = |batch: &Self| batch.0.iter().all(|op| {
-            let mut outputs = Vec::new();
-            op.writes_native(&mut outputs);
-            if outputs.iter().any(|target| target.may_require_byte_publication()) {
-                return false;
-            }
-            match op {
-                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => true,
-                PageOp::CopyTexture(copy) => {
-                    let mut ranges = Vec::new();
-                    copy.ranges(&mut ranges).is_ok() && ranges.is_empty()
-                }
-                PageOp::Draw(draw) => {
-                    let mut ranges = Vec::new();
-                    draw.ranges(&mut ranges).is_ok() && ranges.is_empty()
-                }
-                _ => false,
-            }
-        });
-        self.0.len().saturating_add(next.0.len()) <= 64
-            && native_only(self) && native_only(next)
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn append(&mut self, mut next: Self) {
-        self.0.append(&mut next.0);
+    pub(crate) fn page_free_candidate(&self) -> bool {
+        // This is a scheduler hint only. Exposure and compatible byte
+        // authority can change before we take the direct-queue lock.
+        let mut outputs = Vec::new();
+        for op in &self.0 {
+            if !matches!(op,
+                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_)
+                | PageOp::CopyTexture(_) | PageOp::Draw(_))
+            {
+                return false;
+            }
+            op.writes_native(&mut outputs);
+        }
+        // Don't reserve a multi-submit group for resources that may gain
+        // a CPU-visible obligation even when none was observed at capture.
+        !outputs.iter().any(|target| target.may_require_byte_publication())
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn execute_adjacent(
+        host: &Host, heap: &HostHeap, batches: Vec<Self>,
+    ) -> std::result::Result<(), BatchError> {
+        let mut signal = host.direct_queue();
+        // A scheduler hint may have become stale while waiting for the
+        // direct queue. Recheck before erasing submission boundaries.
+        if batches.len() > 1 && batches.iter().all(Self::page_free_candidate) {
+            let ops: Vec<_> = batches.iter().flat_map(|batch| batch.0.iter().cloned()).collect();
+            if !ops.is_empty()
+                && let Ok(locked_plan) = ClosedFootprint::capture(&ops)
+                && locked_plan.is_page_free()
+            {
+                let mut backing = SubmissionBacking::default();
+                host.execute_paged_plan_locked(&mut signal, heap, &mut backing, &ops, locked_plan)?;
+                return Ok(());
+            }
+        }
+        for batch in batches {
+            let mut backing = SubmissionBacking::default();
+            host.execute_paged_ops_locked(&mut signal, heap, &mut backing, &batch.0)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn execute(
         &self, host: &Host, heap: &HostHeap, backing: &mut SubmissionBacking,
     ) -> std::result::Result<PageStats, BatchError> {
         host.execute_paged_ops(heap, backing, &self.0)
+    }
+}
+
+#[cfg(feature = "paged-title")]
+type VisibleTexture = (usize, crate::page_resource::TextureReadback, std::ops::Range<usize>);
+
+/// One byte-visibility plan for native recording and scheduler admission.
+/// In addition to explicit shader/copy ranges it includes preserving old
+/// CPU bytes on partial writes and all automatic CPU-visible readbacks.
+struct ClosedFootprint {
+    ranges: Vec<(u64, u64)>,
+    max_copy: u64,
+    #[cfg(feature = "paged-title")]
+    ordinary_count: usize,
+    #[cfg(feature = "paged-title")]
+    preserved: BTreeMap<usize, std::ops::Range<usize>>,
+    #[cfg(feature = "paged-title")]
+    visible: Vec<VisibleTexture>,
+}
+
+impl ClosedFootprint {
+    #[cfg(feature = "paged-title")]
+    fn is_page_free(&self) -> bool {
+        self.ranges.is_empty() && self.preserved.is_empty() && self.visible.is_empty()
+    }
+
+    fn capture(ops: &[PageOp]) -> std::result::Result<Self, BatchError> {
+        let mut ranges = Vec::new();
+        let mut max_copy = 0;
+        for op in ops {
+            match op {
+                PageOp::Copy(copy) => {
+                    ranges.extend(copy.ranges());
+                    max_copy = max_copy.max(copy.len as u64);
+                }
+                PageOp::Input(input) => ranges.push(input.range()?),
+                PageOp::ReadbackTexture(readback) => readback.ranges(&mut ranges)?,
+                PageOp::UploadTexture(upload) => upload.ranges(&mut ranges)?,
+                PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
+                PageOp::ClearRaw(clear) => ranges.push(clear.range()?),
+                PageOp::Dispatch(dispatch) => dispatch.ranges(&mut ranges)?,
+                PageOp::CopyTexture(copy) => copy.ranges(&mut ranges)?,
+                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
+            }
+        }
+        #[cfg(feature = "paged-title")]
+        let (ordinary_count, preserved, visible) = {
+            let ordinary_count = ranges.len();
+            let mut preserved = BTreeMap::new();
+            let mut preserve_targets = Vec::new();
+            for op in ops {
+                op.preserved_colors(&mut preserve_targets);
+            }
+            for target in preserve_targets {
+                if let Some(layout) = target.compatible_texture_source() {
+                    let key = std::sync::Arc::as_ptr(target) as usize;
+                    if let std::collections::btree_map::Entry::Vacant(entry) = preserved.entry(key) {
+                        let start = ranges.len();
+                        ranges.extend(layout.rows()?);
+                        entry.insert(start..ranges.len());
+                    }
+                }
+            }
+            let mut targets = Vec::new();
+            for op in ops {
+                op.writes_native(&mut targets);
+            }
+            let mut seen = BTreeSet::new();
+            let mut visible = Vec::new();
+            for texture in targets {
+                if seen.insert(std::sync::Arc::as_ptr(texture))
+                    && let Some(layout) = texture.visible_linear_writeback()?
+                {
+                    let readback = crate::page_resource::TextureReadback::capture(texture.clone(), layout)
+                        .ok_or(BatchError::UnsupportedTextureMap)?;
+                    let start = ranges.len();
+                    readback.ranges(&mut ranges)?;
+                    visible.push((std::sync::Arc::as_ptr(texture) as usize, readback, start..ranges.len()));
+                }
+            }
+            (ordinary_count, preserved, visible)
+        };
+        Ok(Self {
+            ranges, max_copy,
+            #[cfg(feature = "paged-title")]
+            ordinary_count,
+            #[cfg(feature = "paged-title")]
+            preserved,
+            #[cfg(feature = "paged-title")]
+            visible,
+        })
     }
 }
 
@@ -402,61 +509,27 @@ impl Host {
         if ops.is_empty() {
             return Ok(PageStats::default());
         }
-        let mut ranges = Vec::new();
-        let mut max_copy = 0;
-        for op in ops {
-            match op {
-                PageOp::Copy(copy) => {
-                    ranges.extend(copy.ranges());
-                    max_copy = max_copy.max(copy.len);
-                }
-                PageOp::Input(input) => ranges.push(input.range()?),
-                PageOp::ReadbackTexture(readback) => readback.ranges(&mut ranges)?,
-                PageOp::UploadTexture(upload) => upload.ranges(&mut ranges)?,
-                PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
-                PageOp::ClearRaw(clear) => ranges.push(clear.range()?),
-                PageOp::Dispatch(dispatch) => dispatch.ranges(&mut ranges)?,
-                PageOp::CopyTexture(copy) => copy.ranges(&mut ranges)?,
-                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
-            }
-        }
-        #[cfg(feature = "paged-title")]
-        let (ordinary_count, preserved, visible) = {
-            let ordinary_count = ranges.len();
-            let mut preserved = BTreeMap::new();
-            let mut preserve_targets = Vec::new();
-            for op in ops {
-                op.preserved_colors(&mut preserve_targets);
-            }
-            for target in preserve_targets {
-                if let Some(layout) = target.compatible_texture_source() {
-                    let key = std::sync::Arc::as_ptr(target) as usize;
-                    if let std::collections::btree_map::Entry::Vacant(entry) = preserved.entry(key) {
-                        let start = ranges.len();
-                        ranges.extend(layout.rows()?);
-                        entry.insert(start..ranges.len());
-                    }
-                }
-            }
-            let mut targets = Vec::new();
-            for op in ops {
-                op.writes_native(&mut targets);
-            }
-            let mut seen = BTreeSet::new();
-            let mut visible = Vec::new();
-            for texture in targets {
-                if seen.insert(std::sync::Arc::as_ptr(texture))
-                    && let Some(layout) = texture.visible_linear_writeback()?
-                {
-                    let readback = crate::page_resource::TextureReadback::capture(texture.clone(), layout)
-                        .ok_or(BatchError::UnsupportedTextureMap)?;
-                    let start = ranges.len();
-                    readback.ranges(&mut ranges)?;
-                    visible.push((std::sync::Arc::as_ptr(texture) as usize, readback, start..ranges.len()));
-                }
-            }
-            (ordinary_count, preserved, visible)
-        };
+        let footprint = ClosedFootprint::capture(ops)?;
+        self.execute_paged_plan_locked(signal, heap, backing, ops, footprint)
+    }
+
+    fn execute_paged_plan_locked(
+        &self,
+        signal: &mut u64,
+        heap: &HostHeap,
+        backing: &mut SubmissionBacking,
+        ops: &[PageOp],
+        footprint: ClosedFootprint,
+    ) -> std::result::Result<PageStats, BatchError> {
+        let ClosedFootprint {
+            ranges, max_copy,
+            #[cfg(feature = "paged-title")]
+            ordinary_count,
+            #[cfg(feature = "paged-title")]
+            preserved,
+            #[cfg(feature = "paged-title")]
+            visible,
+        } = footprint;
         let stats = self.execute_paged_work_locked(signal, heap, backing, &ranges, WriteSet::Declared, |list, _, batch, pins, descriptors, targets| {
             #[cfg(feature = "paged-title")]
             if !visible.is_empty() || !preserved.is_empty() {
@@ -484,7 +557,7 @@ impl Host {
                 }
             }
             let scratch = if max_copy > 0 {
-                let buffer = self.default_buffer(max_copy as u64)
+                let buffer = self.default_buffer(max_copy)
                     .ok_or_else(|| BatchError::Native(oom()))?;
                 list.keep(&buffer);
                 Some(buffer)

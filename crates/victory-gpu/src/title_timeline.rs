@@ -12,16 +12,15 @@ use crate::descriptor::host::HostHeap;
 use crate::page_queue::ClosedTitleBatch;
 
 enum Job {
-    Execute { host: &'static Host, heap: &'static HostHeap, batch: ClosedTitleBatch },
+    Execute { host: &'static Host, heap: &'static HostHeap, batches: Vec<ClosedTitleBatch> },
     Boundary(Box<dyn FnOnce() + Send>),
 }
 
 impl Job {
     fn run(self) {
         match self {
-            Self::Execute { host, heap, batch } => {
-                let mut backing = crate::title_backing::SubmissionBacking::default();
-                if let Err(error) = batch.execute(host, heap, &mut backing) {
+            Self::Execute { host, heap, batches } => {
+                if let Err(error) = ClosedTitleBatch::execute_adjacent(host, heap, batches) {
                     fail(format_args!("paged title submission rejected: {error:?}"));
                 }
             }
@@ -29,18 +28,22 @@ impl Job {
         }
     }
 
-    fn fold_adjacent(&mut self, timeline: &mut Timeline<GuestFenceRef, Self>, ticket: victory_memory::timeline::Ticket) {
-        let Self::Execute { host, heap, batch } = self else { return; };
+    fn collect_adjacent(&mut self, timeline: &mut Timeline<GuestFenceRef, Self>, ticket: victory_memory::timeline::Ticket) {
+        let Self::Execute { host, heap, batches } = self else { return; };
+        let mut commands = batches.iter().map(ClosedTitleBatch::len).sum::<usize>();
         // Bound both the number and command count; other logical lanes
         // can run after this group retires.
         for _ in 0..3 {
             let next = timeline.take_adjacent(ticket, |next| match next {
-                Self::Execute { host: h, heap: d, batch: other } =>
-                    std::ptr::eq(*host, *h) && std::ptr::eq(*heap, *d) && batch.may_fold(other),
+                Self::Execute { host: h, heap: d, batches: next } =>
+                    std::ptr::eq(*host, *h) && std::ptr::eq(*heap, *d)
+                    && commands.saturating_add(next[0].len()) <= 64
+                    && next[0].page_free_candidate() && batches[0].page_free_candidate(),
                 Self::Boundary(_) => false,
             });
-            let Some(Self::Execute { batch: next, .. }) = next else { break; };
-            batch.append(next);
+            let Some(Self::Execute { batches: next, .. }) = next else { break; };
+            commands += next[0].len();
+            batches.extend(next);
         }
     }
 }
@@ -57,7 +60,7 @@ impl Lane {
     }
 
     pub(crate) fn execute(lane: &Arc<Self>, host: &'static Host, heap: &'static HostHeap, batch: ClosedTitleBatch) -> bool {
-        enqueue(lane, Item::Work(Job::Execute { host, heap, batch }))
+        enqueue(lane, Item::Work(Job::Execute { host, heap, batches: vec![batch] }))
     }
 
     pub(crate) fn work(lane: &Arc<Self>, work: impl FnOnce() + Send + 'static) -> bool {
@@ -113,7 +116,7 @@ impl Scheduler {
                     let mut timeline = lane.0.lock().unwrap_or_else(|e| e.into_inner());
                     let mut ready = timeline.take_ready(GuestFenceRef::reached);
                     if let Some(work) = &mut ready {
-                        work.work.fold_adjacent(&mut timeline, work.ticket);
+                        work.work.collect_adjacent(&mut timeline, work.ticket);
                     }
                     let active = !timeline.is_idle();
                     drop(timeline);
