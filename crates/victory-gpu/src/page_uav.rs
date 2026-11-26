@@ -70,6 +70,7 @@ impl RawClear {
                     cmd.ClearUnorderedAccessViewUint(descriptors.heap.gpu(gpu_slot), cpu,
                         page.buffer(), &self.values, &[]);
                 }
+                resources.record_guest_overwrite(physical, start as usize, bytes as usize);
             }
             dirty.insert(physical);
         }

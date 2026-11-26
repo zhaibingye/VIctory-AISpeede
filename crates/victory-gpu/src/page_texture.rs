@@ -445,6 +445,7 @@ impl LinearTexture {
     pub(crate) fn copy_from_subresource(
         self, host: &Host, list: &HostList, batch: &PinnedBatch, texture: &ID3D12Resource, index: u32,
         dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
+        exact: Option<&mut crate::page_resource::ResourcePlan>,
     ) -> Result<(), BatchError> {
         let rows = self.rows()?;
         let (footprint, total) = self.native_footprint(host)?;
@@ -471,7 +472,7 @@ impl LinearTexture {
         let pitch = u64::from(footprint.Footprint.RowPitch);
         crate::page_view::scatter_regions(list, batch, rows.enumerate().map(|(i, range)| {
             (range, footprint.Offset + i as u64 * pitch)
-        }), &staging, dirty)
+        }), &staging, dirty, exact)
     }
 
     /// Gather current GPU bytes at the exact point of use. The caller

@@ -110,8 +110,7 @@ impl QueryOp {
                 unsafe { list.recording().ResolveQueryData(
                     &heap.native, *kind, *first, *count, &stage, 0,
                 ) };
-                crate::page_view::scatter_regions(list, batch, [(*span, 0)], &stage, dirty)?;
-                plan.record_guest_span(batch, *span)?;
+                crate::page_view::scatter_regions(list, batch, [(*span, 0)], &stage, dirty, Some(plan))?;
             }
         }
         Ok(())
@@ -163,6 +162,7 @@ impl PipeWrite {
                     cmd.ResourceBarrier(&[transition(buffer, dest, uav)]);
                 }
                 dirty.insert(page.physical());
+                plan.record_guest_overwrite(page.physical(), (self.span.0 % PAGE_BYTES) as usize, 4);
             }
             PipeWriteValue::GpuTimestamp => {
                 if timestamp.is_none() {
@@ -179,10 +179,10 @@ impl PipeWrite {
                     cmd.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
                     cmd.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, &stage, 0);
                 }
-                crate::page_view::scatter_regions(list, batch, [(self.span, 0)], &stage, dirty)?;
+                crate::page_view::scatter_regions(list, batch, [(self.span, 0)], &stage, dirty, Some(plan))?;
             }
         }
-        plan.record_guest_span(batch, self.span)
+        Ok(())
     }
 }
 
@@ -707,7 +707,7 @@ impl Host {
         self.execute_paged_work_locked(signal, heap, &mut backing, &ranges, WriteSet::Declared, |list, _, batch, pins, _, plan| {
             publication = Some(readback.prepare_mirror(&ranges, pins)?);
             let mut dirty = BTreeSet::new();
-            readback.encode(self, list, batch, plan, &mut dirty)?;
+            readback.encode(self, list, batch, plan, &mut dirty, false)?;
             Ok(dirty)
         })?;
         let slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
@@ -802,7 +802,7 @@ impl Host {
             #[cfg(feature = "paged-title")]
             for (_, readback, span) in &visible {
                 publications.push(readback.prepare_mirror(&ranges[span.clone()], pins)?);
-                readback.encode(self, list, batch, targets, &mut dirty)?;
+                readback.encode(self, list, batch, targets, &mut dirty, false)?;
             }
             Ok(dirty)
         })?;
@@ -849,7 +849,7 @@ impl Host {
                         }
                     }
                     PageOp::CopyTexture(copy) => copy.encode(self, list, batch, targets)?,
-                    PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty)?,
+                    PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty, true)?,
                     PageOp::UploadTexture(upload) => upload.encode(self, list, batch, targets)?,
                     PageOp::Input(input) => input.encode(self, list, batch)?,
                     PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,

@@ -146,16 +146,19 @@ pub(crate) fn gather_regions(
     transfer_regions(list, batch, regions, buffer, before, after, None)
 }
 
-/// Scatter exact row bytes, not footprint padding, back into physical pages.
+/// Scatter row bytes, not footprint padding, back into physical pages.
+/// Only explicit guest copies establish unconditional byte ownership;
+/// internal texture mirrors preserve independent CPU writes.
 pub(crate) fn scatter_regions(
     list: &HostList,
     batch: &PinnedBatch,
     regions: impl IntoIterator<Item = ((u64, u64), u64)>,
     buffer: &ID3D12Resource,
     dirty: &mut BTreeSet<PhysicalPage>,
+    exact: Option<&mut crate::page_resource::ResourcePlan>,
 ) -> Result<(), BatchError> {
     transfer_regions(list, batch, regions, buffer, D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_COPY_DEST, Some(dirty))
+        D3D12_RESOURCE_STATE_COPY_DEST, Some((dirty, exact)))
 }
 
 fn transfer_regions(
@@ -165,9 +168,9 @@ fn transfer_regions(
     buffer: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
-    dirty: Option<&mut BTreeSet<PhysicalPage>>,
+    output: Option<(&mut BTreeSet<PhysicalPage>, Option<&mut crate::page_resource::ResourcePlan>)>,
 ) -> Result<(), BatchError> {
-    let scatter = dirty.is_some();
+    let scatter = output.is_some();
     let mut touched = BTreeMap::new();
     let mut writes = BTreeMap::<PhysicalPage, BTreeMap<u64, u64>>::new();
     let mut pieces = Vec::new();
@@ -230,8 +233,15 @@ fn transfer_regions(
         }
         cmd.ResourceBarrier(&finish);
     }
-    if let Some(dirty) = dirty {
-        dirty.extend(writes.into_keys());
+    if let Some((dirty, mut exact)) = output {
+        for (page, intervals) in writes {
+            dirty.insert(page);
+            if let Some(plan) = exact.as_deref_mut() {
+                for (start, end) in intervals {
+                    plan.record_guest_overwrite(page, start as usize, (end - start) as usize);
+                }
+            }
+        }
     }
     Ok(())
 }

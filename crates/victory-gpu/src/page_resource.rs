@@ -207,18 +207,6 @@ impl ResourcePlan {
         spans.splice(first..last, [merged]);
     }
 
-    #[cfg(feature = "paged-title")]
-    pub(crate) fn record_guest_span(&mut self, batch: &crate::page_slabs::PinnedBatch, (mut at, end): (u64, u64)) -> Result<(), BatchError> {
-        while at < end {
-            let page = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?;
-            let offset = at % PAGE_BYTES;
-            let count = (end - at).min(PAGE_BYTES - offset);
-            self.record_guest_overwrite(page.physical(), offset as usize, count as usize);
-            at += count;
-        }
-        Ok(())
-    }
-
     pub(crate) fn guest_overwrites(&self, page: PhysicalPage) -> &[std::ops::Range<usize>] {
         self.guest_overwrites.get(&page).map_or(&[], Vec::as_slice)
     }
@@ -505,6 +493,7 @@ impl TextureReadback {
         &self, host: &crate::host::Host, list: &HostList, batch: &crate::page_slabs::PinnedBatch,
         plan: &mut ResourcePlan,
         dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
+        guest_copy: bool,
     ) -> Result<(), BatchError> {
         if !self.sub.allows(&self.source) {
             return Err(BatchError::UnsupportedTextureMap);
@@ -519,7 +508,7 @@ impl TextureReadback {
         let texture = &self.source.texture;
         if !self.sub.scoped {
             plan.transition_texture(list, &self.source, needed.0 as u32)?;
-            self.target.copy_from_subresource(host, list, batch, texture, self.sub.index, dirty)?;
+            self.target.copy_from_subresource(host, list, batch, texture, self.sub.index, dirty, guest_copy.then_some(&mut *plan))?;
             return plan.transition_texture(list, &self.source, before.0 as u32);
         }
         if self.source.twin.get().is_some_and(Option::is_some)
@@ -533,7 +522,7 @@ impl TextureReadback {
             // supplies its state before this temporary scope.
             unsafe { list.recording().ResourceBarrier(&[self.sub.temporary_transition(texture, before, needed)]) };
         }
-        self.target.copy_from_subresource(host, list, batch, texture, self.sub.index, dirty)?;
+        self.target.copy_from_subresource(host, list, batch, texture, self.sub.index, dirty, guest_copy.then_some(&mut *plan))?;
         if before != needed {
             // SAFETY: the copy leaves the selected subresource in COPY_SOURCE.
             unsafe { list.recording().ResourceBarrier(&[self.sub.temporary_transition(texture, needed, before)]) };
