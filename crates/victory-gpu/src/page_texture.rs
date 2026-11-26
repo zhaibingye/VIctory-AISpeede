@@ -30,6 +30,24 @@ const EXTENDED_COLOR: [DXGI_FORMAT; 6] = [
     DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
 ];
 
+/// Exact byte-compatible, single-plane texels. Do not infer this from
+/// rounded size: compressed, planar and typeless layouts are excluded.
+pub(crate) fn linear_texel_bytes(format: DXGI_FORMAT) -> Option<u32> {
+    Some(match format {
+        DXGI_FORMAT_R16G16B16A16_FLOAT => 8,
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM
+        | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        | DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R11G11B10_FLOAT
+        | DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8B8A8_UINT => 4,
+        _ => return None,
+    })
+}
+
+pub(crate) fn sample_color(format: DXGI_FORMAT) -> bool {
+    matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM)
+        || EXTENDED_COLOR.contains(&format)
+}
+
 fn extended_color_support(host: &Host, format: DXGI_FORMAT) -> bool {
     static SUPPORT: [std::sync::OnceLock<bool>; EXTENDED_COLOR.len()] =
         [const { std::sync::OnceLock::new() }; EXTENDED_COLOR.len()];
@@ -53,9 +71,8 @@ impl TextureInput {
     ) -> Option<Self> {
         // SAFETY: the resource is retained by the view.
         let desc = unsafe { copy.texture.GetDesc() };
-        let basic = matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM);
         let extended = EXTENDED_COLOR.contains(&format);
-        if !(basic || extended)
+        if !sample_color(format)
             || extended && copy.uses_unproven_alias_backing()
             || desc.Format != format || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
             || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
@@ -144,12 +161,18 @@ impl TextureInput {
                 if plan.authoritative(copy) {
                     return Err(BatchError::UnsupportedTextureMap);
                 }
+                if !extended_color_support(host, input.format) {
+                    return Err(BatchError::UnsupportedTextureMap);
+                }
                 Ok((input.encode(host, list, batch)?, input.format))
             }
             Self::Native { copy, format, exact_backing, compatible_input } => {
                 if *exact_backing && (copy.uses_unproven_alias_backing()
                     || copy.twin.get().is_some_and(Option::is_some))
                 {
+                    return Err(BatchError::UnsupportedTextureMap);
+                }
+                if !extended_color_support(host, *format) {
                     return Err(BatchError::UnsupportedTextureMap);
                 }
                 #[cfg(feature = "paged-title")]
@@ -160,9 +183,6 @@ impl TextureInput {
                     && !pointer_backed && !plan.authoritative(copy)
                 {
                     return Ok((input.encode(host, list, batch)?, input.format));
-                }
-                if !extended_color_support(host, *format) {
-                    return Err(BatchError::UnsupportedTextureMap);
                 }
                 plan.require_native(host, list, batch, copy)?;
                 let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -185,12 +205,12 @@ pub(crate) struct LinearTexture {
 
 impl LinearTexture {
     pub(crate) fn rows(self) -> Result<impl Iterator<Item = (u64, u64)>, BatchError> {
-        let bytes = u64::from(self.width) * 4;
+        let texel = linear_texel_bytes(self.format).ok_or(BatchError::Range(self.address, self.address))?;
+        let bytes = u64::from(self.width) * u64::from(texel);
         let pitch = u64::from(self.row_pitch);
         let end = self.address.saturating_add(pitch * u64::from(self.height.saturating_sub(1)))
             .saturating_add(bytes);
-        if !matches!(self.format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM)
-            || self.address == 0 || self.width == 0 || self.height == 0
+        if self.address == 0 || self.width == 0 || self.height == 0
             || self.width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
             || self.height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
             || bytes > pitch || end > ADDRESS_LIMIT
@@ -212,7 +232,7 @@ impl LinearTexture {
             return None;
         }
         let address = self.address.checked_add(u64::from(top) * u64::from(self.row_pitch))?
-            .checked_add(u64::from(left) * 4)?;
+            .checked_add(u64::from(left) * u64::from(linear_texel_bytes(self.format)?))?;
         Some(Self { address, width: right - left, height: bottom - top, ..self })
     }
 
@@ -265,7 +285,8 @@ impl LinearTexture {
             host.device.GetCopyableFootprints(&self.native_desc(), 0, 1, 0,
                 Some(&mut footprint), Some(&mut row_count), Some(&mut row_bytes), Some(&mut total));
         }
-        if row_count != self.height || row_bytes != u64::from(self.width) * 4
+        let texel = linear_texel_bytes(self.format).ok_or(BatchError::Range(self.address, self.address))?;
+        if row_count != self.height || row_bytes != u64::from(self.width) * u64::from(texel)
             || total == u64::MAX || total == 0 || footprint.Footprint.Depth != 1
         {
             return Err(BatchError::Native(E_FAIL.into()));

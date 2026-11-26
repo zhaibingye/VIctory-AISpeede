@@ -1716,7 +1716,8 @@ fn page_texture_layout(address: u64, desc: &ResourceDesc) -> Option<crate::page_
     if desc.flags & 0xf != 0 {
         return None;
     }
-    linear_texture_bytes(address, desc)
+    let input = linear_texture_bytes(address, desc)?;
+    crate::page_texture::sample_color(input.format).then_some(input)
 }
 
 #[cfg(windows)]
@@ -1724,23 +1725,27 @@ fn linear_texture_bytes(address: u64, desc: &ResourceDesc) -> Option<crate::page
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     if desc.dimension != 3 || !matches!(desc.layout, 1 | 0x100)
         || desc.depth_or_array_size != 1 || desc.mip_levels != 1
-        || desc.sample_count != 1
-        || !matches!(desc.format, 28 | 87)
+        || desc.sample_count != 1 || desc.sample_quality != 0
     {
         return None;
     }
+    let format = DXGI_FORMAT(desc.format as i32);
+    let texel = crate::page_texture::linear_texel_bytes(format)?;
     let layout = texture_layout(desc)?;
     let [plane] = layout.planes.as_slice() else { return None };
     let [mip] = plane.layout.mips.as_slice() else { return None };
-    if mip.tail.is_some() || mip.depth != 1 {
+    if mip.tail.is_some() || mip.depth != 1
+        || plane.layout.desc.element_bytes != texel || plane.layout.desc.block != 1
+        || plane.layout.desc.swizzle != texture::Swizzle::LINEAR
+    {
         return None;
     }
     let input = crate::page_texture::LinearTexture {
         address: address.checked_add(plane.offset)?.checked_add(mip.offset)?,
-        row_pitch: mip.pitch.checked_mul(4)?,
+        row_pitch: mip.pitch.checked_mul(texel)?,
         width: u32::try_from(desc.width).ok()?,
         height: desc.height,
-        format: DXGI_FORMAT(desc.format as i32),
+        format,
     };
     let _validated_rows = input.rows().ok()?;
     Some(input)
@@ -2534,7 +2539,9 @@ fn cpu_texture_copy(
     if left >= right || top >= bottom || front >= back {
         return S_OK;
     }
-    let copied = ((right - left) as usize) * 4;
+    let Some(texel) = crate::page_texture::linear_texel_bytes(layout.format) else { return E_NOTIMPL; };
+    let texel = texel as usize;
+    let copied = ((right - left) as usize) * texel;
     let pitch = row_pitch as usize;
     if data.is_null() || front != 0 || back != 1
         || right > layout.width || bottom > layout.height
@@ -2544,7 +2551,7 @@ fn cpu_texture_copy(
     }
     let rows = (bottom - top) as usize;
     let tex_pitch = layout.row_pitch as usize;
-    let tex_start = layout.address as usize + top as usize * tex_pitch + left as usize * 4;
+    let tex_start = layout.address as usize + top as usize * tex_pitch + left as usize * texel;
     let tex_end = tex_start + (rows - 1) * tex_pitch + copied;
     let Some(data_len) = (rows - 1).checked_mul(pitch).and_then(|n| n.checked_add(copied))
         .filter(|&n| n <= isize::MAX as usize)

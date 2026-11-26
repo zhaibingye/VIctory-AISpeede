@@ -237,6 +237,7 @@ pub(crate) struct TextureUpload {
     target: Arc<HostTexture>,
     offset: (u32, u32),
     fills_target: bool,
+    exact_backing: bool,
 }
 
 impl TextureUpload {
@@ -257,7 +258,10 @@ impl TextureUpload {
         let end_y = y.checked_add(source.height)?;
         // SAFETY: the retained resource is live.
         let desc = unsafe { target.texture.GetDesc() };
-        if !single_color(desc) || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+        let exact_backing = !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        if !single_color(desc)
+            || desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0
+            || exact_backing && target.uses_unproven_alias_backing()
             || target.sparse.is_some()
             || target.twin.get().is_some_and(Option::is_some)
             || end_x > desc.Width || end_y > desc.Height
@@ -266,7 +270,7 @@ impl TextureUpload {
             return None;
         }
         let fills_target = x == 0 && y == 0 && end_x == desc.Width && end_y == desc.Height;
-        Some(Self { source, target, offset: (x, y), fills_target })
+        Some(Self { source, target, offset: (x, y), fills_target, exact_backing })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -277,6 +281,9 @@ impl TextureUpload {
     pub(crate) fn encode(&self, host: &crate::host::Host, list: &HostList,
         batch: &crate::page_slabs::PinnedBatch, plan: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
+        if self.exact_backing && self.target.uses_unproven_alias_backing() {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
         if !self.fills_target {
             plan.require_native(host, list, batch, &self.target)?;
         }
@@ -404,16 +411,8 @@ impl TextureCopy {
             return None;
         }
         let area = if let Some((x, y, bounds)) = region {
-            // Single-plane ordinary color formats only: block and video
-            // layout rules do not follow these texel bounds.
-            use windows::Win32::Graphics::Dxgi::Common::*;
-            if !matches!(a.Format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
-                | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
-                | DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R10G10B10A2_UNORM
-                | DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R11G11B10_FLOAT)
-            {
-                return None;
-            }
+            // Partial copies use texel bounds only on exact pixel formats.
+            crate::page_texture::linear_texel_bytes(a.Format)?;
             let width = u32::try_from(a.Width).ok()?;
             let [left, top, front, right, bottom, back] = bounds.unwrap_or([0, 0, 0, width, a.Height, 1]);
             if front != 0 || back != 1 || left >= right || top >= bottom
