@@ -1,5 +1,5 @@
 //! 从固定物理页构造宿主纹理，不维持独立的 CPU 影子副本。
-//! 共享体纹理只支持可证明的线性布局或有界的 4 KiB 分块布局。
+//! 共享纹理的字节范围只采用已验证的线性或有界分块布局。
 use victory_memory::gpu_table::ADDRESS_LIMIT;
 use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -383,6 +383,11 @@ pub(crate) struct LinearTexture {
     pub(crate) format: DXGI_FORMAT,
 }
 
+// 传输足迹支持这些字节宽度，不等于描述符、目标或共享访问已经获准。
+fn copy_texel_bytes(format: DXGI_FORMAT) -> Option<u32> {
+    if format == DXGI_FORMAT_R32G32B32A32_FLOAT { Some(16) } else { linear_texel_bytes(format) }
+}
+
 /// 给当前队列核对原生传输足迹；来宾和宿主的 padding 彼此独立。
 fn checked_texture_footprint(host: &Host, desc: D3D12_RESOURCE_DESC)
     -> Result<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64), BatchError>
@@ -392,7 +397,7 @@ fn checked_texture_footprint(host: &Host, desc: D3D12_RESOURCE_DESC)
     } else {
         1
     };
-    let texel = linear_texel_bytes(desc.Format).ok_or(BatchError::UnsupportedTextureMap)?;
+    let texel = copy_texel_bytes(desc.Format).ok_or(BatchError::UnsupportedTextureMap)?;
     let width = desc.Width.checked_mul(u64::from(texel)).ok_or(BatchError::UnsupportedTextureMap)?;
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let (mut rows, mut row_bytes, mut total) = (0, 0, 0);
@@ -415,25 +420,26 @@ fn checked_texture_footprint(host: &Host, desc: D3D12_RESOURCE_DESC)
     Ok((footprint, total))
 }
 
-/// 地址式三维资源的精确字节后备。宿主原生纹理只是单次派发的工作表示。
+/// 精确描述共享纹理的有效字节，不判断哪份数据更新，也不授予读写权威。
 #[cfg(feature = "paged-title")]
-pub(crate) struct VolumeBytes {
+pub(crate) struct SharedTextureBytes {
     pub(crate) format: DXGI_FORMAT,
+    dimension: D3D12_RESOURCE_DIMENSION,
     width: u32,
     height: u32,
     depth: u16,
-    layout: VolumeLayout,
+    layout: TextureByteLayout,
 }
 
 #[cfg(feature = "paged-title")]
-enum VolumeLayout {
+enum TextureByteLayout {
     Linear { base: u64, row_pitch: u64, slice_pitch: u64 },
-    Blocked { regions: Vec<VolumeRegion>, spans: Vec<(u64, u64)> },
+    Blocked { regions: Vec<TextureByteRegion>, spans: Vec<(u64, u64)> },
 }
 
 #[cfg(feature = "paged-title")]
 #[derive(Clone, Copy)]
-struct VolumeRegion {
+struct TextureByteRegion {
     start: u64,
     len: u64,
     row: u64,
@@ -441,9 +447,9 @@ struct VolumeRegion {
 }
 
 #[cfg(feature = "paged-title")]
-impl VolumeBytes {
+impl SharedTextureBytes {
     pub(crate) fn blocked_extent(&self) -> Option<[u32; 3]> {
-        matches!(self.layout, VolumeLayout::Blocked { .. })
+        (self.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && matches!(self.layout, TextureByteLayout::Blocked { .. }))
             .then_some([self.width, self.height, u32::from(self.depth)])
     }
 
@@ -451,21 +457,29 @@ impl VolumeBytes {
         -> Option<Self>
     {
         use victory_formats::texture::{Dimension, Swizzle};
-        const LIMIT: u32 = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION;
+        let (dimension, limit) = match layout.desc.dimension {
+            Dimension::Tex3d => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION),
+            Dimension::Tex2d if layout.slices == 1 =>
+                (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION),
+            _ => return None,
+        };
         let [mip] = layout.mips.as_slice() else { return None; };
-        let texel = u64::from(linear_texel_bytes(format)?);
+        let texel = u64::from(match layout.desc.dimension {
+            Dimension::Tex2d => copy_texel_bytes(format)?,
+            _ => linear_texel_bytes(format)?,
+        });
         let (width, height, depth) = (mip.width, mip.height, mip.depth);
         let end = base.checked_add(layout.size)?;
         if base == 0 || end > ADDRESS_LIMIT || !base.is_multiple_of(layout.alignment)
-            || layout.desc.dimension != Dimension::Tex3d || layout.desc.samples != 1
+            || layout.desc.samples != 1
             || layout.desc.block != 1 || u64::from(layout.desc.element_bytes) != texel
             || !layout.addressable() || mip.tail.is_some()
-            || [width, height, depth].into_iter().any(|n| n == 0 || n > LIMIT)
+            || [width, height, depth].into_iter().any(|n| n == 0 || n > limit)
         {
             return None;
         }
-        let layout = match layout.desc.swizzle {
-            Swizzle::LINEAR if !layout.thick && layout.slices == depth => {
+        let layout = match (layout.desc.dimension, layout.desc.swizzle) {
+            (Dimension::Tex3d, Swizzle::LINEAR) if !layout.thick && layout.slices == depth => {
                 let start = base.checked_add(layout.offset(0, 0, 0, 0).ok()?)?;
                 let row_pitch = u64::from(mip.pitch) * texel;
                 let row_bytes = u64::from(width) * texel;
@@ -476,67 +490,74 @@ impl VolumeBytes {
                 if row_bytes > row_pitch || depth > 1 && slice_pitch < slice_bytes || last > end {
                     return None;
                 }
-                VolumeLayout::Linear { base: start, row_pitch, slice_pitch }
+                TextureByteLayout::Linear { base: start, row_pitch, slice_pitch }
             }
-            Swizzle::SW_4KB_S if layout.thick => {
-                // 只为有界小体纹理展开一次，合并来宾和宿主都连续的字节。
-                // 更大的工作集需要 GPU 重排，不能用无上限的 CopyBufferRegion。
-                const MAX_TEXELS: u64 = 262_144;
-                const MAX_REGIONS: usize = 32_768;
-                if u64::from(width) * u64::from(height) * u64::from(depth) > MAX_TEXELS {
-                    return None;
-                }
-                let mut regions: Vec<VolumeRegion> = Vec::new();
-                for z in 0..depth {
-                    for y in 0..height {
-                        let row = u64::from(z) * u64::from(height) + u64::from(y);
-                        for x in 0..width {
-                            let start = base.checked_add(layout.offset(0, x, y, z).ok()?)?;
-                            let offset = u64::from(x) * texel;
-                            if start.checked_add(texel)? > end { return None; }
-                            if let Some(last) = regions.last_mut()
-                                && last.row == row && last.start + last.len == start
-                                && last.offset + last.len == offset
-                            {
-                                last.len += texel;
-                            } else {
-                                if regions.len() == MAX_REGIONS { return None; }
-                                regions.push(VolumeRegion { start, len: texel, row, offset });
-                            }
-                        }
-                    }
-                }
-                let mut spans: Vec<_> = regions.iter().map(|r| (r.start, r.start + r.len)).collect();
-                spans.sort_unstable();
-                let mut merged = Vec::<(u64, u64)>::new();
-                for (start, end) in spans {
-                    if let Some((_, last)) = merged.last_mut() {
-                        if start < *last { return None; }
-                        if start == *last {
-                            *last = end;
-                            continue;
-                        }
-                    }
-                    merged.push((start, end));
-                }
-                VolumeLayout::Blocked { regions, spans: merged }
-            }
+            (Dimension::Tex3d, Swizzle::SW_4KB_S) if layout.thick
+                => Self::blocked(base, end, layout, [width, height, depth], texel)?,
+            (Dimension::Tex2d, Swizzle::SW_256B_D) if !layout.thick && depth == 1
+                => Self::blocked(base, end, layout, [width, height, depth], texel)?,
             _ => return None,
         };
-        Some(Self { format, width, height, depth: u16::try_from(depth).ok()?, layout })
+        Some(Self { format, dimension, width, height, depth: u16::try_from(depth).ok()?, layout })
     }
 
-    fn regions(&self) -> impl Iterator<Item = VolumeRegion> + '_ {
+    fn blocked(base: u64, end: u64, layout: &victory_formats::texture::Layout,
+        [width, height, depth]: [u32; 3], texel: u64,
+    ) -> Option<TextureByteLayout> {
+        // 只为有界纹理展开一次，合并来宾和宿主都连续的字节。
+        // 更大的工作集需要 GPU 重排，不能用无上限的 CopyBufferRegion。
+        const MAX_TEXELS: u64 = 262_144;
+        const MAX_REGIONS: usize = 32_768;
+        if u64::from(width) * u64::from(height) * u64::from(depth) > MAX_TEXELS {
+            return None;
+        }
+        let mut regions: Vec<TextureByteRegion> = Vec::new();
+        for z in 0..depth {
+            for y in 0..height {
+                let row = u64::from(z) * u64::from(height) + u64::from(y);
+                for x in 0..width {
+                    let start = base.checked_add(layout.offset(0, x, y, z).ok()?)?;
+                    let offset = u64::from(x) * texel;
+                    if start.checked_add(texel)? > end { return None; }
+                    if let Some(last) = regions.last_mut()
+                        && last.row == row && last.start + last.len == start
+                        && last.offset + last.len == offset
+                    {
+                        last.len += texel;
+                    } else {
+                        if regions.len() == MAX_REGIONS { return None; }
+                        regions.push(TextureByteRegion { start, len: texel, row, offset });
+                    }
+                }
+            }
+        }
+        let mut spans: Vec<_> = regions.iter().map(|r| (r.start, r.start + r.len)).collect();
+        spans.sort_unstable();
+        let mut merged = Vec::<(u64, u64)>::new();
+        for (start, end) in spans {
+            if let Some((_, last)) = merged.last_mut() {
+                if start < *last { return None; }
+                if start == *last {
+                    *last = end;
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
+        Some(TextureByteLayout::Blocked { regions, spans: merged })
+    }
+
+    fn regions(&self) -> impl Iterator<Item = TextureByteRegion> + '_ {
         let rows = u64::from(self.height);
-        let row_bytes = u64::from(self.width) * u64::from(linear_texel_bytes(self.format).unwrap());
+        let row_bytes = u64::from(self.width) * u64::from(copy_texel_bytes(self.format).unwrap());
         let (linear, blocked) = match &self.layout {
-            VolumeLayout::Linear { base, row_pitch, slice_pitch } => {
+            TextureByteLayout::Linear { base, row_pitch, slice_pitch } => {
                 (Some((*base, *row_pitch, *slice_pitch)), &[][..])
             }
-            VolumeLayout::Blocked { regions, .. } => (None, regions.as_slice()),
+            TextureByteLayout::Blocked { regions, .. } => (None, regions.as_slice()),
         };
         linear.into_iter().flat_map(move |(base, row_pitch, slice_pitch)| {
-            (0..rows * u64::from(self.depth)).map(move |row| VolumeRegion {
+            (0..rows * u64::from(self.depth)).map(move |row| TextureByteRegion {
                 start: base + row / rows * slice_pitch + row % rows * row_pitch,
                 len: row_bytes, row, offset: 0,
             })
@@ -545,8 +566,8 @@ impl VolumeBytes {
 
     pub(crate) fn ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         let blocked = match &self.layout {
-            VolumeLayout::Linear { .. } => None,
-            VolumeLayout::Blocked { spans, .. } => Some(spans.as_slice()),
+            TextureByteLayout::Linear { .. } => None,
+            TextureByteLayout::Blocked { spans, .. } => Some(spans.as_slice()),
         };
         blocked.into_iter().flatten().copied().chain(
             self.regions().take(if blocked.is_some() { 0 } else { usize::MAX })
@@ -559,7 +580,7 @@ impl VolumeBytes {
     {
         // 安全：查询保留的宿主资源，不读取其像素。
         let desc = unsafe { texture.GetDesc() };
-        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || desc.MipLevels != 1
+        if desc.Dimension != self.dimension || desc.MipLevels != 1
             || desc.Width != u64::from(self.width) || desc.Height != self.height
             || desc.DepthOrArraySize != self.depth || desc.Format != self.format
             || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
@@ -619,7 +640,7 @@ fn shared_volume_maps_only_texels_with_matching_host_rows() {
             mips: 1, element_bytes: 8, block: 1, samples: 1, swizzle,
         }).unwrap();
         let base = 0x10000;
-        let plan = VolumeBytes::new(base, DXGI_FORMAT_R16G16B16A16_FLOAT, &layout).unwrap();
+        let plan = SharedTextureBytes::new(base, DXGI_FORMAT_R16G16B16A16_FLOAT, &layout).unwrap();
         let mut covered = std::collections::BTreeSet::new();
         let mut mapped = Vec::new();
         for r in plan.regions() {
@@ -648,6 +669,21 @@ fn shared_volume_maps_only_texels_with_matching_host_rows() {
         }
         assert_eq!(covered, pinned);
     }
+}
+
+#[cfg(all(test, feature = "paged-title"))]
+#[test]
+fn shared_display_microtile_gathers_exact_rgba32f_rows() {
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+    let desc = Desc { dimension: Dimension::Tex2d, width: 4, height: 2, depth: 1,
+        mips: 1, element_bytes: 16, block: 1, samples: 1, swizzle: Swizzle::SW_256B_D };
+    let base = 0x10000;
+    let plan = SharedTextureBytes::new(base, DXGI_FORMAT_R32G32B32A32_FLOAT, &Layout::new(&desc).unwrap()).unwrap();
+    assert_eq!(plan.ranges().collect::<Vec<_>>(), [(base, base + 128)]);
+    assert_eq!(plan.regions().map(|r| (r.row, r.offset, r.start - base, r.len)).collect::<Vec<_>>(),
+        [(0, 0, 0, 32), (0, 32, 64, 32), (1, 0, 32, 32), (1, 32, 96, 32)]);
+    assert!(SharedTextureBytes::new(base, DXGI_FORMAT_R32G32B32A32_FLOAT,
+        &Layout::new(&Desc { depth: 2, ..desc }).unwrap()).is_none());
 }
 
 impl LinearTexture {

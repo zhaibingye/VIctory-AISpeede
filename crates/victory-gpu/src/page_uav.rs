@@ -201,7 +201,7 @@ impl NativeTextureUav {
 /// existing contents: a bounded shader store is not a full overwrite proof.
 pub(crate) struct ShaderTextureUav(
     NativeTextureUav,
-    #[cfg(feature = "paged-title")] Option<crate::page_texture::VolumeBytes>,
+    #[cfg(feature = "paged-title")] Option<crate::page_texture::SharedTextureBytes>,
 );
 
 impl ShaderTextureUav {
@@ -289,7 +289,7 @@ impl ShaderTextureUav {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn byte_backing(&self) -> Option<&crate::page_texture::VolumeBytes> { self.1.as_ref() }
+    pub(crate) fn byte_backing(&self) -> Option<&crate::page_texture::SharedTextureBytes> { self.1.as_ref() }
 
     pub(crate) fn finish_write(
         &self, host: &Host, list: &HostList, pages: &PinnedBatch, resources: &mut ResourcePlan,

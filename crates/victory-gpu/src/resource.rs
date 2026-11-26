@@ -1834,7 +1834,7 @@ pub(crate) fn title_volume_shape(this: This) -> Option<(u32, u64, u32, u16, u16)
 
 /// 从地址式资源的实际布局构造精确字节后备；这里不授予写入权威。
 #[cfg(all(windows, feature = "paged-title"))]
-pub(crate) fn address_volume_bytes(this: This) -> Option<crate::page_texture::VolumeBytes> {
+pub(crate) fn address_volume_bytes(this: This) -> Option<crate::page_texture::SharedTextureBytes> {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     if this.is_null() { return None; }
     let r = resource(this);
@@ -1849,7 +1849,7 @@ pub(crate) fn address_volume_bytes(this: This) -> Option<crate::page_texture::Vo
     }
     let texture = texture_layout(d)?;
     let [plane] = texture.planes.as_slice() else { return None; };
-    crate::page_texture::VolumeBytes::new(address.checked_add(plane.offset)?,
+    crate::page_texture::SharedTextureBytes::new(address.checked_add(plane.offset)?,
         DXGI_FORMAT(d.format as i32), &plane.layout)
 }
 
