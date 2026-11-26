@@ -48,6 +48,26 @@ pub(crate) enum PageOp {
     ClearUavTexture(std::sync::Arc<crate::page_uav::TextureClear>),
 }
 
+impl PageOp {
+    fn failure(&self, phase: &'static str, index: usize, cause: BatchError) -> BatchError {
+        let operation = match self {
+            Self::Copy(_) => "buffer copy",
+            Self::CopyTexture(_) => "texture copy",
+            Self::ReadbackTexture(_) => "texture readback",
+            Self::UploadTexture(_) => "texture upload",
+            Self::Input(_) => "input binding",
+            Self::Draw(_) => "draw",
+            Self::Dispatch(_) => "dispatch",
+            Self::Clear(_) => "color clear",
+            Self::ClearDepth(_) => "depth clear",
+            Self::Barrier(_) => "resource barrier",
+            Self::ClearRaw(_) => "buffer UAV clear",
+            Self::ClearUavTexture(_) => "texture UAV clear",
+        };
+        BatchError::Operation { phase, index, operation, cause: Box::new(cause) }
+    }
+}
+
 #[cfg(feature = "paged-title")]
 fn physical_footprint(
     pins: &BackingPins, ranges: &[(u64, u64)],
@@ -184,21 +204,24 @@ impl ClosedFootprint {
     fn capture(ops: &[PageOp]) -> std::result::Result<Self, BatchError> {
         let mut ranges = Vec::new();
         let mut max_copy = 0;
-        for op in ops {
-            match op {
-                PageOp::Copy(copy) => {
-                    ranges.extend(copy.ranges());
-                    max_copy = max_copy.max(copy.len as u64);
+        for (index, op) in ops.iter().enumerate() {
+            (|| -> std::result::Result<(), BatchError> {
+                match op {
+                    PageOp::Copy(copy) => {
+                        ranges.extend(copy.ranges());
+                        max_copy = max_copy.max(copy.len as u64);
+                    }
+                    PageOp::Input(input) => ranges.push(input.range()?),
+                    PageOp::ReadbackTexture(readback) => readback.ranges(&mut ranges)?,
+                    PageOp::UploadTexture(upload) => upload.ranges(&mut ranges)?,
+                    PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
+                    PageOp::ClearRaw(clear) => ranges.push(clear.range()?),
+                    PageOp::Dispatch(dispatch) => dispatch.ranges(&mut ranges)?,
+                    PageOp::CopyTexture(copy) => copy.ranges(&mut ranges)?,
+                    PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_) | PageOp::Barrier(_) => {},
                 }
-                PageOp::Input(input) => ranges.push(input.range()?),
-                PageOp::ReadbackTexture(readback) => readback.ranges(&mut ranges)?,
-                PageOp::UploadTexture(upload) => upload.ranges(&mut ranges)?,
-                PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
-                PageOp::ClearRaw(clear) => ranges.push(clear.range()?),
-                PageOp::Dispatch(dispatch) => dispatch.ranges(&mut ranges)?,
-                PageOp::CopyTexture(copy) => copy.ranges(&mut ranges)?,
-                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_) | PageOp::Barrier(_) => {},
-            }
+                Ok(())
+            })().map_err(|error| op.failure("footprint", index, error))?;
         }
         #[cfg(feature = "paged-title")]
         let (ordinary_count, preserved, visible) = {
@@ -623,28 +646,31 @@ impl Host {
         };
         let mut dirty = BTreeSet::new();
         let mut indirect_budget = None;
-        for op in ops {
-            match op {
-                PageOp::Copy(copy) => {
-                    let pieces = copy.bind(pins).map_err(|miss| match miss {
-                        Unbound::AddressWidth => BatchError::Range(copy.src as u64, copy.dst as u64),
-                        Unbound::Source(va) | Unbound::Destination(va) => BatchError::NotCaptured(va as u64),
-                    })?;
-                    record_copy(list, batch, scratch.as_ref().expect("copy reserved scratch"), &pieces, &mut dirty)
-                        .map_err(BatchError::Native)?;
+        for (index, op) in ops.iter().enumerate() {
+            (|| -> std::result::Result<(), BatchError> {
+                match op {
+                    PageOp::Copy(copy) => {
+                        let pieces = copy.bind(pins).map_err(|miss| match miss {
+                            Unbound::AddressWidth => BatchError::Range(copy.src as u64, copy.dst as u64),
+                            Unbound::Source(va) | Unbound::Destination(va) => BatchError::NotCaptured(va as u64),
+                        })?;
+                        record_copy(list, batch, scratch.as_ref().expect("copy reserved scratch"), &pieces, &mut dirty)
+                            .map_err(BatchError::Native)?;
+                    }
+                    PageOp::CopyTexture(copy) => copy.encode(self, list, batch, targets)?,
+                    PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty)?,
+                    PageOp::UploadTexture(upload) => upload.encode(self, list, batch, targets)?,
+                    PageOp::Input(input) => input.encode(self, list, batch)?,
+                    PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
+                    PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
+                    PageOp::Clear(clear) => clear.encode(self, list, batch, targets)?,
+                    PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,
+                    PageOp::Barrier(barrier) => barrier.encode(list, targets)?,
+                    PageOp::ClearRaw(clear) => clear.encode(self, list, batch, descriptors, targets, &mut dirty)?,
+                    PageOp::ClearUavTexture(clear) => clear.encode(self, list, batch, descriptors, targets)?,
                 }
-                PageOp::CopyTexture(copy) => copy.encode(self, list, batch, targets)?,
-                PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty)?,
-                PageOp::UploadTexture(upload) => upload.encode(self, list, batch, targets)?,
-                PageOp::Input(input) => input.encode(self, list, batch)?,
-                PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
-                PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
-                PageOp::Clear(clear) => clear.encode(self, list, batch, targets)?,
-                PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,
-                PageOp::Barrier(barrier) => barrier.encode(list, targets)?,
-                PageOp::ClearRaw(clear) => clear.encode(self, list, batch, descriptors, targets, &mut dirty)?,
-                PageOp::ClearUavTexture(clear) => clear.encode(self, list, batch, descriptors, targets)?,
-            }
+                Ok(())
+            })().map_err(|error| op.failure("encode", index, error))?;
         }
         Ok(dirty)
     }
@@ -708,7 +734,7 @@ impl Host {
         let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
         let batch = match PinnedBatch::from_capture(self, &mut slabs, backing.pins(), ranges) {
             Ok(batch) => batch,
-            Err(BatchError::Native(error)) if error.code() == E_OUTOFMEMORY => return Ok(None),
+            Err(error) if error.is_out_of_memory() => return Ok(None),
             Err(error) => return Err(error),
         };
         let render = submit_work(
@@ -728,7 +754,7 @@ impl Host {
             }
             Err(error) => {
                 batch.cancel(&mut slabs);
-                if matches!(&error, BatchError::Native(e) if e.code() == E_OUTOFMEMORY) {
+                if error.is_out_of_memory() {
                     Ok(None)
                 } else {
                     Err(error)
@@ -1239,7 +1265,8 @@ fn paged_title_recording_rejects_mixed_lists_before_alias_copy() {
     second.close();
     assert!(matches!(
         host.execute_paged_title(heap, &mut backing, &[&first, &second]),
-        Err(BatchError::Range(..))
+        Err(BatchError::Operation { phase: "footprint", index: 1, operation: "input binding", cause })
+            if matches!(*cause, BatchError::Range(..))
     ));
     assert_eq!(&section.lock().unwrap()[..6], &initial);
     second.reset();

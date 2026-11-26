@@ -272,6 +272,12 @@ pub(crate) enum ListRejection {
 #[derive(Debug)]
 pub(crate) enum BatchError {
     UnloweredList { index: usize, reason: ListRejection },
+    Operation {
+        phase: &'static str,
+        index: usize,
+        operation: &'static str,
+        cause: Box<BatchError>,
+    },
     TargetNotInitialized,
     UnsupportedDepth,
     UnsupportedBarrier,
@@ -281,6 +287,17 @@ pub(crate) enum BatchError {
     NotCaptured(u64),
     Native(Error),
     Table(BindError),
+}
+
+#[cfg(feature = "paged-title")]
+impl BatchError {
+    pub(crate) fn is_out_of_memory(&self) -> bool {
+        match self {
+            Self::Native(error) => error.code() == windows::Win32::Foundation::E_OUTOFMEMORY,
+            Self::Operation { cause, .. } => cause.is_out_of_memory(),
+            _ => false,
+        }
+    }
 }
 
 /// Translation back from the GPU's per-VA mark bitmap. One missing leaf
