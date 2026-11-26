@@ -221,9 +221,45 @@ impl<'a> Ranges<'a> {
         let reach = (self.st.reach[block], true);
         let guard = self.st.guards[block][inst];
         let facts = [reach, (guard.unwrap_or(Bool::TRUE), true)];
-        let local = self.fact_hi(value, &facts[..if guard.is_some() { 2 } else { 1 }]);
+        let local = self.fact_hi(value, &facts[..if guard.is_some() { 2 } else { 1 }], true);
         let hi = self.hi(value).min(local);
         (hi != u32::MAX).then_some(hi)
+    }
+
+    /// 诊断仅暴露产生值的指令类别和该位置是否有 EXEC 守卫，不输出指令字节。
+    pub(crate) fn value_source_at(&self, v: Value, (b, i): (usize, usize)) -> (&'static str, bool) {
+        let root = self.plain_copy_root(v);
+        let producer = match self.defs.get(&root).copied() {
+            Some(Def::Inst(b, i)) => self.p.blocks[b].insts[i].name(),
+            Some(Def::Phi(..)) => "phi",
+            None => "input",
+        };
+        (producer, self.st.guards[b][i].is_some())
+    }
+
+    fn plain_copy_root(&self, mut v: Value) -> Value {
+        for _ in 0..16 {
+            let Some(Def::Inst(b, i)) = self.defs.get(&v).copied() else { break; };
+            let inst = &self.p.blocks[b].insts[i];
+            let source = match (&inst.fields, inst.name()) {
+                (Fields::Valu(f), "v_mov_b32") if self.st.guards[b][i].is_none()
+                    && f.sdwa.is_none() && f.dpp.is_none() && !f.clamp && f.omod == 0
+                    && f.neg | f.abs | f.opsel == 0 => f.src.as_slice(),
+                (Fields::Sop { src, .. }, "s_mov_b32") => src.as_slice(),
+                _ => break,
+            };
+            let [op] = source else { break; };
+            if !dst(inst).is_some_and(|reg| inst.write(reg) == Some(v)) { break; }
+            let Some(next) = value(inst, op) else { break; };
+            // 不跨越 phi 或条件写入，也不跨线程采用 readfirstlane 的值。
+            if dst(inst).is_some_and(|reg| matches!(reg, Reg::S(_)))
+                && matches!(op, Operand::Vector { .. })
+            {
+                break;
+            }
+            v = next;
+        }
+        v
     }
 
     fn hi(&mut self, v: Value) -> u32 {
@@ -280,11 +316,11 @@ impl<'a> Ranges<'a> {
         {
             facts.push((when, taken == to));
         }
-        let best = self.fact_hi(a, &facts);
+        let best = self.fact_hi(a, &facts, false);
         if best == u32::MAX { self.hi(a) } else { best }
     }
 
-    fn fact_hi(&mut self, a: Value, facts: &[(Bool, bool)]) -> u32 {
+    fn fact_hi(&mut self, a: Value, facts: &[(Bool, bool)], follow_copies: bool) -> u32 {
         let mut atoms: Vec<Atom> = facts
             .iter()
             .flat_map(|&(f, _)| self.st.bools.support(f))
@@ -296,7 +332,7 @@ impl<'a> Ranges<'a> {
                 continue;
             };
             if let Some(holds) = self.st.bools.decides(facts, atom)
-                && let Some(h) = self.compare_bound(c, a, holds)
+                && let Some(h) = self.compare_bound(c, a, holds, follow_copies)
             {
                 best = best.min(h);
             }
@@ -306,7 +342,7 @@ impl<'a> Ranges<'a> {
 
     /// What an unsigned compare whose result `c` is `holds` says of the
     /// largest value of its operand `a`.
-    fn compare_bound(&mut self, c: Value, a: Value, holds: bool) -> Option<u32> {
+    fn compare_bound(&mut self, c: Value, a: Value, holds: bool, follow_copies: bool) -> Option<u32> {
         let Some(&Def::Inst(b, i)) = self.defs.get(&c) else {
             return None;
         };
@@ -314,7 +350,8 @@ impl<'a> Ranges<'a> {
         let inst = &p.blocks[b].insts[i];
         let name = inst.name();
         let (op, src) = match &inst.fields {
-            Fields::Valu(v) if v.sdwa.is_none() && v.dpp.is_none() => (
+            Fields::Valu(v) if v.sdwa.is_none() && v.dpp.is_none()
+                && !v.clamp && v.omod == 0 && v.neg | v.abs | v.opsel == 0 => (
                 name.strip_prefix("v_cmpx_")
                     .or_else(|| name.strip_prefix("v_cmp_"))?,
                 &v.src,
@@ -327,8 +364,11 @@ impl<'a> Ranges<'a> {
         let op = op.strip_suffix("_u32")?;
         let [x, y] = &src[..] else { return None };
         let (x, y) = (value(inst, x), value(inst, y));
-        // `a op other`, with the result as it holds.
-        let (op, other) = match (x == Some(a), y == Some(a)) {
+        let same = |v: Option<Value>| v.is_some_and(|v| {
+            if follow_copies { self.plain_copy_root(v) == self.plain_copy_root(a) } else { v == a }
+        });
+        // 比较与访问必须是同一 SSA 值，或无修饰、无条件的逐位复制。
+        let (op, other) = match (same(x), same(y)) {
             (true, false) => (op, &src[1]),
             (false, true) => (
                 match op {
@@ -492,6 +532,25 @@ mod tests {
         assert_eq!(range.unsigned_upper_bound_at(v0, (0, 0)), None);
         assert_eq!(range.unsigned_upper_bound_at(unrelated, (0, 3)), None);
         assert_eq!(range.unsigned_upper_bound(v0), None);
+    }
+
+    #[test]
+    fn compares_follow_plain_copies_but_not_guarded_overwrites() {
+        let p = build_words(&[
+            vop1(0x01, 1, V),      // v1 是 v0 的无条件复制。
+            0x7DA4_0080,           // v_cmpx_eq_u32 exec, 0, v0
+            vop1(0x01, 2, V + 1),  // 比较过 v0 就能约束 v1。
+            vop1(0x01, 1, V + 4),  // 活动 lane 内 v1 改成未比较的 v4。
+            vop1(0x01, 2, V + 1),
+            S_ENDPGM,
+        ]);
+        let st = structure::structure(&p).unwrap();
+        let i = &p.blocks[0].insts;
+        let copy = i[2].read(Reg::V(1)).unwrap();
+        let overwrite = i[4].read(Reg::V(1)).unwrap();
+        let mut range = Ranges::new(&p, &st);
+        assert_eq!(range.unsigned_upper_bound_at(copy, (0, 2)), Some(0));
+        assert_eq!(range.unsigned_upper_bound_at(overwrite, (0, 4)), None);
     }
 
     #[test]

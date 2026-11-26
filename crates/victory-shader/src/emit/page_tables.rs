@@ -20,7 +20,11 @@ pub struct StaticTextureSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StaticViewAccess {
     TextureRead { array: bool },
-    TextureWrite { x: u32, y: u32, z: Option<u32> },
+    TextureWrite {
+        x: u32, y: u32, z: Option<u32>,
+        sources: [&'static str; 3], exec_guard: bool,
+        dispatch: Option<([u32; 3], [u32; 3])>,
+    },
     /// A statically bounded aligned byte window on a raw UAV, as used by DXIL.
     RawUav { offset: u32, bytes: u32, write: bool },
     RawSrv { offset: u32, bytes: u32 },
@@ -114,6 +118,10 @@ fn view_report(container: &[u8], direct: Option<[u32; 3]>) -> Result<StaticViewR
             }
         }
     }
+    let dispatch = match (&native.io, direct) {
+        (StageIo::Cs(cs), Some(groups)) => Some((groups, cs.threads)),
+        _ => None,
+    };
     let addresses: BTreeMap<_, _> = resources.scalar.iter().copied().collect();
     let mut slots = BTreeSet::new();
     for descriptor in &resources.descriptors {
@@ -128,7 +136,7 @@ fn view_report(container: &[u8], direct: Option<[u32; 3]>) -> Result<StaticViewR
             }
             continue;
         }
-        let access = if let Some(access) = bounded_texture_write(inst, &mut bounds, (b, i)) {
+        let access = if let Some(access) = bounded_texture_write(inst, &mut bounds, (b, i), dispatch) {
             AccessProof::Native(access)
         } else if let Fields::Image { dim, .. } = inst.fields
             && let Some(access) = closed_image_read(name, dim)
@@ -273,6 +281,7 @@ fn bounded_raw_access(inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<
 
 fn bounded_texture_write(
     inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>, site: (usize, usize),
+    dispatch: Option<([u32; 3], [u32; 3])>,
 ) -> Option<StaticViewAccess> {
     let Fields::Image {
         addr, dim, dmask: 15, a16: false, d16: false, tfe: false, lwe: false, ..
@@ -282,14 +291,20 @@ fn bounded_texture_write(
         Operand::Vector { reg, dwords } => reg..reg.saturating_add(dwords),
         _ => 0..0,
     });
-    let x = bounds.unsigned_upper_bound_at(inst.read(crate::ir::Reg::V(regs.next()?))?, site)?;
-    let y = bounds.unsigned_upper_bound_at(inst.read(crate::ir::Reg::V(regs.next()?))?, site)?;
-    let z = if *dim == 2 {
-        Some(bounds.unsigned_upper_bound_at(inst.read(crate::ir::Reg::V(regs.next()?))?, site)?)
+    let a = inst.read(crate::ir::Reg::V(regs.next()?))?;
+    let b = inst.read(crate::ir::Reg::V(regs.next()?))?;
+    let (x, y) = (bounds.unsigned_upper_bound_at(a, site)?, bounds.unsigned_upper_bound_at(b, site)?);
+    let (source_x, exec_guard) = bounds.value_source_at(a, site);
+    let (source_y, _) = bounds.value_source_at(b, site);
+    let (z, source_z) = if *dim == 2 {
+        let c = inst.read(crate::ir::Reg::V(regs.next()?))?;
+        (Some(bounds.unsigned_upper_bound_at(c, site)?), bounds.value_source_at(c, site).0)
     } else {
-        None
+        (None, "-")
     };
-    Some(StaticViewAccess::TextureWrite { x, y, z })
+    Some(StaticViewAccess::TextureWrite { x, y, z,
+        sources: [source_x, source_y, source_z], exec_guard, dispatch,
+    })
 }
 
 enum AccessProof {

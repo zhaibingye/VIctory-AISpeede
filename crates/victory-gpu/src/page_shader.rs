@@ -54,6 +54,8 @@ pub(crate) enum DescriptorSlotReason {
     TextureWriteRange {
         host_format: i32, xyz_max: (u32, u32, Option<u32>),
         view_width_height_w_window: (u64, u32, Option<(u32, u32)>),
+        coordinate_sources: [&'static str; 3], exec_guard: bool,
+        groups_and_threads: Option<([u32; 3], [u32; 3])>,
     },
     UnsupportedAccess,
     OutsideRangeOrConflictingView,
@@ -560,11 +562,12 @@ impl ShaderBindings {
                             if texture.selection().slices.is_some() == array => {},
                         (Some(ClosedView::NullTexture(_, selection)), StaticViewAccess::TextureRead { array })
                             if selection.slices.is_some() == array => {},
-                        (Some(ClosedView::TextureUav(view)), StaticViewAccess::TextureWrite { x, y, z }) => {
+                        (Some(ClosedView::TextureUav(view)), StaticViewAccess::TextureWrite { x, y, z, sources, exec_guard, dispatch }) => {
                             if !view.allows(x, y, z) {
                                 return Err(reason(DescriptorSlotReason::TextureWriteRange {
                                     host_format: view.format_id(), xyz_max: (x, y, z),
                                     view_width_height_w_window: view.view_extent(),
+                                    coordinate_sources: sources, exec_guard, groups_and_threads: dispatch,
                                 }));
                             }
                         }
