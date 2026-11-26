@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{self, EXEC, Inst, M0, Program, Reg, Value};
-use crate::structure::{self, Atom, LaneExit, Structured};
+use crate::structure::{self, Atom, Bool, LaneExit, Structured};
 
 /// [`ir::build`] and [`structure::structure`], built again with the register
 /// ranges of relative moves bounded where their index is.
@@ -214,6 +214,18 @@ impl<'a> Ranges<'a> {
         (hi != u32::MAX).then_some(hi)
     }
 
+    /// 只在此指令的活动 lane 使用控制流和 EXEC 的比较条件，不污染全局值界。
+    pub(crate) fn unsigned_upper_bound_at(&mut self, value: Value, (block, inst): (usize, usize))
+        -> Option<u32>
+    {
+        let reach = (self.st.reach[block], true);
+        let guard = self.st.guards[block][inst];
+        let facts = [reach, (guard.unwrap_or(Bool::TRUE), true)];
+        let local = self.fact_hi(value, &facts[..if guard.is_some() { 2 } else { 1 }]);
+        let hi = self.hi(value).min(local);
+        (hi != u32::MAX).then_some(hi)
+    }
+
     fn hi(&mut self, v: Value) -> u32 {
         if let Some(&h) = self.memo.get(&v) {
             return h;
@@ -268,6 +280,11 @@ impl<'a> Ranges<'a> {
         {
             facts.push((when, taken == to));
         }
+        let best = self.fact_hi(a, &facts);
+        if best == u32::MAX { self.hi(a) } else { best }
+    }
+
+    fn fact_hi(&mut self, a: Value, facts: &[(Bool, bool)]) -> u32 {
         let mut atoms: Vec<Atom> = facts
             .iter()
             .flat_map(|&(f, _)| self.st.bools.support(f))
@@ -278,13 +295,13 @@ impl<'a> Ranges<'a> {
             let (Atom::Lane(c) | Atom::Uniform(c)) = atom else {
                 continue;
             };
-            if let Some(holds) = self.st.bools.decides(&facts, atom)
+            if let Some(holds) = self.st.bools.decides(facts, atom)
                 && let Some(h) = self.compare_bound(c, a, holds)
             {
                 best = best.min(h);
             }
         }
-        if best == u32::MAX { self.hi(a) } else { best }
+        best
     }
 
     /// What an unsigned compare whose result `c` is `holds` says of the
@@ -455,6 +472,26 @@ mod tests {
         assert_eq!(bounded.unsigned_upper_bound(value), Some(7));
         assert_eq!(bounded.unsigned_upper_bound(overwritten), Some(8));
         assert_eq!(Ranges::new(&p, &st).unsigned_upper_bound(value), None);
+    }
+
+    #[test]
+    fn lane_compare_limits_only_the_guarded_site_and_matching_value() {
+        let p = build_words(&[
+            vop1(0x01, 1, V),      // 读取 v0，未缩小 EXEC。
+            0x7DA4_0080,           // v_cmpx_eq_u32 exec, 0, v0
+            vop1(0x01, 2, V),      // 仅在 v0 等于 0 的 lane 运行。
+            vop1(0x01, 3, V + 4),  // v4 未经比较。
+            S_ENDPGM,
+        ]);
+        let st = structure::structure(&p).unwrap();
+        let i = &p.blocks[0].insts;
+        let v0 = i[0].read(Reg::V(0)).unwrap();
+        let unrelated = i[3].read(Reg::V(4)).unwrap();
+        let mut range = Ranges::new(&p, &st);
+        assert_eq!(range.unsigned_upper_bound_at(v0, (0, 2)), Some(0));
+        assert_eq!(range.unsigned_upper_bound_at(v0, (0, 0)), None);
+        assert_eq!(range.unsigned_upper_bound_at(unrelated, (0, 3)), None);
+        assert_eq!(range.unsigned_upper_bound(v0), None);
     }
 
     #[test]

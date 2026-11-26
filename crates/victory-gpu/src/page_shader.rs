@@ -51,7 +51,10 @@ pub(crate) enum DescriptorSlotReason {
         title_format: Option<u32>, view_format: Option<i32>, view_dimension: Option<i32>,
         phase: crate::page_uav::TextureUavReject,
     },
-    TextureWriteRange { host_format: i32, xyz_max: (u32, u32, Option<u32>) },
+    TextureWriteRange {
+        host_format: i32, xyz_max: (u32, u32, Option<u32>),
+        view_width_height_w_window: (u64, u32, Option<(u32, u32)>),
+    },
     UnsupportedAccess,
     OutsideRangeOrConflictingView,
 }
@@ -561,6 +564,7 @@ impl ShaderBindings {
                             if !view.allows(x, y, z) {
                                 return Err(reason(DescriptorSlotReason::TextureWriteRange {
                                     host_format: view.format_id(), xyz_max: (x, y, z),
+                                    view_width_height_w_window: view.view_extent(),
                                 }));
                             }
                         }

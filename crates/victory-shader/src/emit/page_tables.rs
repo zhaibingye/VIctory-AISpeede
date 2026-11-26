@@ -128,7 +128,7 @@ fn view_report(container: &[u8], direct: Option<[u32; 3]>) -> Result<StaticViewR
             }
             continue;
         }
-        let access = if let Some(access) = bounded_texture_write(inst, &mut bounds) {
+        let access = if let Some(access) = bounded_texture_write(inst, &mut bounds, (b, i)) {
             AccessProof::Native(access)
         } else if let Fields::Image { dim, .. } = inst.fields
             && let Some(access) = closed_image_read(name, dim)
@@ -272,7 +272,7 @@ fn bounded_raw_access(inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<
 }
 
 fn bounded_texture_write(
-    inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>,
+    inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>, site: (usize, usize),
 ) -> Option<StaticViewAccess> {
     let Fields::Image {
         addr, dim, dmask: 15, a16: false, d16: false, tfe: false, lwe: false, ..
@@ -282,10 +282,10 @@ fn bounded_texture_write(
         Operand::Vector { reg, dwords } => reg..reg.saturating_add(dwords),
         _ => 0..0,
     });
-    let x = bounds.unsigned_upper_bound(inst.read(crate::ir::Reg::V(regs.next()?))?)?;
-    let y = bounds.unsigned_upper_bound(inst.read(crate::ir::Reg::V(regs.next()?))?)?;
+    let x = bounds.unsigned_upper_bound_at(inst.read(crate::ir::Reg::V(regs.next()?))?, site)?;
+    let y = bounds.unsigned_upper_bound_at(inst.read(crate::ir::Reg::V(regs.next()?))?, site)?;
     let z = if *dim == 2 {
-        Some(bounds.unsigned_upper_bound(inst.read(crate::ir::Reg::V(regs.next()?))?)?)
+        Some(bounds.unsigned_upper_bound_at(inst.read(crate::ir::Reg::V(regs.next()?))?, site)?)
     } else {
         None
     };
