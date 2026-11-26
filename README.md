@@ -137,6 +137,15 @@ victory config
 再运行带有 `2>&1 | Tee-Object -FilePath vnme-startup.log` 的命令。
 `Tee-Object` 无法修复已经被错误解码的旧日志。
 
+### VNME 提交前盘点
+
+同时开启 `paged-title` 和 `diagnostics` 构建功能后，设置
+`$env:VICTORY_VNME_INVENTORY = '1'`。提交被拒绝时，查看日志中的
+`[VNME_BATCH_INVENTORY]` 和 `[VNME_BATCH_ITEM]`：盘点当前提交中已经录制的命令、
+绘制和派发使用的 Shader 标识、已识别的附件格式及不支持的原因。纹理 UAV
+绑定或访问范围失败时会附带可取得的格式信息。重复条目合并计数，超限数量记入
+`dropped`。盘点不提交被拒绝的命令，也看不到游戏尚未执行到的路径。
+
 ### Windows 着色器验证
 
 着色器测试使用 `dxil.dll` 验证 Shader Model 6.6。较旧的 Windows SDK

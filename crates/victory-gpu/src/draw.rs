@@ -57,6 +57,8 @@ use crate::page_view::InputView;
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    inventory_shaders: String,
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -232,7 +234,7 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
-        self.pipeline = pipeline as usize;
+        self.set_pipeline(pipeline);
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -259,6 +261,11 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if crate::page_inventory::enabled() {
+            // 绑定时读一次，盘点拒绝命令时不再解引用旧管线指针。
+            self.inventory_shaders = crate::pipeline::shaders_of(pipeline);
+        }
     }
 
     /// Others recorded into the host list (`crate::external`): its heaps,
@@ -404,8 +411,39 @@ impl State {
         };
     }
 
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    fn note_inventory_pipeline(
+        &self, list: &HostList, command: &'static str, graphics: bool,
+        rejection: Option<crate::page_shader::UnloweredShader>,
+    ) {
+        if !crate::page_inventory::enabled() {
+            return;
+        }
+        let shaders = self.inventory_shaders.clone();
+        let (colors, depth) = if graphics {
+            (
+                self.page_targets.iter().flatten().map(|target| target.format_id()).collect(),
+                self.page_depth.as_ref().map(|target| target.format_id()),
+            )
+        } else {
+            (Vec::new(), None)
+        };
+        list.record_inventory(crate::page_inventory::Observation::Pipeline {
+            command, shaders, colors, depth, rejection,
+        });
+    }
+
     fn record_strict_draw(&self, list: &HostList, call: crate::page_draw::DrawCall) -> bool {
-        match self.capture_page_draw(call) {
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        let command = match &call {
+            crate::page_draw::DrawCall::Direct { .. } => "DrawInstanced",
+            crate::page_draw::DrawCall::Indexed { .. } => "DrawIndexedInstanced",
+            crate::page_draw::DrawCall::Indirect(_) => "ExecuteIndirect:Draw",
+        };
+        let ready = self.capture_page_draw(call);
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        self.note_inventory_pipeline(list, command, true, ready.as_ref().err().copied());
+        match ready {
             Ok(draw) => { list.record_page_draw(draw); true }
             Err(reason) => {
                 list.reject_page_recording(crate::page_slabs::ListRejection::Shader { operation: "draw", reason });
@@ -1033,6 +1071,11 @@ impl State {
 
     fn record_strict_dispatch(&self, list: &HostList, call: crate::page_dispatch::DispatchCall) -> bool {
         use crate::page_shader::UnloweredShader;
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        let command = match &call {
+            crate::page_dispatch::DispatchCall::Direct(..) => "Dispatch",
+            crate::page_dispatch::DispatchCall::Indirect(_) => "ExecuteIndirect:Dispatch",
+        };
         let ready = if self.page_state_opaque {
             Err(UnloweredShader::GraphicsState)
         } else {
@@ -1044,6 +1087,8 @@ impl State {
             |slot| self.page_address(true, slot),
             call,
         ));
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        self.note_inventory_pipeline(list, command, false, ready.as_ref().err().copied());
         match ready {
             Ok(dispatch) => { list.record_page_dispatch(dispatch); true }
             Err(reason) => {

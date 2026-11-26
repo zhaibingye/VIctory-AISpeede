@@ -45,6 +45,8 @@ mod memory;
 #[cfg(windows)]
 #[allow(dead_code, reason = "will replace title dispatch after direct and texture views use physical pages")]
 mod page_queue;
+#[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+mod page_inventory;
 #[cfg(windows)]
 mod page_dispatch;
 #[cfg(windows)]

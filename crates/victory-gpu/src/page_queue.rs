@@ -189,8 +189,8 @@ impl PipeWrite {
 }
 
 impl PageOp {
-    fn failure(&self, phase: &'static str, index: usize, cause: BatchError) -> BatchError {
-        let operation = match self {
+    pub(crate) fn operation(&self) -> &'static str {
+        match self {
             Self::Copy(_) => "buffer copy",
             Self::CopyTexture(_) => "texture copy",
             #[cfg(feature = "paged-title")]
@@ -215,8 +215,11 @@ impl PageOp {
                 QueryOp::End { .. } => "query end",
                 QueryOp::Resolve { .. } => "query resolve",
             },
-        };
-        BatchError::Operation { phase, index, operation, cause: Box::new(cause) }
+        }
+    }
+
+    fn failure(&self, phase: &'static str, index: usize, cause: BatchError) -> BatchError {
+        BatchError::Operation { phase, index, operation: self.operation(), cause: Box::new(cause) }
     }
 }
 

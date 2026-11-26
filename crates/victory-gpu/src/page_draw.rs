@@ -43,6 +43,9 @@ pub(crate) struct ColorTarget {
 }
 
 impl ColorTarget {
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn format_id(&self) -> i32 { self.format.0 }
+
     /// Only an already-authoritative host render target is admitted here.
     /// Title-memory texture uploads, aliasing and sparse placement must
     /// be lowered before they can participate in this form of draw.
@@ -193,6 +196,9 @@ pub(crate) struct DepthTarget {
 }
 
 impl DepthTarget {
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn format_id(&self) -> i32 { self.format.0 }
+
     pub(crate) fn capture(
         copy: Arc<HostTexture>, desc: Option<D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> Option<Self> {

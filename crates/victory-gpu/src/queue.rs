@@ -133,7 +133,11 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 crate::host::fail(format_args!("VNME 提交包含没有宿主录制器的命令列表"));
             }
             let batch = crate::page_queue::ClosedTitleBatch::capture(&host_lists)
-                .unwrap_or_else(|e| crate::host::fail(format_args!("[VNME_SUBMISSION_REJECTED] VNME 拒绝提交 GPU 命令列表： {e:?}")));
+                .unwrap_or_else(|e| {
+                    #[cfg(feature = "diagnostics")]
+                    crate::page_inventory::report(&host_lists);
+                    crate::host::fail(format_args!("[VNME_SUBMISSION_REJECTED] VNME 拒绝提交 GPU 命令列表： {e:?}"))
+                });
             let heap = crate::memory::heap().unwrap_or_else(|| {
                 crate::host::fail(format_args!("VNME 提交缺少描述符堆"))
             });

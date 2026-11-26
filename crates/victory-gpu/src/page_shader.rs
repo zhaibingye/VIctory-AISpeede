@@ -42,7 +42,8 @@ pub(crate) enum DescriptorSlotReason {
     UnboundOrStale,
     UnsupportedTexture { array: bool, title_format: Option<u32> },
     UnsupportedBuffer,
-    UnsupportedTextureWrite,
+    UnsupportedTextureWrite { title_format: Option<u32>, view_format: Option<i32>, view_dimension: Option<i32> },
+    TextureWriteRange { host_format: i32, xyz_max: (u32, u32, Option<u32>) },
     UnsupportedAccess,
     OutsideRangeOrConflictingView,
 }
@@ -483,7 +484,10 @@ impl ShaderBindings {
                                     },
                                 }))?),
                             StaticViewAccess::TextureWrite { .. } if pipeline.compute => {
-                                ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).ok_or(reason(DescriptorSlotReason::UnsupportedTextureWrite))?)
+                                ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).ok_or_else(|| {
+                                    let (title_format, view_format, view_dimension) = crate::descriptor::host::paged_uav_format(&actual);
+                                    reason(DescriptorSlotReason::UnsupportedTextureWrite { title_format, view_format, view_dimension })
+                                })?)
                             }
                             StaticViewAccess::ConstantTable { .. } => {
                                 let (start, end) = crate::descriptor::host::paged_table_constant_range(&actual)
@@ -521,7 +525,11 @@ impl ShaderBindings {
                         (Some(ClosedView::Texture(texture)), StaticViewAccess::TextureRead { array })
                             if texture.selection().slices.is_some() == array => {},
                         (Some(ClosedView::TextureUav(view)), StaticViewAccess::TextureWrite { x, y, z }) => {
-                            if !view.allows(x, y, z) { return Err(reject); }
+                            if !view.allows(x, y, z) {
+                                return Err(reason(DescriptorSlotReason::TextureWriteRange {
+                                    host_format: view.format_id(), xyz_max: (x, y, z),
+                                }));
+                            }
                         }
                         (Some(ClosedView::Raw(raw)), StaticViewAccess::RawSrv { offset, bytes })
                         | (Some(ClosedView::TableConstant(raw)), StaticViewAccess::ConstantTable { offset, bytes })

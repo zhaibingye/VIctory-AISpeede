@@ -735,6 +735,8 @@ pub(crate) struct HostList {
     /// Closed state and whether a caller could have recorded native work.
     recording_flags: std::sync::atomic::AtomicU8,
     page_rejection: std::sync::Mutex<Option<crate::page_slabs::ListRejection>>,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    page_inventory: Mutex<crate::page_inventory::Inventory>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1113,6 +1115,8 @@ impl Host {
                 list,
                 recording_flags: 0.into(),
                 page_rejection: std::sync::Mutex::new(None),
+                #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+                page_inventory: Mutex::default(),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -1759,6 +1763,33 @@ impl HostList {
         let mut first = self.page_rejection.lock().unwrap_or_else(|e| e.into_inner());
         first.get_or_insert(reason);
         self.recording_flags.fetch_or(NATIVE_RECORDING, Ordering::Relaxed);
+        drop(first);
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if crate::page_inventory::enabled()
+            && !matches!(reason, crate::page_slabs::ListRejection::Shader { .. })
+        {
+            self.page_inventory.lock().unwrap_or_else(|e| e.into_inner())
+                .observe(crate::page_inventory::Observation::Rejection(format!("{reason:?}")));
+        }
+    }
+
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn record_inventory(&self, entry: crate::page_inventory::Observation) {
+        self.page_inventory.lock().unwrap_or_else(|e| e.into_inner()).observe(entry);
+    }
+
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn summarize_inventory(&self, result: &mut crate::page_inventory::Inventory) {
+        result.merge(&self.page_inventory.lock().unwrap_or_else(|e| e.into_inner()));
+        let deferred = self.deferred();
+        for step in &deferred.copies {
+            let name = match step {
+                Step::Copy(_) => "buffer copy",
+                Step::Page(op) => op.operation(),
+                _ => continue,
+            };
+            result.observe(crate::page_inventory::Observation::Command(name));
+        }
     }
 
     /// Admit the complete closed page list or none of it. Native work,
@@ -1920,6 +1951,10 @@ impl HostList {
     pub(crate) fn reset(&self) {
         self.recording_flags.store(0, Ordering::Relaxed);
         *self.page_rejection.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if crate::page_inventory::enabled() {
+            self.page_inventory.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();

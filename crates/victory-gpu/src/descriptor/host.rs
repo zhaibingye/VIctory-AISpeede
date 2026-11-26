@@ -1045,6 +1045,18 @@ fn exact_texture_uav(view: &View) -> Option<(
     Some((crate::resource::host_copy(resource)?, format, selection))
 }
 
+/// 只取诊断所需的格式和视图维度，不记录地址或资源内容。
+pub(crate) fn paged_uav_format(view: &View) -> (Option<u32>, Option<i32>, Option<i32>) {
+    match view {
+        View::Unordered(resource, counter, words) => {
+            let title = (*counter == 0).then(|| crate::resource::title_format(*resource as crate::object::This)).flatten();
+            let desc = words.as_ref().map(uav_desc);
+            (title, desc.map(|d| d.Format.0), desc.map(|d| d.ViewDimension.0))
+        }
+        _ => (None, None, None),
+    }
+}
+
 pub(crate) fn paged_shader_texture_uav(view: &View) -> Option<crate::page_uav::ShaderTextureUav> {
     let (target, format, selection) = exact_texture_uav(view)?;
     crate::page_uav::ShaderTextureUav::capture(target, format, selection)

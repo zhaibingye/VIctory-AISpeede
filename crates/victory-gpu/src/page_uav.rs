@@ -188,6 +188,8 @@ impl ShaderTextureUav {
 
     pub(crate) fn subresource(&self) -> ColorSubresource { self.0.subresources[0] }
 
+    pub(crate) fn format_id(&self) -> i32 { self.0.format.0 }
+
     pub(crate) fn allows(&self, x: u32, y: u32, z: Option<u32>) -> bool {
         u64::from(x) < self.subresource().width && y < self.subresource().height
             && match (self.0.selection.volume, z) {
