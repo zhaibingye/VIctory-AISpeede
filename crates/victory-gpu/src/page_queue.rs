@@ -1144,6 +1144,16 @@ fn submit_work<'a>(
     let uploaded = uploads.as_ref().map_or(0, |stage| stage.record(&list, batch));
     barrier(&list, slabs.values().copied(), false);
     let declared_dirty = record(&list, roots, batch, backing.pins(), &mut pairs, &mut targets)?;
+    #[cfg(feature = "paged-title")]
+    if targets.section_texture_read {
+        let previous_submission = host.unclassified_native_writes.load(std::sync::atomic::Ordering::Relaxed);
+        let current_submission = targets.unclassified_native_write;
+        // 同一队列锁覆盖当前批次、已入队批次及仍在途的早期批次。
+        if previous_submission || current_submission {
+            return Err(BatchError::UnclassifiedSharedTextureWriter { previous_submission, current_submission });
+        }
+    }
+
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     targets.capture_trace_writers();
     barrier(&list, slabs.values().copied(), true);
@@ -1162,6 +1172,11 @@ fn submit_work<'a>(
     let rendered = host
         .submit_native_group(signal, &[Some(command)])
         .unwrap_or_else(|e| fail(format_args!("VNME 原生渲染提交失败：{e}")));
+    #[cfg(feature = "paged-title")]
+    if targets.unclassified_native_write {
+        host.unclassified_native_writes.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let profile = started.zip(encoded).map(|(started, encoded)| {
         let queued = std::time::Instant::now();
         SubmissionProfile {

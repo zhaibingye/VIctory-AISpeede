@@ -48,6 +48,9 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     pub(crate) paged: Mutex<crate::page_slabs::PageSlabs>,
+    /// 原生写入的来源未知时，禁止依赖仅共享页的临时读取路径。
+    #[cfg(feature = "paged-title")]
+    pub(crate) unclassified_native_writes: std::sync::atomic::AtomicBool,
     idle_paged_lists: Mutex<Vec<HostList>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
@@ -263,6 +266,8 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             paged: Mutex::default(),
+            #[cfg(feature = "paged-title")]
+            unclassified_native_writes: false.into(),
             idle_paged_lists: Mutex::default(),
             event,
             rtvs,

@@ -24,7 +24,7 @@ extern "system" fn create_device(
         victory_gpu::title_backing::use_backing(
             super::xmem::pin_backing, super::xmem::with_writeback_page, super::xmem::read_backing_runs,
         );
-        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        #[cfg(feature = "paged-title")]
         victory_gpu::title_backing::use_private_heap_span(super::xmem::is_graphics_heap_span);
         victory_gpu::title_backing::use_upload_backing(
             super::xmem::allocate_list_upload, super::xmem::free_list_upload,

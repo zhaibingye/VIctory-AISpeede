@@ -438,15 +438,15 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 
 /// 仅记录明确由默认分配器创建的图形堆块；不改 allocator hook，
 /// 不用虚拟地址或 VirtualQuery 猜测第三方分配的身份。
-#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[cfg(feature = "paged-title")]
 static GRAPHICS_HEAP: LazyLock<Mutex<BTreeMap<usize, usize>>> = LazyLock::new(Mutex::default);
 
-#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[cfg(feature = "paged-title")]
 fn graphics_allocator(attributes: u64) -> bool {
     (attributes >> 16) & 0xff == 128
 }
 
-#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[cfg(feature = "paged-title")]
 pub(crate) fn is_graphics_heap_span(start: usize, end: usize) -> bool {
     if start >= end { return false; }
     GRAPHICS_HEAP.lock().unwrap_or_else(|e| e.into_inner())
@@ -485,7 +485,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), offset]);
-        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        #[cfg(feature = "paged-title")]
         if graphics_allocator(attributes) && let Some(end) = (user as usize).checked_add(size) {
             GRAPHICS_HEAP.lock().unwrap_or_else(|e| e.into_inner()).insert(user as usize, end);
         }
@@ -506,7 +506,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
             return;
         }
         let user = address.cast::<u8>();
-        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        #[cfg(feature = "paged-title")]
         if graphics_allocator(attributes) {
             GRAPHICS_HEAP.lock().unwrap_or_else(|e| e.into_inner()).remove(&(user as usize));
         }

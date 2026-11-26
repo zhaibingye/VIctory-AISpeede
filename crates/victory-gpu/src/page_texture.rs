@@ -81,6 +81,11 @@ impl ScopedTextureAccess {
 /// One admitted shader view, consumed from ordered native authority or
 /// from an exact compatible byte representation.
 pub(crate) enum TextureInput {
+    #[cfg(feature = "paged-title")]
+    Section2d {
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        input: SharedTextureBytes,
+    },
     Linear {
         copy: std::sync::Arc<crate::resource::HostTexture>,
         input: LinearTexture,
@@ -138,6 +143,22 @@ fn extended_color_support(host: &Host, format: DXGI_FORMAT) -> bool {
             D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut caps).cast(), size_of_val(&caps) as u32,
         ) }.is_ok()
             && caps.Support1.contains(D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)
+    })
+}
+
+#[cfg(feature = "paged-title")]
+fn section_2d_sampling_supported(host: &Host) -> bool {
+    static SUPPORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORT.get_or_init(|| {
+        let mut caps = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT, ..Default::default()
+        };
+        // 安全：仅查询设备能力，缓冲区是匹配该查询的本地结构。
+        unsafe { host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut caps).cast(), size_of_val(&caps) as u32,
+        ) }.is_ok()
+            && caps.Support1.contains(D3D12_FORMAT_SUPPORT1_TEXTURE2D
+                | D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)
     })
 }
 
@@ -207,7 +228,9 @@ impl TextureInput {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn has_exact_guest_bytes(&self) -> bool { matches!(self, Self::Linear { .. }) }
+    pub(crate) fn has_exact_guest_bytes(&self) -> bool {
+        matches!(self, Self::Linear { .. } | Self::Section2d { .. })
+    }
 
     pub(crate) fn selection(&self) -> TextureSelection {
         match self { Self::Scoped { selection, .. } => *selection, _ => TextureSelection::SINGLE }
@@ -245,6 +268,8 @@ impl TextureInput {
         }
         match self {
             Self::Scoped { .. } => {},
+            #[cfg(feature = "paged-title")]
+            Self::Section2d { input, .. } => ranges.extend(input.ranges()),
             Self::Linear { input, .. } => ranges.extend(input.rows()?),
             Self::Native { copy, compatible_input: Some(input), .. } => {
                 // A queued earlier operation can establish native
@@ -271,6 +296,8 @@ impl TextureInput {
     pub(crate) fn aliases_target(&self, target: &crate::resource::HostTexture) -> bool {
         let copy = match self {
             Self::Linear { copy, .. } | Self::Native { copy, .. } | Self::Scoped { copy, .. } => copy,
+            #[cfg(feature = "paged-title")]
+            Self::Section2d { copy, .. } => copy,
         };
         copy.texture == target.texture
     }
@@ -331,6 +358,27 @@ impl TextureInput {
                 }
                 list.keep(&copy.texture);
                 Ok((copy.texture.clone(), *format))
+            }
+            #[cfg(feature = "paged-title")]
+            Self::Section2d { copy, input } => {
+                if shared.is_some() || plan.authoritative(copy) || !section_2d_sampling_supported(host)
+                    || copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
+                    || copy.has_pointer_exposure()
+                {
+                    return Err(BatchError::UnsupportedTextureMap);
+                }
+                for span in input.ranges() {
+                    batch.for_each_physical_span(span, |page, _| {
+                        if page.is_private() { return Err(BatchError::UnsupportedTextureMap); }
+                        Ok(())
+                    })?;
+                }
+                plan.section_texture_read = true;
+                plan.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
+                input.transfer(host, list, batch, &copy.texture, None)?;
+                plan.transition_texture(list, copy, SHADER_READ.0 as u32)?;
+                list.keep(&copy.texture);
+                Ok((copy.texture.clone(), input.format))
             }
             Self::Linear { copy, input } => {
                 if shared.is_some() || plan.authoritative(copy) {

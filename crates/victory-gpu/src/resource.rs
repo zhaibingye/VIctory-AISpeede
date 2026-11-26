@@ -906,6 +906,8 @@ pub(crate) struct HostTexture {
     #[cfg(feature = "paged-title")]
     pub(crate) candidate_guest_span: Option<(u64, u64)>,
     #[cfg(feature = "paged-title")]
+    pub(crate) began_on_private_heap: bool,
+    #[cfg(feature = "paged-title")]
     committed_linear: std::sync::OnceLock<crate::page_texture::LinearTexture>,
     #[cfg(feature = "paged-title")]
     mapped_pointers: std::sync::Mutex<MapEpoch>,
@@ -1215,6 +1217,8 @@ impl HostTexture {
             byte_exposure: 0.into(),
             #[cfg(feature = "paged-title")]
             candidate_guest_span: None,
+            #[cfg(feature = "paged-title")]
+            began_on_private_heap: false,
             #[cfg(feature = "paged-title")]
             committed_linear: std::sync::OnceLock::new(),
             #[cfg(feature = "paged-title")]
@@ -1576,7 +1580,11 @@ fn shared_texture(
     let mut texture = make_texture(&d, state, clear)?;
     // 格式代换后的宿主布局不是来宾布局。必须使用原描述计算。
     #[cfg(feature = "paged-title")]
-    { texture.candidate_guest_span = native_writer_candidate_span(address, desc); }
+    {
+        texture.candidate_guest_span = native_writer_candidate_span(address, desc);
+        texture.began_on_private_heap = texture.candidate_guest_span.is_some_and(|(start, end)|
+            crate::title_backing::is_private_heap_span(start as usize, end as usize));
+    }
     let t = std::sync::Arc::new(texture);
     if let Some(k) = key {
         if live.is_some() {
@@ -1876,6 +1884,27 @@ fn one_texel_reads_only_its_proven_bytes() {
 #[cfg(all(windows, feature = "paged-title"))]
 pub(crate) fn title_volume_shape(this: This) -> Option<(u32, u64, u32, u16, u16)> {
     texture_memory(this).map(|(_, d)| (d.layout, d.width, d.height, d.depth_or_array_size, d.mip_levels))
+}
+
+/// 地址式 2D 读取的精确布局；执行时仍需证明物理后备和写入顺序。
+#[cfg(all(windows, feature = "paged-title"))]
+pub(crate) fn address_2d_bytes(this: This) -> Option<crate::page_texture::SharedTextureBytes> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    if this.is_null() { return None; }
+    let r = resource(this);
+    let d = &r.desc;
+    if !matches!(r.backing, Backing::Address(_)) || d.dimension != 3
+        || d.depth_or_array_size != 1 || d.mip_levels != 1
+        || d.sample_count != 1 || d.sample_quality != 0
+        || d.format as i32 != DXGI_FORMAT_R32G32B32A32_FLOAT.0
+        || d.flags & 0xb != 0
+    {
+        return None;
+    }
+    let texture = texture_layout(d)?;
+    let [plane] = texture.planes.as_slice() else { return None; };
+    crate::page_texture::SharedTextureBytes::new((r.data() as u64).checked_add(plane.offset)?,
+        DXGI_FORMAT_R32G32B32A32_FLOAT, &plane.layout)
 }
 
 /// 从地址式资源的实际布局构造精确字节后备；这里不授予写入权威。

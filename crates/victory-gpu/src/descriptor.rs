@@ -471,6 +471,14 @@ impl View {
         // Pick between the canonical native image and the original linear
         // bytes at execution, after earlier resolves/uploads are ordered.
         let external_alias = copy.uses_unproven_alias_backing();
+        #[cfg(feature = "paged-title")]
+        if external_alias && !array && actual.Format == format
+            && let Some(input) = crate::resource::address_2d_bytes(resource)
+            && input.format == format
+        {
+            return Ok(TextureInput::Section2d { copy, input });
+        }
+
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
         let observed_span = copy.candidate_guest_span;
         TextureInput::native(copy.clone(), format, compatible.or(plain_linear)).or_else(|| {

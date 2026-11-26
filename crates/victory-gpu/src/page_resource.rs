@@ -120,6 +120,10 @@ pub(crate) struct ResourcePlan {
     #[cfg(feature = "paged-title")]
     snapshot: Option<crate::page_slabs::SnapshotDigests>,
     pending: BTreeMap<(usize, Option<u32>), (Arc<HostTexture>, Version)>,
+    #[cfg(feature = "paged-title")]
+    pub(crate) section_texture_read: bool,
+    #[cfg(feature = "paged-title")]
+    pub(crate) unclassified_native_write: bool,
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     trace_writers: BTreeMap<usize, Option<(u64, u64)>>,
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
@@ -270,6 +274,14 @@ impl ResourcePlan {
     }
 
     fn record_write_at(&mut self, copy: &Arc<HostTexture>, subresource: Option<u32>) -> Result<(), BatchError> {
+        #[cfg(feature = "paged-title")]
+        if !self.unclassified_native_write {
+            // 私有堆的当前有效分配不能是单独固定的 XMem section 页。
+            self.unclassified_native_write = !copy.began_on_private_heap
+                || copy.candidate_guest_span.is_none_or(|(start, end)|
+                    !crate::title_backing::is_private_heap_span(start as usize, end as usize));
+        }
+
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
         if tracing::enabled!(tracing::Level::TRACE) {
             self.trace_writers.insert(Self::key(copy), copy.candidate_guest_span);

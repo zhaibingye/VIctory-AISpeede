@@ -284,6 +284,8 @@ pub(crate) enum BatchError {
     UnsupportedDepth,
     UnsupportedBarrier,
     UnsupportedTextureMap,
+    #[cfg(feature = "paged-title")]
+    UnclassifiedSharedTextureWriter { previous_submission: bool, current_submission: bool },
     Range(u64, u64),
     NotCaptured(u64),
     Native(Error),

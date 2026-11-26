@@ -50,16 +50,16 @@ pub fn use_backing(pinner: BackingPinner, writeback: WritebackPage, read: ReadRu
     let _ = BACKING.set((pinner, writeback, read));
 }
 
-#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[cfg(feature = "paged-title")]
 static PRIVATE_HEAP_SPAN: OnceLock<fn(usize, usize) -> bool> = OnceLock::new();
 
-/// 诊断：仅识别由本运行时实际分配且仍存活的系统堆范围。
-#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+/// 仅识别由本运行时实际分配且仍存活的系统堆范围。
+#[cfg(feature = "paged-title")]
 pub fn use_private_heap_span(prove: fn(usize, usize) -> bool) {
     let _ = PRIVATE_HEAP_SPAN.set(prove);
 }
 
-#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[cfg(feature = "paged-title")]
 pub(crate) fn is_private_heap_span(start: usize, end: usize) -> bool {
     PRIVATE_HEAP_SPAN.get().is_some_and(|prove| prove(start, end))
 }
