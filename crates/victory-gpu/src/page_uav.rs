@@ -258,7 +258,7 @@ impl TextureClear {
         } else {
             resources.transition_texture(list, self.target(), wanted.0 as u32)?;
         }
-        PageBarrier::Uav.encode(list, resources)?;
+        PageBarrier::native_uav(list, self.target());
         list.keep(texture);
         let slot = descriptors.reserve_texture_uav(texture, self.view.format, self.view.selection).map_err(BatchError::Native)?;
         let cpu = host.cpu_view();
@@ -276,7 +276,7 @@ impl TextureClear {
                 cmd.ClearUnorderedAccessViewUint(gpu, cpu, texture, &self.values, &self.rects);
             }
         }
-        PageBarrier::Uav.encode(list, resources)?;
+        PageBarrier::native_uav(list, self.target());
         scope.transition(list.recording(), true);
         for &sub in subs {
             resources.record_color_write(self.target(), sub)?;

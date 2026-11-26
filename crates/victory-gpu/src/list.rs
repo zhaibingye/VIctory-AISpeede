@@ -377,7 +377,11 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             use crate::page_resource::PageBarrier;
             for b in barriers {
                 let typed = match (b.kind, b.flags) {
-                    (2, 0) => Some(PageBarrier::Uav),
+                    (2, 0) => Some(if b.first.is_null() || crate::resource::stands_in(b.first) {
+                        PageBarrier::Uav
+                    } else {
+                        crate::resource::host_copy(b.first).map_or(PageBarrier::Uav, PageBarrier::NativeUav)
+                    }),
                     (0, 0) if b.second as u32 == u32::MAX && !b.first.is_null() => {
                         if let Some(texture) = crate::resource::host_copy(b.first) {
                             Some(PageBarrier::Texture(texture, crate::host::texture_state(b.last as u32)))

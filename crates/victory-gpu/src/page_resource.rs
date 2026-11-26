@@ -250,32 +250,49 @@ pub(crate) fn collect_compatible_source(
 
 pub(crate) enum PageBarrier {
     Texture(Arc<HostTexture>, u32),
+    NativeUav(Arc<HostTexture>),
     Uav,
 }
 
 impl PageBarrier {
+    pub(crate) fn native_uav(list: &HostList, copy: &HostTexture) {
+        // A title texture may still have accesses through canonical byte
+        // pages or another native representation. A named host barrier is
+        // sufficient only when the resource identity is unambiguous.
+        let exact = !copy.has_pointer_exposure() && !copy.uses_unproven_alias_backing()
+            && copy.sparse.is_none() && !copy.twin.get().is_some_and(Option::is_some)
+            && legal_state(&copy.texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32) != 0;
+        Self::emit_uav(list, exact.then_some(&copy.texture));
+    }
+
+    fn emit_uav(list: &HostList, texture: Option<&ID3D12Resource>) {
+        if let Some(texture) = texture {
+            list.keep(texture);
+        }
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    // SAFETY: borrow the interface representation; the
+                    // barrier must not release this non-owning copy.
+                    pResource: std::mem::ManuallyDrop::new(texture.map(|resource| unsafe { std::ptr::read(resource) })),
+                }),
+            },
+        };
+        // SAFETY: the optional resource permits UAV and is retained across
+        // the real Fence. Otherwise this barrier orders any UAV resource.
+        unsafe { list.recording().ResourceBarrier(&[barrier]) };
+    }
+
     pub(crate) fn encode(
         &self, list: &HostList, resources: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
         match self {
-            Self::Texture(copy, wanted) => {
-                resources.transition_texture(list, copy, *wanted)?;
-            }
-            Self::Uav => {
-                let barrier = D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                            pResource: std::mem::ManuallyDrop::new(None),
-                        }),
-                    },
-                };
-                // SAFETY: a global ordered UAV barrier uses no pointer.
-                unsafe { list.recording().ResourceBarrier(&[barrier]) };
-            }
+            Self::Texture(copy, wanted) => resources.transition_texture(list, copy, *wanted),
+            Self::NativeUav(copy) => { Self::native_uav(list, copy); Ok(()) }
+            Self::Uav => { Self::emit_uav(list, None); Ok(()) }
         }
-        Ok(())
     }
 }
 
