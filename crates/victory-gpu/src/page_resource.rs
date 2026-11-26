@@ -236,6 +236,11 @@ impl TextureReadback {
         Some(Self { source, target })
     }
 
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn publish_mirror(&self, ranges: &[(u64, u64)], backing: &crate::title_backing::SubmissionBacking) {
+        self.source.publish_byte_mirror(ranges, backing.pins());
+    }
+
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
         ranges.extend(self.target.rows()?);
         Ok(())

@@ -341,10 +341,16 @@ impl Host {
         &self, heap: &HostHeap, source: std::sync::Arc<crate::resource::HostTexture>,
         target: crate::page_texture::LinearTexture,
     ) -> std::result::Result<(), BatchError> {
-        let readback = crate::page_resource::TextureReadback::capture(source, target)
-            .ok_or(BatchError::UnsupportedTextureMap)?;
+        let mut signal = self.direct_queue();
+        let ranges: Vec<_> = target.rows()?.collect();
+        if source.reusable_byte_mirror(&ranges) {
+            return Ok(());
+        }
+        let readback = std::sync::Arc::new(crate::page_resource::TextureReadback::capture(source, target)
+            .ok_or(BatchError::UnsupportedTextureMap)?);
         let mut backing = SubmissionBacking::default();
-        self.execute_paged_ops(heap, &mut backing, &[PageOp::ReadbackTexture(std::sync::Arc::new(readback))])?;
+        self.execute_paged_ops_locked(&mut signal, heap, &mut backing, &[PageOp::ReadbackTexture(readback.clone())])?;
+        readback.publish_mirror(&ranges, &backing);
         Ok(())
     }
 
@@ -366,10 +372,20 @@ impl Host {
         backing: &mut SubmissionBacking,
         ops: &[PageOp],
     ) -> std::result::Result<PageStats, BatchError> {
+        let mut signal = self.direct_queue();
+        self.execute_paged_ops_locked(&mut signal, heap, backing, ops)
+    }
+
+    fn execute_paged_ops_locked(
+        &self,
+        signal: &mut u64,
+        heap: &HostHeap,
+        backing: &mut SubmissionBacking,
+        ops: &[PageOp],
+    ) -> std::result::Result<PageStats, BatchError> {
         if ops.is_empty() {
             return Ok(PageStats::default());
         }
-        let mut signal = self.direct_queue();
         let mut ranges = Vec::new();
         let mut max_copy = 0;
         for op in ops {
@@ -410,7 +426,7 @@ impl Host {
             }
             (ordinary_count, visible)
         };
-        self.execute_paged_work_locked(&mut signal, heap, backing, &ranges, WriteSet::Declared, |list, _, batch, pins, descriptors, targets| {
+        let stats = self.execute_paged_work_locked(signal, heap, backing, &ranges, WriteSet::Declared, |list, _, batch, pins, descriptors, targets| {
             #[cfg(feature = "paged-title")]
             if !visible.is_empty() {
                 let mut existing = physical_footprint(pins, &ranges[..ordinary_count])?;
@@ -461,7 +477,12 @@ impl Host {
                 readback.encode(self, list, batch, targets, &mut dirty)?;
             }
             Ok(dirty)
-        })
+        })?;
+        #[cfg(feature = "paged-title")]
+        for (readback, span) in visible {
+            readback.publish_mirror(&ranges[span], backing);
+        }
+        Ok(stats)
     }
 
     fn execute_paged_work(

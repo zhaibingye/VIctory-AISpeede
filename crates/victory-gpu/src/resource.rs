@@ -817,6 +817,15 @@ struct Resource {
     host: Option<std::sync::Arc<HostTexture>>,
 }
 
+/// Recorded only after compatible bytes were merged into these identities.
+#[cfg(all(windows, feature = "paged-title"))]
+struct ByteMirror {
+    version: u64,
+    ranges: Box<[(u64, u64)]>,
+    pages: Box<[(usize, victory_memory::physical::PhysicalPage)]>,
+    _charge: victory_memory::physical::Reservation,
+}
+
 #[cfg(all(windows, feature = "paged-title"))]
 #[derive(Default)]
 struct MapEpoch {
@@ -850,6 +859,8 @@ pub(crate) struct HostTexture {
     committed_linear: std::sync::OnceLock<crate::page_texture::LinearTexture>,
     #[cfg(feature = "paged-title")]
     mapped_pointers: std::sync::Mutex<MapEpoch>,
+    #[cfg(feature = "paged-title")]
+    byte_mirror: std::sync::Mutex<Option<ByteMirror>>,
     pub(crate) native_authority: std::sync::Mutex<Option<victory_memory::authority::CompletedVersion>>,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
@@ -953,6 +964,47 @@ impl HostTexture {
     }
 
     #[cfg(feature = "paged-title")]
+    pub(crate) fn publish_byte_mirror(
+        &self, ranges: &[(u64, u64)], pins: &victory_memory::physical::BackingPins,
+    ) {
+        let Some(version) = self.completed_native_version() else { return; };
+        let mut pages = std::collections::BTreeMap::new();
+        for &(start, end) in ranges {
+            let mut page = start & !(victory_memory::PAGE_BYTES - 1);
+            while page < end {
+                let at = page as usize;
+                let Some(physical) = pins.expected(at) else { return; };
+                pages.insert(at, physical);
+                page += victory_memory::PAGE_BYTES;
+            }
+        }
+        let mut saved = self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner());
+        *saved = None;
+        let bytes = std::mem::size_of_val(ranges) as u64
+            + pages.len() as u64 * std::mem::size_of::<(usize, victory_memory::physical::PhysicalPage)>() as u64;
+        let Ok(charge) = victory_memory::physical::HostBudget::process().reserve_ram(bytes) else { return; };
+        *saved = Some(ByteMirror {
+            version, ranges: ranges.into(), pages: pages.into_iter().collect(), _charge: charge,
+        });
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn reusable_byte_mirror(&self, ranges: &[(u64, u64)]) -> bool {
+        let Some(version) = self.completed_native_version() else { return false; };
+        let mirror = self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mirror) = mirror.as_ref().filter(|m| m.version == version && m.ranges.as_ref() == ranges && !m.pages.is_empty())
+            else { return false; };
+        // Query physical identity without allocating GPU residency or
+        // reading/uploading contents from guest pages.
+        let mut probe = crate::title_backing::SubmissionBacking::default();
+        for &(start, end) in ranges {
+            probe.include(start as usize, end as usize);
+        }
+        probe.flush();
+        mirror.pages.iter().all(|&(at, id)| probe.pins().expected(at) == Some(id))
+    }
+
+    #[cfg(feature = "paged-title")]
     fn record_cpu_bytes(&self) {
         use victory_memory::{authority::{CompletedVersion, Representation, Version}, coherence::Fence};
         let mut completed = self.native_authority.lock().unwrap_or_else(|e| e.into_inner());
@@ -961,6 +1013,7 @@ impl HostTexture {
             self.byte_observation()).unwrap_or_else(|| crate::host::fail(format_args!("VNME version exhausted")));
         *completed = Some(CompletedVersion { version, fence: old.map_or(Fence(0), |v| v.fence) });
         self.host_written.store(false, std::sync::atomic::Ordering::Release);
+        self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     /// A host texture made outside the title's resources (twins).
@@ -1001,6 +1054,8 @@ impl HostTexture {
             committed_linear: std::sync::OnceLock::new(),
             #[cfg(feature = "paged-title")]
             mapped_pointers: std::sync::Mutex::default(),
+            #[cfg(feature = "paged-title")]
+            byte_mirror: std::sync::Mutex::default(),
             native_authority: std::sync::Mutex::new(None),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
