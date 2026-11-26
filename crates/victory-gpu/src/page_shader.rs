@@ -373,6 +373,20 @@ impl BoundedReads {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+impl ShaderBindings {
+    pub(crate) fn record_test_texture(&mut self, root: u8, slot: u32, input: TextureInput) {
+        self.tables.entry(root).or_default().insert(slot, ClosedView::Texture(input));
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+impl RootWords {
+    pub(crate) fn test_words(parameter: u32, words: Vec<u32>, tables: Vec<(usize, u8)>) -> Self {
+        Self { parameter, words, tables, root_srvs: Vec::new() }
+    }
+}
+
 impl ShaderBindings {
     pub(crate) fn capture(
         pipeline: &HostPipeline,

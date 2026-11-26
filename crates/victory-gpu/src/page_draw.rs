@@ -955,20 +955,32 @@ float4 pixel() : SV_Target0 {
             format: FORMAT,
         };
         if relocated {
-            draw.shader.texture_tables.entry(7).or_default().insert(3, input);
-            // An unrelocated table would read from the wrong heap slot.
-            draw.shader.constants.push(RootWords {
-                parameter: 0, words: vec![0; 4], tables: vec![(0, 7)],
-            });
+            let mut native = None;
+            // SAFETY: 测试创建独立、未初始化的一像素纹理作为线性源的身份。
+            unsafe {
+                device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 1, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+                        Format: FORMAT, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON, None, &mut native,
+                ).unwrap();
+            }
+            let copy = Arc::new(HostTexture::new(native.unwrap(), 0, Vec::new()));
+            draw.shader.record_test_texture(7, 3, crate::page_texture::TextureInput::Linear { copy, input });
+            // 未重定位的表会读取错误的描述符槽位。
+            draw.shader.constants.push(RootWords::test_words(0, vec![0; 4], vec![(0, 7)]));
         } else {
             draw.sample = Some(SampledTexture { root: 0, input });
         }
     } else {
-        draw.shader.constants.push(RootWords {
-            parameter: 0,
-            words: [0.0f32, 1.0, 0.0, 1.0].into_iter().map(f32::to_bits).collect(),
-            tables: Vec::new(),
-        });
+        draw.shader.constants.push(RootWords::test_words(
+            0, [0.0f32, 1.0, 0.0, 1.0].into_iter().map(f32::to_bits).collect(), Vec::new(),
+        ));
     }
     title.record_page_draw(draw);
     title.close();
