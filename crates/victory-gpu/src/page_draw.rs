@@ -152,12 +152,12 @@ impl ColorClear {
         unsafe {
             let cmd = list.recording();
             if before != after {
-                cmd.ResourceBarrier(&[transition(texture, before, after)]);
+                cmd.ResourceBarrier(&[self.target.sub.temporary_transition(texture, before, after)]);
             }
             let rects = (!self.rects.is_empty()).then_some(self.rects.as_slice());
             cmd.ClearRenderTargetView(rtv, &self.color, rects);
             if before != after {
-                cmd.ResourceBarrier(&[transition(texture, after, before)]);
+                cmd.ResourceBarrier(&[self.target.sub.temporary_transition(texture, after, before)]);
             }
         }
         initialized.record_color_write(&self.target.copy, self.target.sub)?;
@@ -468,7 +468,7 @@ impl ClosedDraw {
             // changes to global state if a later operation rejects it.
             for (target, before) in self.targets.iter().zip(states) {
                 if before != render_target {
-                    cmd.ResourceBarrier(&[transition(&target.copy.texture, before, render_target)]);
+                    cmd.ResourceBarrier(&[target.sub.temporary_transition(&target.copy.texture, before, render_target)]);
                 }
             }
             cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
@@ -500,7 +500,7 @@ impl ClosedDraw {
             }
             for (target, before) in self.targets.iter().zip(states) {
                 if before != render_target {
-                    cmd.ResourceBarrier(&[transition(&target.copy.texture, render_target, before)]);
+                    cmd.ResourceBarrier(&[target.sub.temporary_transition(&target.copy.texture, render_target, before)]);
                 }
             }
         }

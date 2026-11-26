@@ -257,8 +257,8 @@ impl PageBarrier {
     }
 }
 
-/// Plane zero of an exact 2D color texture. State transitions remain
-/// whole-resource for now, but byte authority is scoped to the copy.
+/// Plane zero of an exact 2D color texture. Byte authority is scoped;
+/// an operation may also borrow the exact native subresource state.
 #[derive(Clone, Copy)]
 pub(crate) struct ColorSubresource {
     pub(crate) index: u32,
@@ -297,6 +297,16 @@ impl ColorSubresource {
     }
 
     fn authority(self) -> Option<u32> { self.scoped.then_some(self.index) }
+
+    /// Paired barriers only: the planner's persistent baseline is still
+    /// whole-resource, so callers must restore it in the same recording.
+    pub(crate) fn temporary_transition(
+        self, resource: &ID3D12Resource,
+        before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES,
+    ) -> D3D12_RESOURCE_BARRIER {
+        let index = self.authority().unwrap_or(D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+        crate::host::transition_subresource(resource, index, before, after)
+    }
 
     pub(crate) fn allows(self, copy: &HostTexture) -> bool {
         !self.scoped || (!copy.uses_unproven_alias_backing() && !copy.has_pointer_exposure())
@@ -432,9 +442,30 @@ impl TextureReadback {
             return Err(BatchError::TargetNotInitialized);
         }
         let before = plan.state(&self.source);
-        plan.transition_texture(list, &self.source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)?;
-        self.target.copy_from_subresource(host, list, batch, &self.source.texture, self.sub.index, dirty)?;
-        plan.transition_texture(list, &self.source, before.0 as u32)
+        let needed = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let texture = &self.source.texture;
+        if !self.sub.scoped {
+            plan.transition_texture(list, &self.source, needed.0 as u32)?;
+            self.target.copy_from_subresource(host, list, batch, texture, self.sub.index, dirty)?;
+            return plan.transition_texture(list, &self.source, before.0 as u32);
+        }
+        if self.source.twin.get().is_some_and(Option::is_some)
+            || legal_state(texture, needed.0 as u32) != needed.0 as u32
+        {
+            return Err(BatchError::UnsupportedBarrier);
+        }
+        list.keep(texture);
+        if before != needed {
+            // SAFETY: the exact source is retained and the ordered plan
+            // supplies its state before this temporary scope.
+            unsafe { list.recording().ResourceBarrier(&[self.sub.temporary_transition(texture, before, needed)]) };
+        }
+        self.target.copy_from_subresource(host, list, batch, texture, self.sub.index, dirty)?;
+        if before != needed {
+            // SAFETY: the copy leaves the selected subresource in COPY_SOURCE.
+            unsafe { list.recording().ResourceBarrier(&[self.sub.temporary_transition(texture, needed, before)]) };
+        }
+        Ok(())
     }
 }
 
