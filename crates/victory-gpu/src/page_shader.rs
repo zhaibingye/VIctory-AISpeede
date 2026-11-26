@@ -286,6 +286,7 @@ pub(crate) struct ShaderBindings {
 
 enum ClosedView {
     Texture(TextureInput),
+    NullTexture(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, crate::page_texture::TextureSelection),
     TextureUav(crate::page_uav::ShaderTextureUav),
     Raw(BoundedBufferView),
     TableConstant(BoundedBufferView),
@@ -495,13 +496,18 @@ impl ShaderBindings {
                     if let std::collections::btree_map::Entry::Vacant(e) = table.entry(slot.index) {
                         let actual = view(slot.root, slot.index).ok_or(reason(DescriptorSlotReason::UnboundOrStale))?;
                         let bound = match proof.access {
-                            StaticViewAccess::TextureRead { array } => ClosedView::Texture(
-                                actual.paged_texture_srv(array).ok_or_else(|| {
-                                    let (kind, title_format, view_format, view_dimension) = actual.texture_srv_metadata();
-                                    reason(DescriptorSlotReason::UnsupportedTexture {
-                                        array, kind, title_format, view_format, view_dimension,
-                                    })
-                                })?),
+                            StaticViewAccess::TextureRead { array } => {
+                                if let Some((format, selection)) = actual.paged_null_texture_srv(array) {
+                                    ClosedView::NullTexture(format, selection)
+                                } else {
+                                    ClosedView::Texture(actual.paged_texture_srv(array).ok_or_else(|| {
+                                        let (kind, title_format, view_format, view_dimension) = actual.texture_srv_metadata();
+                                        reason(DescriptorSlotReason::UnsupportedTexture {
+                                            array, kind, title_format, view_format, view_dimension,
+                                        })
+                                    })?)
+                                }
+                            }
                             StaticViewAccess::TextureWrite { .. } if pipeline.compute => {
                                 ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).ok_or_else(|| {
                                     let (title_format, view_format, view_dimension) = crate::descriptor::host::paged_uav_format(&actual);
@@ -543,6 +549,8 @@ impl ShaderBindings {
                     match (table.get_mut(&slot.index), proof.access) {
                         (Some(ClosedView::Texture(texture)), StaticViewAccess::TextureRead { array })
                             if texture.selection().slices.is_some() == array => {},
+                        (Some(ClosedView::NullTexture(_, selection)), StaticViewAccess::TextureRead { array })
+                            if selection.slices.is_some() == array => {},
                         (Some(ClosedView::TextureUav(view)), StaticViewAccess::TextureWrite { x, y, z }) => {
                             if !view.allows(x, y, z) {
                                 return Err(reason(DescriptorSlotReason::TextureWriteRange {
@@ -605,7 +613,7 @@ impl ShaderBindings {
                 match view {
                     ClosedView::Texture(texture) => texture.ranges(ranges)?,
                     // The queue footprint records writable native textures separately.
-                    ClosedView::TextureUav(_) => {},
+                    ClosedView::TextureUav(_) | ClosedView::NullTexture(..) => {},
                     ClosedView::Raw(raw) | ClosedView::TableConstant(raw) | ClosedView::Structured(raw, _) => ranges.push(raw.range()),
                 }
             }
@@ -729,6 +737,7 @@ impl ShaderBindings {
                             shared.then_some(&mut shared_access))?;
                         TableDescriptor::Texture(resource, format, texture.selection())
                     }
+                    ClosedView::NullTexture(format, selection) => TableDescriptor::NullTexture(*format, *selection),
                     ClosedView::TextureUav(view) => {
                         let shared = shared_uavs.iter().any(|target| target.texture == view.target().texture);
                         view.prepare(host, list, batch, plan, shared.then_some(&mut shared_access))?

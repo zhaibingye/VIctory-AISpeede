@@ -582,6 +582,7 @@ pub(crate) struct PageDescriptors<'a> {
 
 pub(crate) enum TableDescriptor {
     Texture(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, crate::page_texture::TextureSelection),
+    NullTexture(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, crate::page_texture::TextureSelection),
     TextureUav(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, crate::page_uav::TextureUavSelection),
     Raw(ID3D12Resource, u64, u64, bool),
     Structured(ID3D12Resource, u64, u32, u32, bool),
@@ -629,6 +630,7 @@ impl PageDescriptors<'_> {
                 _ => {
                     let (resource, format, selection) = match view {
                         Some(TableDescriptor::Texture(tex, format, selection)) => (Some(tex), *format, *selection),
+                        Some(TableDescriptor::NullTexture(format, selection)) => (None, *format, *selection),
                         _ => (None, DXGI_FORMAT_R8G8B8A8_UNORM, crate::page_texture::TextureSelection::SINGLE),
                     };
                     self.heap.paged_texture_at(slot, resource, format, selection);

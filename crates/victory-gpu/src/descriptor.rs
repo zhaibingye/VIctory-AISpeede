@@ -449,6 +449,28 @@ impl View {
         })
     }
 
+    /// 仅游戏显式绑定的带类型空 SRV 才可生成宿主空视图，绝不替代真实纹理。
+    #[cfg(windows)]
+    pub(crate) fn paged_null_texture_srv(&self, array: bool) -> Option<(
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        crate::page_texture::TextureSelection,
+    )> {
+        use windows::Win32::Graphics::Direct3D12::{D3D12_REQ_MIP_LEVELS, D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION};
+        let Self::Shader(0, Some(words)) = self else { return None; };
+        let (format, selection) = host::paged_2d_srv(words)?;
+        let within = |s: crate::page_texture::MipSelection, limit| {
+            s.count > 0 && s.first.checked_add(s.count).is_some_and(|end| end <= limit)
+        };
+        if !crate::page_texture::sample_color(format)
+            || array != selection.slices.is_some()
+            || !within(selection.mips, D3D12_REQ_MIP_LEVELS)
+            || selection.slices.is_some_and(|s| !within(s, D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION))
+        {
+            return None;
+        }
+        Some((format, selection))
+    }
+
     /// 只记录可用于区分空、放置式、直接资源及其他类型的格式信息，省略地址和内容。
     #[cfg(windows)]
     pub(crate) fn texture_srv_metadata(&self) -> (&'static str, Option<u32>, Option<u32>, Option<u32>) {
