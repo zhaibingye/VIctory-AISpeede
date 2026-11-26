@@ -452,6 +452,10 @@ impl ClosedFootprint {
             }
             (ordinary_count, preserved, visible)
         };
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if tracing::enabled!(tracing::Level::TRACE) {
+            trace_native_writer_backing(ops);
+        }
         Ok(Self {
             ranges, max_copy,
             #[cfg(feature = "paged-title")]
@@ -461,6 +465,35 @@ impl ClosedFootprint {
             #[cfg(feature = "paged-title")]
             visible,
         })
+    }
+}
+
+/// 捕获候选写者的物理页，但不把这些页上传给 GPU 或发布为完成的写入。
+/// 这里的计数只用于确定下一步使用哪个同步策略。
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+fn trace_native_writer_backing(ops: &[PageOp]) {
+    let mut targets = Vec::new();
+    for op in ops { op.writes_native(&mut targets); }
+    targets.sort_unstable_by_key(|copy| std::sync::Arc::as_ptr(copy));
+    targets.dedup_by_key(|copy| std::sync::Arc::as_ptr(copy));
+    let mut backing = SubmissionBacking::default();
+    for span in targets.iter().filter_map(|copy| copy.candidate_guest_span) {
+        backing.include(span.0 as usize, span.1 as usize);
+    }
+    backing.flush();
+    let mut identified = 0;
+    let mut missing_layout = 0;
+    let mut incomplete_pins = 0;
+    for copy in targets {
+        match copy.candidate_guest_span {
+            None => missing_layout += 1,
+            Some((start, end)) if backing.pins().physical_runs(start as usize, end as usize).is_some() =>
+                identified += 1,
+            Some(_) => incomplete_pins += 1,
+        }
+    }
+    if identified + missing_layout + incomplete_pins != 0 {
+        tracing::trace!(identified, missing_layout, incomplete_pins, "原生纹理写者的物理范围盘点");
     }
 }
 

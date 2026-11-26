@@ -294,7 +294,52 @@ impl BackingPins {
         (limit, None)
     }
 
+    /// 以固定的物理页覆盖半开区间。任何空洞都会使证明失败；不退回虚拟地址。
+    /// 返回连续物理区间的起点和页数，不分配每页一个条目。
+    pub fn physical_runs(&self, start: usize, end: usize) -> Option<Vec<(PhysicalPage, usize)>> {
+        const PAGE: usize = PAGE_BYTES as usize;
+        if start >= end { return None; }
+        let mut at = start & !(PAGE - 1);
+        let end = end.checked_next_multiple_of(PAGE)?;
+        let mut runs = Vec::<(PhysicalPage, usize)>::new();
+        while at < end {
+            let (to, first) = self.run_at(at, end);
+            let first = first?;
+            let count = (to - at) / PAGE;
+            if count == 0 { return None; }
+            if let Some((previous, len)) = runs.last_mut()
+                && first.offset_from(*previous) == Some(*len)
+            {
+                *len += count;
+            } else {
+                runs.push((first, count));
+            }
+            at = to;
+        }
+        Some(runs)
+    }
+
     pub fn expected(&self, address: usize) -> Option<PhysicalPage> {
         self.run_at(address, usize::MAX).1
     }
+}
+
+
+#[cfg(test)]
+#[test]
+fn physical_runs_keep_first_backing_and_never_fill_a_hole() {
+    let page = PAGE_BYTES as usize;
+    let first = PageNumbers::default().allocate(12).unwrap();
+    let mut pins = BackingPins::default();
+    pins.remember(page, page * 2, Some(first));
+    pins.remember(page * 2, page * 3, Some(first.offset(1)));
+    pins.remember(page * 3, page * 4, Some(first.offset(8)));
+    pins.remember(page * 4, page * 5, Some(first.offset(1)));
+    pins.remember(page * 2, page * 3, Some(first.offset(10)));
+    assert_eq!(pins.physical_runs(page + 7, page * 2 + 8), Some(vec![(first, 2)]));
+    assert_eq!(pins.physical_runs(page * 2 + 1, page * 4 + 7), Some(vec![
+        (first.offset(1), 1), (first.offset(8), 1), (first.offset(1), 1),
+    ]));
+    assert_eq!(pins.physical_runs(page * 4, page * 5 + 1), None);
+    assert_eq!(pins.physical_runs(page, page), None);
 }
