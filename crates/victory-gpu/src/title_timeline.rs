@@ -38,7 +38,7 @@ impl Job {
                 Self::Execute { host: h, heap: d, batches: next } =>
                     std::ptr::eq(*host, *h) && std::ptr::eq(*heap, *d)
                     && commands.saturating_add(next[0].len()) <= 64
-                    && next[0].page_free_candidate() && batches[0].page_free_candidate(),
+                    && next[0].native_window_candidate() && batches[0].native_window_candidate(),
                 Self::Boundary(_) => false,
             });
             let Some(Self::Execute { batches: next, .. }) = next else { break; };

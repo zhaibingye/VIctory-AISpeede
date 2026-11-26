@@ -119,22 +119,13 @@ impl ClosedTitleBatch {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn page_free_candidate(&self) -> bool {
-        // This is a scheduler hint only. Exposure and compatible byte
-        // authority can change before we take the direct-queue lock.
-        let mut outputs = Vec::new();
-        for op in &self.0 {
-            if !matches!(op,
-                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_) | PageOp::Barrier(_)
-                | PageOp::CopyTexture(_) | PageOp::Draw(_))
-            {
-                return false;
-            }
-            op.writes_native(&mut outputs);
-        }
-        // Don't reserve a multi-submit group for resources that may gain
-        // a CPU-visible obligation even when none was observed at capture.
-        !outputs.iter().any(|target| target.may_require_byte_publication())
+    pub(crate) fn native_window_candidate(&self) -> bool {
+        // A cheap scheduler hint. The footprint is resolved only under
+        // the direct queue lock, which also orders pointer publication.
+        self.0.iter().all(|op| matches!(op,
+            PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
+            | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Draw(_)
+            | PageOp::Dispatch(_)))
     }
 
     #[cfg(feature = "paged-title")]
@@ -142,18 +133,10 @@ impl ClosedTitleBatch {
         host: &Host, heap: &HostHeap, batches: Vec<Self>,
     ) -> std::result::Result<(), BatchError> {
         let mut signal = host.direct_queue();
-        // A scheduler hint may have become stale while waiting for the
-        // direct queue. Recheck before erasing submission boundaries.
-        if batches.len() > 1 && batches.iter().all(Self::page_free_candidate) {
-            // Hold the queue lock for the entire native-only window.
-            // Each original batch must have an empty guest footprint.
-            if batches.iter().all(|batch| {
-                ClosedFootprint::capture(&batch.0).is_ok_and(|plan| plan.is_page_free())
-            }) {
-                return host.execute_page_free_window(&mut signal, heap, batches);
-            }
+        if batches.len() > 1 {
+            return host.execute_native_window(&mut signal, heap, batches);
         }
-        for batch in batches {
+        if let Some(batch) = batches.into_iter().next() {
             let mut backing = SubmissionBacking::default();
             host.execute_paged_ops_locked(&mut signal, heap, &mut backing, &batch.0)?;
         }
@@ -646,20 +629,34 @@ impl Host {
     }
 
     #[cfg(feature = "paged-title")]
-    fn execute_page_free_window(
+    fn execute_native_window(
         &self, signal: &mut u64, heap: &HostHeap, batches: Vec<ClosedTitleBatch>,
     ) -> std::result::Result<(), BatchError> {
         use crate::page_resource::{ResourcePlan, SubmittedTail};
 
         let mut tail = SubmittedTail::default();
-        let mut backing = SubmissionBacking::default();
-        let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
+        let mut empty_backing = SubmissionBacking::default();
         let mut in_flight = Vec::with_capacity(batches.len());
         let enqueue = (|| {
             for ops in batches.into_iter().map(|batch| batch.0).filter(|ops| !ops.is_empty()) {
-                let batch = PinnedBatch::capture(self, &mut slabs, &mut backing, &[])?;
+                let mut footprint = ClosedFootprint::capture(&ops)?;
+                if !footprint.is_page_free() {
+                    // Any guest bytes are an execution boundary. Publish
+                    // earlier work before reading current authority or
+                    // taking a new CPU snapshot of those physical pages.
+                    if !in_flight.is_empty() {
+                        self.drain_native_window(signal, &empty_backing, &mut in_flight);
+                        tail = SubmittedTail::default();
+                        footprint = ClosedFootprint::capture(&ops)?;
+                    }
+                    let mut backing = SubmissionBacking::default();
+                    self.execute_paged_plan_locked(signal, heap, &mut backing, &ops, footprint)?;
+                    continue;
+                }
+                let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
+                let batch = PinnedBatch::capture(self, &mut slabs, &mut empty_backing, &[])?;
                 let render = submit_work(
-                    self, signal, heap, &backing, &batch, WriteSet::Declared, ResourcePlan::after(&tail),
+                    self, signal, heap, &empty_backing, &batch, WriteSet::Declared, ResourcePlan::after(&tail),
                     |list, _, batch, pins, descriptors, targets| {
                         let dirty = self.encode_closed_ops(list, batch, pins, descriptors, targets, &ops, 0)?;
                         if !dirty.is_empty() {
@@ -681,12 +678,22 @@ impl Host {
             }
             Ok(())
         })();
-        // Always retire what actually reached the GPU, including on a
-        // later recording error. Guest fence/present boundaries follow.
-        for work in in_flight {
-            work.retire(self, signal, &backing, &mut slabs);
-        }
+        // Always retire submitted GPU work, even on a later recording
+        // error. The logical fence and present boundaries come afterward.
+        self.drain_native_window(signal, &empty_backing, &mut in_flight);
         enqueue
+    }
+
+    #[cfg(feature = "paged-title")]
+    fn drain_native_window(
+        &self, signal: &mut u64, backing: &SubmissionBacking, in_flight: &mut Vec<InFlightPages<'_>>,
+    ) {
+        if !in_flight.is_empty() {
+            let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
+            for work in in_flight.drain(..) {
+                work.retire(self, signal, backing, &mut slabs);
+            }
+        }
     }
 
     fn execute_paged_work(

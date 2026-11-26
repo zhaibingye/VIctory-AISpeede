@@ -899,11 +899,6 @@ impl HostTexture {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn may_require_byte_publication(&self) -> bool {
-        self.committed_linear.get().is_some()
-    }
-
-    #[cfg(feature = "paged-title")]
     pub(crate) fn compatible_texture_source(&self) -> Option<crate::page_texture::LinearTexture> {
         use victory_memory::authority::Representation;
         let value = self.native_authority.lock().unwrap_or_else(|e| e.into_inner());
