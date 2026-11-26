@@ -1,69 +1,45 @@
-# Series S memory
+# Series S 内存说明
 
-AISpeede has one guest profile: Series S. The hardware has **10 GiB shared
-by the title and system**. Keep reporting the existing **7,776 MiB retail
-title allowance** to game code; raising that allowance to 10 GiB is not
-memory optimization.
+AISpeede 只提供 Series S 配置。主机上有 **10 GiB** 的游戏和系统共享内存；
+VIctory 仍向游戏报告现有的 **7,776 MiB** 标题额度。提高游戏看到的额度并不能降低内存占用。
 
-The host target on a discrete GPU is **10 GiB extra physical system RAM
-and at most 5 GiB of dedicated VRAM**, independently. The first backs
-title memory; VRAM is reserved for GPU-native resources and not exposed
-as extra memory to the title. Neither is preallocated. The 15 GiB sum
-is a secondary check. Windows can migrate allocations and the driver
-and other processes are outside the allocator's control.
+对使用独立显卡的宿主，目标是分开管理 **10 GiB 系统内存**及**最多 5 GiB 本地显存**。
+系统内存为游戏数据提供后备空间，显存用于原生 GPU 资源，不作为游戏可见的额外内存。
+两者不预分配。合计 15 GiB 只用于辅助核对；Windows 可以迁移资源，驱动和其他进程的开销
+不受项目账本控制。
 
-The GPU resource allocator uses the lower of the current dedicated DXGI
-budget and 5 GiB, leaving 384 MiB for costs outside its ledger. It admits
-committed textures, sparse texture pages, depth twins and certain
-GPU-only temporary buffers on the local segment only while budget remains.
-It asks for a non-local GPU-accessible allocation otherwise. Non-local
-allocations cost physical RAM and can be slower; no resource is discarded
-just to pass the local budget check. The retained charge follows the D3D12
-object even when a title object has been released but a descriptor or GPU
-list still holds it. This is a managed allocation limit, not a guarantee
-about the driver's total dedicated usage. The RAM figure is a target,
-not a hard cap on the entire Windows process.
+GPU 资源分配器采用 DXGI 当前专用显存预算与 5 GiB 中的较小值，为账本外的开销保留
+384 MiB。预算内可接纳已提交纹理、稀疏纹理页、可写深度副本及部分 GPU 临时缓冲。
+本地预算不足时，尝试分配非本地但 GPU 可访问的内存。这类分配计入系统内存且可能更慢；
+不会仅为了满足预算而丢弃仍需保留的资源。受管内存占用跟随 D3D12 资源的生命周期，
+即使游戏对象已释放，只要描述符或在途命令还在引用它，记账就不会提前结束。
 
-The monitor samples physical system memory against a baseline before
-loading the title and queries local DXGI usage and budget. Shared GPU
-memory is not counted again. Other processes affect the RAM estimate and
-peaks between samples can be missed. No combined estimate is emitted on
-an integrated GPU.
+监控以加载游戏前的系统内存作为基线，并查询 DXGI 的本地用量和预算。不会再次把共享
+GPU 内存加进合计。其他进程可能影响系统内存估算，采样之间的峰值也可能遗漏。
+集成显卡不报告系统内存和显存的合计估算。
 
-The three small idle caches (upload chunks, snapshots, CPU texture
-scratch) retain at most 256 MiB in total with plenty of headroom. At
-3 GiB available RAM they reduce to a quarter of that, and keep nothing at
-2 GiB available RAM or when the observed system/path target is exceeded.
-One-shot bindless texture uploads allocate only for changed content, then
-release the reordered upload bytes after the GPU fence. A replayable
-command list still pins its upload address until reset; the host texture
-and the original guest data remain intact in both cases.
+## 既有路径的缓存和直接映射
 
-## Experimental direct mapping
+上传块、快照和 CPU 纹理临时区三种空闲缓存，在系统内存充足时合计保留不超过 256 MiB。
+可用内存降至 3 GiB 时，保留量缩为四分之一；降至 2 GiB 或达到相关路径的内存目标时，
+不保留空闲缓存。一次性无绑定纹理上传只为变动数据分配临时空间，在 GPU Fence 完成后
+释放重排字节。可重复执行的命令列表会将上传地址固定到列表重置为止。
 
-Set `VICTORY_IN_PLACE=1` to try opening selected guest ranges directly
-instead of allocating a shadow for them. The driver must support D3D12
-subrange heaps. No whole-allocation fallback: rejected, oversized,
-or low-headroom ranges retain the existing copy path. Limit mappings to
-16 MiB each and 512 MiB of live mappings, with reservations held until the
-last list or view releases the backing. The mapped count measures ranges
-shared by CPU and GPU, not additional physical memory.
+`VICTORY_IN_PLACE=1` 尝试让符合条件的游戏地址直接共享给 GPU，而非另建影子缓冲。
+需要驱动支持 D3D12 子区间堆。单处映射至多 16 MiB，同时存活的映射至多 512 MiB；
+预算会保留到最后一个命令列表或视图释放。拒绝、超限或预算不足时，不会扩大到整个
+分配，而是保持既有复制路径。映射大小指 CPU 与 GPU 共享的范围，不是额外物理占用。
 
-This is opt-in. In particular, a GPU write made directly into shared pages
-cannot be intercepted and withheld like a write made into a shadow, so the
-default path remains preferable if rendering regresses. Unset the variable
-to return to it. Neither path has been verified to stay under 15 GiB.
+此功能为显式开启。GPU 直接写共享页时，不能像写影子缓冲那样延迟公开结果。
+若出现渲染异常，可取消设置这一变量。既有路径和直接映射尚未全面实机验证 15 GiB 目标。
 
-## VNME submission counters
+## VNME 提交计数器
 
-A build with the experimental `paged-title` feature can log one line per
-retired native submission with `VICTORY_VNME_TIMING=1`. The
-`victory_gpu::vnme_timing` target reports CPU command encoding/enqueue/wait
-and retirement time, whether the submission used the overlap window,
-transferred canonical page bytes, and current RAM/local VRAM ledger use.
+启用 `paged-title` 构建功能时，通过 `VICTORY_VNME_TIMING=1` 可逐条记录完成的
+原生命令提交。日志目标为 `victory_gpu::vnme_timing`，包含 CPU 编码、入队、
+等待和收尾时间、是否进入异步重叠窗口、实际传输的受管物理页字节数，以及系统
+内存与本地显存账本的采样值。默认关闭。
 
-CPU wait is not GPU time or frame time. Retirement can include an extra
-readback fence for low-level bitmap-tracked diagnostics. Page bytes exclude native texture
-transfers and descriptor/scratch traffic. Ledger samples are managed
-allocation readings at retirement, not process/driver usage or global peaks.
-The option is off by default.
+CPU 等待时间不等于 GPU 时间或帧时间。低层位图跟踪诊断可能在收尾时额外等待一次回读
+Fence。分页字节数不包含原生纹理传输、描述符和临时区。内存数字是提交完成时的受管分配
+采样，不是 Windows 或驱动的总用量，也不是全程峰值。
