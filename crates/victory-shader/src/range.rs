@@ -202,6 +202,11 @@ impl<'a> Ranges<'a> {
     }
 
     /// The largest unsigned value `v` takes in any lane that defines it.
+    pub(crate) fn unsigned_upper_bound(&mut self, value: Value) -> Option<u32> {
+        let hi = self.hi(value);
+        (hi != u32::MAX).then_some(hi)
+    }
+
     fn hi(&mut self, v: Value) -> u32 {
         if let Some(&h) = self.memo.get(&v) {
             return h;

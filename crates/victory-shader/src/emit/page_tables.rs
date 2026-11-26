@@ -22,6 +22,7 @@ pub enum StaticViewAccess {
     /// A statically bounded aligned byte window on a raw UAV, as used by DXIL.
     RawUav { offset: u32, bytes: u32, write: bool },
     RawSrv { offset: u32, bytes: u32 },
+    StructuredSrv { stride: u32, elements: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,9 +73,11 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
         let access = if matches!(inst.fields, Fields::Image { dim: 1, .. })
             && (name.starts_with("image_sample") || matches!(name, "image_load" | "image_load_mip"))
         {
-            StaticViewAccess::TextureRead
-        } else if let Some(access) = bounded_raw_access(inst, &mut bounds) {
+            AccessProof::Native(StaticViewAccess::TextureRead)
+        } else if let Some(access) = bounded_structured_read(inst, &mut bounds) {
             access
+        } else if let Some(access) = bounded_raw_access(inst, &mut bounds) {
+            AccessProof::Native(access)
         } else {
             return Ok(None);
         };
@@ -162,6 +165,35 @@ fn bounded_raw_access(inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<
         .then_some(StaticViewAccess::RawUav { offset, bytes: span, write })
 }
 
+enum AccessProof {
+    Native(StaticViewAccess),
+    StructuredRead { elements: u32, last_byte: u32 },
+}
+
+fn bounded_structured_read(
+    inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>,
+) -> Option<AccessProof> {
+    let bytes = match inst.name() {
+        "buffer_load_dword" => 4,
+        "buffer_load_dwordx2" => 8,
+        "buffer_load_dwordx3" => 12,
+        "buffer_load_dwordx4" => 16,
+        _ => return None,
+    };
+    let Fields::Buffer {
+        addr: Operand::Vector { reg, .. }, offset, soffset,
+        idxen: true, offen: false, format: None, lds: false, tfe: false, ..
+    } = &inst.fields else { return None; };
+    if !offset.is_multiple_of(4) || !matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128)) {
+        return None;
+    }
+    let max_index = bounds.unsigned_upper_bound(inst.read(crate::ir::Reg::V(*reg))?)?;
+    Some(AccessProof::StructuredRead {
+        elements: max_index.checked_add(1)?,
+        last_byte: u32::from(*offset).checked_add(bytes)?,
+    })
+}
+
 fn table_slot(address: Address, first: u8) -> Option<u32> {
     if address.dynamic.is_some() {
         return None;
@@ -177,7 +209,7 @@ fn table_slot(address: Address, first: u8) -> Option<u32> {
 }
 
 fn proven_slot(
-    native: &NativeProgram, address: Address, first: u8, access: StaticViewAccess,
+    native: &NativeProgram, address: Address, first: u8, proof: AccessProof,
 ) -> Option<StaticViewSlot> {
     let param = native.layout.get(address.param)?;
     let index = table_slot(address, first)?;
@@ -196,14 +228,21 @@ fn proven_slot(
     }
     let unique = || relevant.clone()
         .filter(|u| u.table_offset_dwords == used.table_offset_dwords).count() == 1;
-    let access = match access {
-        StaticViewAccess::TextureRead if used.kind == ResourceType::Srv && used.dwords == 8 => access,
-        StaticViewAccess::RawUav { offset, bytes, write: false }
+    let access = match proof {
+        AccessProof::StructuredRead { elements, last_byte }
+            if unique() && used.kind == ResourceType::Srv && used.dwords == 4
+                && (4..=2048).contains(&used.stride) && used.stride.is_multiple_of(4)
+                && last_byte <= used.stride && elements.checked_mul(used.stride)? <= 65536 =>
+        {
+            StaticViewAccess::StructuredSrv { stride: used.stride, elements }
+        }
+        AccessProof::Native(access @ StaticViewAccess::TextureRead) if used.kind == ResourceType::Srv && used.dwords == 8 => access,
+        AccessProof::Native(StaticViewAccess::RawUav { offset, bytes, write: false })
             if used.kind == ResourceType::Srv && used.dwords == 4 && used.stride == 0 && unique() =>
         {
             StaticViewAccess::RawSrv { offset, bytes }
         }
-        StaticViewAccess::RawUav { .. }
+        AccessProof::Native(access @ StaticViewAccess::RawUav { .. })
             if used.kind == ResourceType::Uav && used.dwords == 4 && used.stride == 0 && unique() => access,
         _ => return None,
     };

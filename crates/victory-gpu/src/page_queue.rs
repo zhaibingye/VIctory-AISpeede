@@ -341,11 +341,13 @@ pub(crate) struct PageDescriptors<'a> {
     slots: Vec<u32>,
     textures: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>,
     raw_views: Vec<(u32, bool)>,
+    structured_views: Vec<(u32, u32)>,
 }
 
 pub(crate) enum TableDescriptor {
     Texture(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT),
     Raw(ID3D12Resource, u64, u64, bool),
+    Structured(ID3D12Resource, u64, u32, u32),
 }
 
 impl PageDescriptors<'_> {
@@ -375,6 +377,10 @@ impl PageDescriptors<'_> {
             use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
             let slot = first + offset as u32;
             match view {
+                Some(TableDescriptor::Structured(buffer, at, elements, stride)) => {
+                    self.heap.paged_structured_at(slot, Some(buffer), *at, *elements, *stride);
+                    self.structured_views.push((slot, *stride));
+                }
                 Some(TableDescriptor::Raw(buffer, at, len, unordered)) => {
                     self.heap.raw_view_at(slot, Some(buffer), *at, *len, *unordered);
                     self.raw_views.push((slot, *unordered));
@@ -406,6 +412,10 @@ impl PageDescriptors<'_> {
 
 impl Drop for PageDescriptors<'_> {
     fn drop(&mut self) {
+        for (slot, stride) in self.structured_views.drain(..) {
+            self.heap.paged_structured_at(slot, None, 0, 1, stride);
+            self.heap.release(slot, 1);
+        }
         for (slot, unordered) in self.raw_views.drain(..) {
             self.heap.raw_view_at(slot, None, 0, 0, unordered);
             self.heap.release(slot, 1);
@@ -729,6 +739,7 @@ fn submit_work<'a>(
         slots: Vec::new(),
         textures: Vec::new(),
         raw_views: Vec::new(),
+        structured_views: Vec::new(),
     };
     let reusable = matches!(writes, WriteSet::Declared);
     let list = if reusable { host.acquire_paged_list() } else { host.new_list() }.map_err(native)?;

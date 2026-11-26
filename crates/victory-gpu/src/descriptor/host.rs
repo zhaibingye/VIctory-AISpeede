@@ -700,6 +700,29 @@ impl HostHeap {
         self.keep(index, texture.map(|t| (t.clone(), None)));
     }
 
+    /// Installs a bounded structured buffer SRV in a dynamic table slot.
+    pub(crate) fn paged_structured_at(
+        &self, index: u32, resource: Option<&ID3D12Resource>, offset: u64, elements: u32, stride: u32,
+    ) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / u64::from(stride),
+                    NumElements: elements,
+                    StructureByteStride: stride,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        };
+        // SAFETY: reserved slot and a retained buffer or typed null view.
+        unsafe { host.device.CreateShaderResourceView(resource, Some(&desc), self.cpu(index)) };
+        self.keep(index, resource.map(|buffer| (buffer.clone(), None)));
+    }
+
     /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
     /// resource view and a raw unordered access view of the first `bytes`
     /// (a multiple of 4) of `buffer`, which they hold; null views for no
@@ -929,7 +952,7 @@ pub(crate) fn paged_raw_srv_range(view: &View) -> Option<(u64, u64)> {
     if raw.Flags != D3D12_BUFFER_SRV_FLAG_RAW || raw.StructureByteStride != 0 {
         return None;
     }
-    checked_raw_buffer(*resource, raw.FirstElement, raw.NumElements)
+    checked_buffer_view(*resource, raw.FirstElement, raw.NumElements, 4)
 }
 
 pub(crate) fn paged_raw_range(view: &View) -> Option<(u64, u64)> {
@@ -943,13 +966,29 @@ pub(crate) fn paged_raw_range(view: &View) -> Option<(u64, u64)> {
     if raw.Flags != D3D12_BUFFER_UAV_FLAG_RAW || raw.StructureByteStride != 0 || raw.CounterOffsetInBytes != 0 {
         return None;
     }
-    checked_raw_buffer(*resource, raw.FirstElement, raw.NumElements)
+    checked_buffer_view(*resource, raw.FirstElement, raw.NumElements, 4)
 }
 
-fn checked_raw_buffer(resource: usize, first: u64, elements: u32) -> Option<(u64, u64)> {
+pub(crate) fn paged_structured_srv_range(view: &View, stride: u32) -> Option<(u64, u64)> {
+    let View::Shader(resource, Some(words)) = view else { return None; };
+    let desc = srv_desc(words);
+    if desc.Format != DXGI_FORMAT_UNKNOWN || desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER
+        || desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+    {
+        return None;
+    }
+    // SAFETY: the checked view discriminator selects Buffer.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    if buffer.StructureByteStride != stride || buffer.Flags != D3D12_BUFFER_SRV_FLAG_NONE {
+        return None;
+    }
+    checked_buffer_view(*resource, buffer.FirstElement, buffer.NumElements, stride)
+}
+
+fn checked_buffer_view(resource: usize, first: u64, elements: u32, stride: u32) -> Option<(u64, u64)> {
     let (base, size) = crate::resource::buffer_bytes(resource as crate::object::This)?;
-    let offset = first.checked_mul(4)?;
-    let len = u64::from(elements) * 4;
+    let offset = first.checked_mul(u64::from(stride))?;
+    let len = u64::from(elements) * u64::from(stride);
     let stop = offset.checked_add(len)?;
     if len == 0 || stop > size || base.is_null() {
         return None;
