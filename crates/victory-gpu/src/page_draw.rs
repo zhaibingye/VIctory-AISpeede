@@ -445,8 +445,14 @@ impl ClosedDraw {
             .map(|input| input.prepare(host, list, batch, descriptors)).transpose()?;
         let color_targets: Vec<_> = self.targets.iter().map(|target| target.copy.as_ref()).collect();
         let words = self.shader.prepare(host, list, batch, descriptors, initialized, dirty, &color_targets)?;
+        let mut fixed_reads = crate::page_view::FixedReads::default();
+        let uses_uav = self.shader.uses_uav();
         for &input in &self.inputs {
-            input.encode(host, list, batch)?;
+            if uses_uav {
+                input.encode(host, list, batch)?;
+            } else {
+                input.encode_scoped(host, list, batch, &mut fixed_reads)?;
+            }
         }
         list.keep(&self.pipeline);
         list.keep(&self.root);
@@ -473,6 +479,8 @@ impl ClosedDraw {
                 }
             }
             words.shared_access.transition(cmd, false);
+            fixed_reads.transition(cmd, false);
+            fixed_reads.bind(list);
             cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
             cmd.SetGraphicsRootSignature(&self.root);
             cmd.SetPipelineState(&self.pipeline);
@@ -500,6 +508,7 @@ impl ClosedDraw {
                 }
                 DrawCall::Indirect(_) => indirect.as_ref().expect("indirect arguments prepared").execute(cmd),
             }
+            fixed_reads.transition(cmd, true);
             words.shared_access.transition(cmd, true);
             for (target, before) in self.targets.iter().zip(states) {
                 if before != render_target {

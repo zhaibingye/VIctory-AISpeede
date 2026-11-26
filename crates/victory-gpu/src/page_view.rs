@@ -85,17 +85,54 @@ impl InputView {
         batch: &PinnedBatch,
     ) -> Result<(), BatchError> {
         let buffer = self.gather(host, list, batch)?;
-        let native = list.recording();
-        // SAFETY: gather validated the slot/format and prepared a live
-        // contiguous resource in the corresponding read-only state.
+        // SAFETY: the gathered buffer has its native read-only state.
+        self.bind(list, unsafe { buffer.GetGPUVirtualAddress() });
+        Ok(())
+    }
+
+    pub(crate) fn encode_scoped(
+        self, host: &Host, list: &HostList, batch: &PinnedBatch, reads: &mut FixedReads,
+    ) -> Result<(), BatchError> {
+        let (start, end) = self.range()?;
+        let base = start & !(PAGE_BYTES - 1);
+        let first = batch.pinned_at(start).ok_or(BatchError::NotCaptured(start))?;
+        let mut at = base;
+        while at < end {
+            let page = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?;
+            if page.slab() != first.slab() || page.offset() != first.offset() + at - base {
+                let gathered = self.gather(host, list, batch)?;
+                // SAFETY: a budgeted, contiguous buffer retained by the list.
+                reads.views.push((self, unsafe { gathered.GetGPUVirtualAddress() }));
+                return Ok(());
+            }
+            at += PAGE_BYTES;
+        }
+        let buffer = first.buffer();
+        list.keep(buffer);
+        reads.insert(first.slab(), buffer, self.binding());
+        // SAFETY: the whole view is consecutive within the retained slab.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + first.offset() + start % PAGE_BYTES;
+        reads.views.push((self, gpu));
+        Ok(())
+    }
+
+    fn bind(self, list: &HostList, gpu: u64) {
+        // Setting an IA view does not access its bytes. The draw starts
+        // only after the caller has installed the required read state.
         unsafe {
-            let gpu = buffer.GetGPUVirtualAddress();
+            let native = list.recording();
             match self {
                 Self::Vertex(slot, view) => native.IASetVertexBuffers(slot, Some(&[view.native(gpu)])),
                 Self::Index(view) => native.IASetIndexBuffer(Some(&view.native(gpu))),
             }
         }
-        Ok(())
+    }
+
+    fn binding(self) -> D3D12_RESOURCE_STATES {
+        match self {
+            Self::Vertex(..) => D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            Self::Index(_) => D3D12_RESOURCE_STATE_INDEX_BUFFER,
+        }
     }
 
     /// All slabs are in UAV state at this point. Transitions expose
@@ -111,13 +148,39 @@ impl InputView {
         let buffer = host
             .default_buffer(span.1 - span.0)
             .ok_or_else(|| BatchError::Native(Error::from(E_OUTOFMEMORY)))?;
-        let binding = match self {
-            Self::Vertex(..) => D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
-            Self::Index(_) => D3D12_RESOURCE_STATE_INDEX_BUFFER,
-        };
         gather_span(list, batch, span, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
-            binding | D3D12_RESOURCE_STATE_COPY_SOURCE)?;
+            self.binding() | D3D12_RESOURCE_STATE_COPY_SOURCE)?;
         Ok(buffer)
+    }
+}
+
+/// Temporary read-only state on each slab for one fixed-function draw.
+#[derive(Default)]
+pub(crate) struct FixedReads {
+    slabs: BTreeMap<u64, (ID3D12Resource, D3D12_RESOURCE_STATES)>,
+    views: Vec<(InputView, u64)>,
+}
+
+impl FixedReads {
+    fn insert(&mut self, slab: u64, buffer: &ID3D12Resource, binding: D3D12_RESOURCE_STATES) {
+        self.slabs.entry(slab).and_modify(|(_, state)| *state = *state | binding)
+            .or_insert_with(|| (buffer.clone(), binding));
+    }
+
+    pub(crate) fn bind(&self, list: &HostList) {
+        for &(view, address) in &self.views { view.bind(list, address); }
+    }
+
+    pub(crate) fn transition(&self, cmd: &ID3D12GraphicsCommandList, restore: bool) {
+        if self.slabs.is_empty() { return; }
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let barriers = self.slabs.values().map(|(buffer, state)| {
+            let (before, after) = if restore { (*state, uav) } else { (uav, *state) };
+            transition(buffer, before, after)
+        }).collect::<Vec<_>>();
+        // SAFETY: captured slab lifetime extends to the real fence, no
+        // co-bound shader UAVs, and combined IA uses are all read-only.
+        unsafe { cmd.ResourceBarrier(&barriers) };
     }
 }
 
