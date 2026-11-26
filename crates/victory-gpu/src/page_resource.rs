@@ -118,10 +118,17 @@ impl ResourcePlan {
         &mut self, host: &crate::host::Host, list: &HostList, batch: &crate::page_slabs::PinnedBatch,
         copy: &Arc<HostTexture>, sub: ColorSubresource,
     ) -> Result<(), BatchError> {
-        if !sub.scoped {
+        self.require_texture_authority(host, list, batch, copy, sub.authority())
+    }
+
+    fn require_texture_authority(
+        &mut self, host: &crate::host::Host, list: &HostList, batch: &crate::page_slabs::PinnedBatch,
+        copy: &Arc<HostTexture>, subresource: Option<u32>,
+    ) -> Result<(), BatchError> {
+        if subresource.is_none() {
             return self.require_native(host, list, batch, copy);
         }
-        if self.version_at(copy, Some(sub.index)).is_some_and(|v| v.representation == Representation::NativeGpu) {
+        if self.version_at(copy, subresource).is_some_and(|v| v.representation == Representation::NativeGpu) {
             Ok(())
         } else {
             Err(BatchError::TargetNotInitialized)
@@ -441,6 +448,7 @@ pub(crate) struct TextureCopy {
     exact_backing: bool,
     source: ColorSubresource,
     destination: ColorSubresource,
+    subresources: u32,
 }
 
 struct CopyArea {
@@ -456,7 +464,6 @@ impl TextureCopy {
         self.area.as_ref().filter(|area| !area.fills_destination).map(|_| &self.dst)
     }
 
-    #[cfg(feature = "paged-title")]
     #[cfg(feature = "paged-title")]
     pub(crate) fn pointer_source(&self) -> Option<&Arc<HostTexture>> {
         self.src.has_pointer_exposure().then_some(&self.src)
@@ -488,7 +495,6 @@ impl TextureCopy {
         let exact_backing = scoped || !a.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
             || !b.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         if Arc::ptr_eq(&src, &dst) || src.texture == dst.texture
-            || (region.is_none() && scoped)
             || !source.allows(&src) || !destination.allows(&dst)
             || (!scoped && (a.Flags.0 & writable == 0 || b.Flags.0 & writable == 0))
             || exact_backing && (src.uses_unproven_alias_backing() || dst.uses_unproven_alias_backing())
@@ -499,7 +505,7 @@ impl TextureCopy {
         {
             return None;
         }
-        let area = if let Some((x, y, bounds)) = region {
+        let (area, subresources) = if let Some((x, y, bounds)) = region {
             // Partial copies use texel bounds only on exact pixel formats.
             crate::page_texture::linear_texel_bytes(a.Format)?;
             let width = u32::try_from(source.width).ok()?;
@@ -514,18 +520,26 @@ impl TextureCopy {
             if u64::from(end_x) > destination.width || end_y > destination.height {
                 return None;
             }
-            Some(CopyArea {
+            (Some(CopyArea {
                 x, y,
                 source: D3D12_BOX { left, top, front, right, bottom, back },
                 fills_destination: x == 0 && y == 0 && u64::from(end_x) == destination.width && end_y == destination.height,
-            })
+            }), 1)
         } else {
-            if a.Width != b.Width || a.Height != b.Height {
+            if a.Width != b.Width || a.Height != b.Height
+                || a.MipLevels != b.MipLevels || a.DepthOrArraySize != b.DepthOrArraySize
+            {
                 return None;
             }
-            None
+            (None, u32::from(a.MipLevels).checked_mul(u32::from(a.DepthOrArraySize))?)
         };
-        Some(Self { src, dst, area, exact_backing, source, destination })
+        Some(Self { src, dst, area, exact_backing, source, destination, subresources })
+    }
+
+    /// A region carries one pair; a whole copy carries each mip/slice
+    /// in native subresource order. Authority stays keyed per subresource.
+    fn authorities(&self, sub: ColorSubresource) -> impl Iterator<Item = Option<u32>> {
+        (0..self.subresources).map(move |offset| sub.authority().map(|first| first + offset))
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -540,7 +554,9 @@ impl TextureCopy {
             || self.exact_backing && (self.src.uses_unproven_alias_backing() || self.dst.uses_unproven_alias_backing()) {
             return Err(BatchError::UnsupportedTextureMap);
         }
-        plan.require_color_subresource(host, list, batch, &self.src, self.source)?;
+        for authority in self.authorities(self.source) {
+            plan.require_texture_authority(host, list, batch, &self.src, authority)?;
+        }
         if self.area.as_ref().is_some_and(|area| !area.fills_destination) {
             plan.require_color_subresource(host, list, batch, &self.dst, self.destination)?;
         }
@@ -549,7 +565,8 @@ impl TextureCopy {
         list.keep(&self.src.texture);
         list.keep(&self.dst.texture);
         // SAFETY: both resources stay alive in COPY_SOURCE/DEST. A region
-        // uses two borrowed subresource zero locations and checked texel bounds.
+        // uses checked texel bounds and borrows the retained resources.
+        // A whole copy uses matching texture shapes and proven source contents.
         unsafe {
             let cmd = list.recording();
             if let Some(area) = &self.area {
@@ -564,7 +581,9 @@ impl TextureCopy {
                 cmd.CopyResource(&self.dst.texture, &self.src.texture);
             }
         }
-        plan.record_write_at(&self.dst, self.destination.authority())?;
+        for authority in self.authorities(self.destination) {
+            plan.record_write_at(&self.dst, authority)?;
+        }
         Ok(())
     }
 }
