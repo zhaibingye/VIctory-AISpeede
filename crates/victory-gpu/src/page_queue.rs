@@ -17,7 +17,7 @@ use crate::copy_plan::{GuestCopy, Unbound};
 use crate::descriptor::host::HostHeap;
 use crate::host::{Host, HostList, fail, transition};
 use crate::page_view::InputView;
-use crate::page_slabs::{BatchError, BoundLeaves, CapturedUploads, PinnedBatch, Transfer, download};
+use crate::page_slabs::{BatchError, BoundLeaves, CapturedUploads, PageSlabs, PinnedBatch, Transfer, download};
 use crate::title_backing::SubmissionBacking;
 
 #[derive(Clone, Copy)]
@@ -190,54 +190,42 @@ struct Completion {
     digests: BTreeMap<PhysicalPage, blake3::Hash>,
 }
 
-/// Ownership boundary between enqueue and completion. The command
-/// allocator, retained resources, descriptor reservations and targets
-/// all survive until the real render fence is observed.
+/// Holds physical residency and retirement work for one native submission.
+#[must_use]
+struct InFlightPages<'a> {
+    batch: PinnedBatch,
+    render: SubmittedRender<'a>,
+}
+
+impl InFlightPages<'_> {
+    fn retire(
+        self, host: &Host, signal: &mut u64, backing: &SubmissionBacking, slabs: &mut PageSlabs,
+    ) -> PageStats {
+        let completed = self.render.retire(host, signal, backing, &self.batch);
+        self.batch.submitted(slabs, completed.fence, |_| (true, false));
+        slabs.publish_completed_content(completed.digests);
+        completed.stats
+    }
+}
+
+/// GPU work, descriptors and byte publication retained to the native fence.
 #[must_use]
 struct SubmittedRender<'a> {
     fence: Fence,
-    list: HostList,
-    descriptors: PageDescriptors<'a>,
-    targets: crate::page_resource::ResourcePlan,
-    tracking: Option<BitmapTracking>,
-}
-
-struct CompletedRender<'a> {
     _list: HostList,
     _descriptors: PageDescriptors<'a>,
+    targets: crate::page_resource::ResourcePlan,
     tracking: Option<BitmapTracking>,
-}
-
-impl<'a> SubmittedRender<'a> {
-    fn observe(self, host: &Host) -> CompletedRender<'a> {
-        let completed = host.await_native_group(self.fence)
-            .unwrap_or_else(|e| fail(format_args!("native paged render fence: {e}")));
-        self.targets.commit(self.fence, completed);
-        CompletedRender {
-            _list: self.list, _descriptors: self.descriptors,
-            tracking: self.tracking,
-        }
-    }
+    declared_dirty: BTreeSet<PhysicalPage>,
+    planned: Option<PageDownload>,
+    uploads: Option<CapturedUploads>,
+    uploaded: usize,
 }
 
 struct BitmapTracking {
     leaves: BoundLeaves,
     mapped: NonNull<u8>,
     words: usize,
-}
-
-impl CompletedRender<'_> {
-    fn discovered_writes(&self) -> BTreeSet<PhysicalPage> {
-        let Some(tracking) = &self.tracking else { return BTreeSet::new() };
-        // SAFETY: the fence completed, and the retained list exclusively
-        // owns this submission's bitmap mapping.
-        let words = unsafe {
-            std::slice::from_raw_parts(tracking.mapped.as_ptr().cast(), tracking.words)
-        };
-        tracking.leaves.dirty_pages(words).unwrap_or_else(|leaf| {
-            fail(format_args!("paged dispatch accessed unbound page-table leaf {leaf}"))
-        })
-    }
 }
 
 /// One heap's reserved descriptor slots. They are released only after the
@@ -577,27 +565,23 @@ impl Host {
     ) -> std::result::Result<PageStats, BatchError> {
         let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
         let batch = PinnedBatch::capture(self, &mut slabs, backing, ranges)?;
-        let result = run(self, signal, heap, backing, &batch, writes, record);
-        match result {
-            Ok(completed) => {
-                // The readback was merged before the pins are relinquished.
-                // The next submission revalidates its own CPU snapshot.
-                batch.submitted(&mut slabs, completed.fence, |_| (true, false));
-                slabs.publish_completed_content(completed.digests);
-                Ok(completed.stats)
-            }
+        let render = match submit_work(self, signal, heap, backing, &batch, writes, record) {
+            Ok(render) => render,
             Err(e) => {
                 batch.cancel(&mut slabs);
-                Err(e)
+                return Err(e);
             }
-        }
+        };
+        // Keep retirement ordered here until the scheduler has separate
+        // submitted resource state and byte-publication dependency gates.
+        Ok(InFlightPages { batch, render }.retire(self, signal, backing, &mut slabs))
     }
 }
 
-fn run(
+fn submit_work<'a>(
     host: &Host,
     signal: &mut u64,
-    heap: &HostHeap,
+    heap: &'a HostHeap,
     backing: &SubmissionBacking,
     batch: &PinnedBatch,
     writes: WriteSet,
@@ -609,7 +593,7 @@ fn run(
         &mut PageDescriptors<'_>,
         &mut crate::page_resource::ResourcePlan,
     ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError>,
-) -> std::result::Result<Completion, BatchError> {
+) -> std::result::Result<SubmittedRender<'a>, BatchError> {
     let native = BatchError::Native;
     let mut pairs = PageDescriptors {
         heap,
@@ -658,7 +642,7 @@ fn run(
         list.keep(*buffer);
     }
     list.keep(&heap.heap);
-    let uploaded = uploads.as_ref().map_or(0, |stage| stage.record(&list));
+    let uploaded = uploads.as_ref().map_or(0, |stage| stage.record(&list, batch));
     barrier(&list, slabs.values().copied(), false);
     let mut targets = crate::page_resource::ResourcePlan::default();
     let declared_dirty = record(&list, roots, batch, backing.pins(), &mut pairs, &mut targets)?;
@@ -677,73 +661,66 @@ fn run(
     let rendered = host
         .submit_native_group(signal, &[Some(command)])
         .unwrap_or_else(|e| fail(format_args!("native paged render submission: {e}")));
-    let render = SubmittedRender {
-        fence: rendered, list, descriptors: pairs, targets, tracking,
-    };
-    // Keep CPU-visible semantics unchanged for now. Moving this
-    // observation later requires proving which guest bytes are visible.
-    let completed_render = render.observe(host);
-
-    let dirty = match writes {
-        WriteSet::Declared => declared_dirty,
-        WriteSet::ShaderBitmap => {
-            let mut dirty = completed_render.discovered_writes();
-            dirty.extend(declared_dirty);
-            dirty
-        }
-    };
-    let mut digests = uploads
-        .as_ref()
-        .map_or_else(BTreeMap::new, CapturedUploads::digests);
-    let stats = PageStats {
-        uploaded,
-        downloaded: dirty.len(),
-    };
-    if dirty.is_empty() {
-        return Ok(Completion {
-            fence: rendered,
-            stats,
-            digests,
-        });
-    }
-
-    let (readback, completed) = if let Some(planned) = planned {
-        (planned, rendered)
-    } else {
-        // The low-level bitmap shader API cannot plan GPU-selected
-        // writes ahead of execution. It does not serve the title queue.
-        (|| -> Result<_> {
-            let transfer = host.new_list()?;
-            let readback = PageDownload::record(host, &transfer, batch, &dirty)?;
-            transfer.close();
-            let completed = host.run_native_group(signal, &[Some(transfer.recording().cast()?)])?;
-            Ok((readback, completed))
-        })().unwrap_or_else(|e| fail(format_args!("native paged dirty readback: {e}")))
-    };
-    let snapshots = uploads.expect("dirty leaf requires an uploaded page");
-    let _scratch_charge = HostBudget::process()
-        .reserve_ram(PAGE_BYTES)
-        .unwrap_or_else(|_| fail(format_args!("no RAM for paged writeback scratch")));
-    let mut scratch = vec![0; PAGE_BYTES as usize];
-    for (i, (page, _, _)) in batch
-        .pages()
-        .filter(|(id, _, _)| dirty.contains(id))
-        .enumerate()
-    {
-        let bytes = readback.bytes(i);
-        if !snapshots.merge(backing, page, bytes, &mut scratch) {
-            fail(format_args!(
-                "paged writeback failed for physical page {}",
-                page.number()
-            ));
-        }
-        digests.insert(page, blake3::hash(bytes));
-    }
-    Ok(Completion {
-        fence: completed,
-        stats,
-        digests,
+    Ok(SubmittedRender {
+        fence: rendered, _list: list, _descriptors: pairs, targets, tracking,
+        declared_dirty, planned, uploads, uploaded,
     })
+}
+
+impl SubmittedRender<'_> {
+    fn retire(
+        self, host: &Host, signal: &mut u64, backing: &SubmissionBacking, batch: &PinnedBatch,
+    ) -> Completion {
+        let observed = host.await_native_group(self.fence)
+            .unwrap_or_else(|e| fail(format_args!("native paged render fence: {e}")));
+        let mut dirty = self.declared_dirty;
+        if let Some(tracking) = self.tracking {
+            // SAFETY: the fence has completed, and the retained list
+            // exclusively owns this submission's bitmap mapping.
+            let words = unsafe {
+                std::slice::from_raw_parts(tracking.mapped.as_ptr().cast(), tracking.words)
+            };
+            dirty.extend(tracking.leaves.dirty_pages(words).unwrap_or_else(|leaf| {
+                fail(format_args!("paged dispatch accessed unbound page-table leaf {leaf}"))
+            }));
+        }
+        let mut digests = self.uploads.as_ref().map_or_else(BTreeMap::new, CapturedUploads::digests);
+        let stats = PageStats { uploaded: self.uploaded, downloaded: dirty.len() };
+        let mut completed = self.fence;
+        if !dirty.is_empty() {
+            let readback = if let Some(planned) = self.planned {
+                planned
+            } else {
+                // Diagnostics discover their writes after rendering, so
+                // only they require a second native submission.
+                let (readback, fence) = (|| -> Result<_> {
+                    let transfer = host.new_list()?;
+                    let readback = PageDownload::record(host, &transfer, batch, &dirty)?;
+                    transfer.close();
+                    let fence = host.run_native_group(signal, &[Some(transfer.recording().cast()?)])?;
+                    Ok((readback, fence))
+                })().unwrap_or_else(|e| fail(format_args!("native paged dirty readback: {e}")));
+                completed = fence;
+                readback
+            };
+            let snapshots = self.uploads.expect("dirty leaf requires an uploaded page");
+            let _scratch_charge = HostBudget::process()
+                .reserve_ram(PAGE_BYTES)
+                .unwrap_or_else(|_| fail(format_args!("no RAM for paged writeback scratch")));
+            let mut scratch = vec![0; PAGE_BYTES as usize];
+            for (i, (page, _, _)) in batch.pages().filter(|(id, _, _)| dirty.contains(id)).enumerate() {
+                let bytes = readback.bytes(i);
+                if !snapshots.merge(backing, page, bytes, &mut scratch) {
+                    fail(format_args!("paged writeback failed for physical page {}", page.number()));
+                }
+                digests.insert(page, blake3::hash(bytes));
+            }
+        }
+        // Native readiness is not guest byte visibility. Publish the
+        // completed plan only after the required CPU merge succeeded.
+        self.targets.commit(self.fence, observed);
+        Completion { fence: completed, stats, digests }
+    }
 }
 
 /// Gather all source fragments into disjoint scratch before scattering.

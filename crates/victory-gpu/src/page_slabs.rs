@@ -409,17 +409,22 @@ impl PinnedBatch {
 
 /// Budgeted CPU-visible before-images. The same allocation supplies GPU
 /// copies and post-fence byte comparison, avoiding a second full CPU copy.
-pub(crate) struct CapturedUploads<'a> {
-    batch: &'a PinnedBatch,
+pub(crate) struct CapturedUploads {
     staging: ID3D12Resource,
     mapped: std::ptr::NonNull<u8>,
-    snapshots: BTreeMap<PhysicalPage, (usize, blake3::Hash)>,
+    snapshots: BTreeMap<PhysicalPage, PageSnapshot>,
 }
 
-impl<'a> CapturedUploads<'a> {
+struct PageSnapshot {
+    va: u64,
+    offset: usize,
+    digest: blake3::Hash,
+}
+
+impl CapturedUploads {
     pub(crate) fn stage(
         host: &Host,
-        batch: &'a PinnedBatch,
+        batch: &PinnedBatch,
         backing: &crate::title_backing::SubmissionBacking,
     ) -> std::result::Result<Option<Self>, BatchError> {
         const PAGE: usize = PAGE_BYTES as usize;
@@ -449,26 +454,24 @@ impl<'a> CapturedUploads<'a> {
             if !backing.stage_page(va as usize, id, dest) {
                 return Err(BatchError::NotCaptured(va));
             }
-            snapshots.insert(id, (offset, blake3::hash(dest)));
+            snapshots.insert(id, PageSnapshot { va, offset, digest: blake3::hash(dest) });
         }
         Ok(Some(Self {
-            batch,
             staging,
             mapped,
             snapshots,
         }))
     }
 
-    pub(crate) fn record(&self, list: &HostList) -> usize {
-        let entries: Vec<_> = self
-            .batch
+    pub(crate) fn record(&self, list: &HostList, batch: &PinnedBatch) -> usize {
+        let entries: Vec<_> = batch
             .pages()
             .filter_map(|(id, _, page)| {
-                let (offset, digest) = self.snapshots[&id];
-                (page.digest != Some(digest)).then_some(Transfer {
+                let snapshot = &self.snapshots[&id];
+                (page.digest != Some(snapshot.digest)).then_some(Transfer {
                     page,
                     staging: &self.staging,
-                    offset: offset as u64,
+                    offset: snapshot.offset as u64,
                 })
             })
             .collect();
@@ -479,7 +482,7 @@ impl<'a> CapturedUploads<'a> {
     pub(crate) fn digests(&self) -> BTreeMap<PhysicalPage, blake3::Hash> {
         self.snapshots
             .iter()
-            .map(|(&id, &(_, digest))| (id, digest))
+            .map(|(&id, snapshot)| (id, snapshot.digest))
             .collect()
     }
 
@@ -492,16 +495,14 @@ impl<'a> CapturedUploads<'a> {
         gpu: &[u8],
         scratch: &mut [u8],
     ) -> bool {
-        let Some((&(offset, _), &(va, _))) =
-            self.snapshots.get(&page).zip(self.batch.pages.get(&page))
-        else {
+        let Some(snapshot) = self.snapshots.get(&page) else {
             return false;
         };
         // SAFETY: fully initialized snapshot; our GPU lists only read it.
         let before = unsafe {
-            std::slice::from_raw_parts(self.mapped.as_ptr().add(offset), PAGE_BYTES as usize)
+            std::slice::from_raw_parts(self.mapped.as_ptr().add(snapshot.offset), PAGE_BYTES as usize)
         };
-        backing.merge_page(va as usize, page, before, gpu, scratch)
+        backing.merge_page(snapshot.va as usize, page, before, gpu, scratch)
     }
 }
 
