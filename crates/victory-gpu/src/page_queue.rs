@@ -1154,7 +1154,7 @@ fn submit_work<'a>(
     let encoded = started.map(|_| std::time::Instant::now());
     let rendered = host
         .submit_native_group(signal, &[Some(command)])
-        .unwrap_or_else(|e| fail(format_args!("native paged render submission: {e}")));
+        .unwrap_or_else(|e| fail(format_args!("VNME 原生渲染提交失败：{e}")));
     let profile = started.zip(encoded).map(|(started, encoded)| {
         let queued = std::time::Instant::now();
         SubmissionProfile {
@@ -1176,7 +1176,7 @@ impl SubmittedRender<'_> {
     ) -> Completion {
         let wait_started = self.profile.as_ref().map(|_| std::time::Instant::now());
         let observed = host.await_native_group(self.fence)
-            .unwrap_or_else(|e| fail(format_args!("native paged render fence: {e}")));
+            .unwrap_or_else(|e| fail(format_args!("VNME 原生渲染 Fence 失败：{e}")));
         let fence_observed = wait_started.map(|_| std::time::Instant::now());
         let mut dirty = self.declared_dirty;
         if let Some(tracking) = self.tracking {
@@ -1204,19 +1204,19 @@ impl SubmittedRender<'_> {
                     transfer.close();
                     let fence = host.run_native_group(signal, &[Some(transfer.recording().cast()?)])?;
                     Ok((readback, fence))
-                })().unwrap_or_else(|e| fail(format_args!("native paged dirty readback: {e}")));
+                })().unwrap_or_else(|e| fail(format_args!("VNME 脏页回读失败：{e}")));
                 completed = fence;
                 readback
             };
             let snapshots = self.uploads.expect("dirty leaf requires an uploaded page");
             let _scratch_charge = HostBudget::process()
                 .reserve_ram(PAGE_BYTES)
-                .unwrap_or_else(|_| fail(format_args!("no RAM for paged writeback scratch")));
+                .unwrap_or_else(|_| fail(format_args!("没有足够的系统内存用于 VNME 的回写暂存")));
             let mut scratch = vec![0; PAGE_BYTES as usize];
             for (i, (page, _, _)) in batch.pages().filter(|(id, _, _)| dirty.contains(id)).enumerate() {
                 let bytes = readback.bytes(i);
                 if !snapshots.merge(backing, page, bytes, &mut scratch, self.targets.guest_overwrites(page)) {
-                    fail(format_args!("paged writeback failed for physical page {}", page.number()));
+                    fail(format_args!("VNME 无法回写物理页 {}", page.number()));
                 }
                 digests.insert(page, blake3::hash(bytes));
             }
@@ -1245,7 +1245,7 @@ impl SubmittedRender<'_> {
                 page_readback_bytes = stats.downloaded as u64 * PAGE_BYTES,
                 managed_ram_bytes = budget.used(Pool::Ram),
                 managed_local_bytes = budget.used(Pool::Local),
-                "VNME submission retired");
+                "VNME 提交完成收尾");
         }
         Completion { fence: completed, stats, digests }
     }

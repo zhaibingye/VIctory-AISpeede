@@ -136,15 +136,15 @@ pub extern "system" fn create(
     }
     // SAFETY: checked non-null; the title passes its parameters and an id.
     let (version, iid) = unsafe { (parameters.read(), &*iid) };
-    tracing::info!(version = format_args!("{version:#x}"), "D3D12.X device");
+    tracing::info!(version = format_args!("{version:#x}"), "正在创建 D3D12.X 设备");
     if version != CHECKED_VERSION {
         tracing::warn!(
             version = format_args!("{version:#x}"),
-            "device layouts were checked against {CHECKED_VERSION:#x} only"
+            "设备接口布局仅按版本 {CHECKED_VERSION:#x} 核对过"
         );
     }
     if !is_device(iid) {
-        tracing::warn!(iid = %guid_text(iid), "device created as an unknown interface");
+        tracing::warn!(iid = %guid_text(iid), "请求创建的设备接口无法识别");
         return E_NOINTERFACE;
     }
     if out.is_null() {
@@ -206,7 +206,7 @@ pub extern "system" fn configure_virtual_memory(config: *mut VirtualMemory) -> H
         flags = config.flags,
         page_table_pages = config.page_table_pages,
         preserved_bytes = config.preserved_bytes,
-        "graphics virtual memory"
+        "图形虚拟内存配置"
     );
     (config.lowest, config.highest) = user_space();
     S_OK
@@ -286,7 +286,7 @@ extern "system" fn check_feature_support(
         OPTIONS1 => 24,
         OPTIONS4 => 12,
         _ => {
-            tracing::warn!(feature, size, "device feature query not implemented");
+            tracing::warn!(feature, size, "设备功能查询尚未实现");
             return E_NOTIMPL;
         }
     };

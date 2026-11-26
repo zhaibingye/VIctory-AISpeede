@@ -95,7 +95,7 @@ pub(crate) fn answer(kind: usize, iid: *const Iid, found: Option<This>, out: *mu
     };
     // SAFETY: the title passes an interface id (null is tolerated).
     let iid = unsafe { iid.as_ref() }.map(guid_text).unwrap_or_default();
-    tracing::warn!(object = KINDS[kind], %iid, "unknown interface");
+    tracing::warn!(object = KINDS[kind], %iid, "无法识别接口");
     // SAFETY: checked non-null.
     unsafe { out.write(std::ptr::null()) };
     hr
@@ -297,7 +297,7 @@ extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
             object = KINDS[KIND],
             slot = format_args!("{:#x}", SLOT * 8),
             caller = caller(),
-            "method not implemented"
+            "接口方法尚未实现"
         );
     }
     E_NOTIMPL

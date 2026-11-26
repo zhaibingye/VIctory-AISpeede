@@ -56,7 +56,7 @@ pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT
             put(out, std::ptr::from_ref(&FACTORY_OBJECT).cast_mut().cast())
         }
         iid => {
-            tracing::warn!(iid = ?iid.map(Guid::to_string), "DStorageGetFactory: unknown interface");
+            tracing::warn!(iid = ?iid.map(Guid::to_string), "DStorageGetFactory：无法识别接口");
             E_NOINTERFACE
         }
     }
@@ -138,10 +138,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     };
     if handle as isize == -1 {
         let error = std::io::Error::last_os_error();
-        tracing::warn!(path = name, %error, "dstorage: opening a file failed");
+        tracing::warn!(path = name, %error, "DirectStorage：无法打开文件");
         return from_win32(&error);
     }
-    tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    tracing::info!(path = name, iid = iid_text(iid), "DirectStorage：已打开文件");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
@@ -160,7 +160,7 @@ extern "system" fn create_status_array(
         capacity,
         name = text(name),
         iid = iid_text(iid),
-        "dstorage: status array"
+        "DirectStorage：已请求状态数组"
     );
     let entries = (0..capacity).map(|_| AtomicI32::new(S_OK)).collect();
     let array = Instance::create(
@@ -199,7 +199,7 @@ extern "system" fn create_queue(
         name,
         unknown = desc.unknown,
         iid = iid_text(iid),
-        "dstorage: queue"
+        "DirectStorage：已请求队列"
     );
     let Some(scheduler) = scheduler() else {
         return E_OUTOFMEMORY;
@@ -218,7 +218,7 @@ extern "system" fn create_queue(
 
 /// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    tracing::info!(size, "DirectStorage：暂存缓冲区大小");
     if let Some(scheduler) = scheduler() {
         scheduler.lock().staging = u64::from(size);
     }
@@ -432,7 +432,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, "DirectStorage：工作线程数");
     });
     Some(scheduler)
 }
@@ -730,7 +730,7 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
         return;
     };
     let Some(entry) = entries.get(index as usize) else {
-        tracing::warn!(index, "dstorage: status entry out of range");
+        tracing::warn!(index, "DirectStorage：状态条目超出范围");
         return;
     };
     entry.store(E_PENDING, Ordering::Release);
@@ -804,7 +804,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             tag = request.tag,
             name = text(request.name),
             hr = format_args!("{:#010x}", hr as u32),
-            "dstorage: request failed: {why}"
+            "DirectStorage：请求失败：{why}"
         );
         hr
     };
@@ -869,7 +869,7 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     match TABLES.get_or_init(load_bcpack_tables) {
         Ok(tables) => Ok(tables),
         Err(why) if !WARNED.swap(true, Ordering::Relaxed) => {
-            tracing::warn!("dstorage: BCPack requests fail: {why} (more at debug)");
+            tracing::warn!("DirectStorage：BCPack 请求失败：{why}（调试级别有详细信息）");
             Err(E_NOTIMPL)
         }
         Err(_) => {
@@ -1001,7 +1001,7 @@ fn into_destination(
                 if late.is_power_of_two() {
                     tracing::info!(
                         late,
-                        "dstorage: a page list filled after its request started: written late"
+                        "DirectStorage：请求启动后页列表才填满，已补写数据"
                     );
                 }
                 return Ok(());
@@ -1012,7 +1012,7 @@ fn into_destination(
         offset,
         len,
         pages = pages.len(),
-        "dstorage: a destination's physical pages could not be written; its request fails"
+        "DirectStorage：无法写入目标物理页，请求失败"
     );
     Err(E_INVALIDARG)
 }

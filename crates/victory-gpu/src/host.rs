@@ -114,7 +114,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     if let Some(host) = host() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
-            text.push_str(&format!("; device removed: {e}"));
+            text.push_str(&format!("；设备已移除：{e}"));
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
@@ -138,7 +138,7 @@ pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
-            tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
+            tracing::warn!(error = %e, "未能建立宿主 D3D12 设备，命令列表不会执行");
             None
         }
     })
@@ -154,7 +154,7 @@ fn create() -> windows::core::Result<Host> {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
                 Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
-                Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
+                Err(e) => tracing::warn!(error = %e, "无法启用 D3D12 调试层"),
             }
             // GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range
             // descriptor heap indices and the like become messages naming
@@ -171,7 +171,7 @@ fn create() -> windows::core::Result<Host> {
                         D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING,
                     );
                 }
-                tracing::info!("GPU-based validation on");
+                tracing::info!("已启用 GPU 验证");
             }
         }
         // Diagnostics: device-removed data (the command that faulted, the
@@ -192,7 +192,7 @@ fn create() -> windows::core::Result<Host> {
         if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            tracing::info!("host device on the software adapter (WARP)");
+            tracing::info!("宿主使用 WARP 软件适配器");
         } else {
             device = Some(create_hardware_device()?);
             // Whether a GPU hang ends the run or freezes the PC (#1054).
@@ -239,10 +239,10 @@ fn create() -> windows::core::Result<Host> {
                 vendor = format_args!("{:#06x}", desc.VendorId),
                 device = format_args!("{:#06x}", desc.DeviceId),
                 vram_mib = desc.DedicatedVideoMemory >> 20,
-                "host D3D12 adapter"
+                "宿主 D3D12 适配器"
             );
         }
-        tracing::info!("host D3D12 device ready");
+        tracing::info!("宿主 D3D12 设备就绪");
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -253,9 +253,9 @@ fn create() -> windows::core::Result<Host> {
         {
             Ok(true) => {}
             Ok(false) => tracing::warn!(
-                "the host GPU does not fuse multiply-adds: results of the console's fused v_fma and v_fmac can differ in kind here"
+                "宿主 GPU 未融合乘加，结果可能与主机的 v_fma 和 v_fmac 不同"
             ),
-            Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
+            Err(e) => tracing::debug!(error = %e, "未能检查融合乘加支持"),
         }
         Ok(Host {
             device,
@@ -293,7 +293,7 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
             tracing::warn!(
                 vendor = format_args!("{:#x}", desc.VendorId),
                 flags = format_args!("{:#x}", desc.Flags),
-                "DXGI did not identify the WARP adapter as software; refusing device"
+                "DXGI 未将 WARP 适配器标识为软件设备，已拒绝使用"
             );
             return Err(windows::core::Error::from_hresult(
                 windows::Win32::Foundation::E_FAIL,
@@ -363,7 +363,7 @@ fn create_hardware_device() -> windows::core::Result<ID3D12Device> {
                 tracing::warn!(
                     spec,
                     available = ?names,
-                    "VICTORY_D3D12_ADAPTER matched no DXGI adapter"
+                    "VICTORY_D3D12_ADAPTER 未匹配任何 DXGI 适配器"
                 );
                 return Err(windows::core::Error::from_hresult(DXGI_ERROR_NOT_FOUND));
             };
@@ -1042,7 +1042,7 @@ impl Host {
             let mesh = ok
                 && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            tracing::info!(mesh, "host mesh shader support");
+            tracing::info!(mesh, "宿主网格着色器支持情况");
             mesh
         })
     }
@@ -1075,7 +1075,7 @@ impl Host {
             let atomics = ok
                 && typed.AtomicInt64OnTypedResourceSupported.as_bool()
                 && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool();
-            tracing::info!(atomics, "host 64-bit atomics on typed heap resources");
+            tracing::info!(atomics, "宿主有类型堆资源的 64 位原子操作支持情况");
             atomics
         })
     }
@@ -1361,7 +1361,7 @@ impl Host {
                 crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted + 1, 0);
                 if let Err(e) = self.run_native_group(&mut submitted, group) {
                     fail(format_args!(
-                        "host submission fence wait failed: {e}{}",
+                        "等待宿主提交的 Fence 失败：{e}{}",
                         self.removal_data(runs)
                     ));
                 }
@@ -1381,10 +1381,10 @@ impl Host {
                     tracing::warn!(
                         ms = group_started.elapsed().as_millis(),
                         commands,
-                        "slow host list"
+                        "宿主命令列表耗时较长"
                     );
                     for (ms, op) in runs[run_idx].slowest(frequency, 6) {
-                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                        tracing::warn!("命令耗时 {ms:.1} 毫秒：{op}");
                     }
                 }
                 if groups.len() > 1 && removed_in.is_none() {
@@ -1418,12 +1418,12 @@ impl Host {
                 .iter()
                 .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
                 .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "宿主提交耗时较长");
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}{}",
+                "提交 {} 个命令列表后，宿主 GPU 设备被移除{}{}{}",
                 runs.len(),
                 self.removal_data(runs),
                 last_notes(runs),
@@ -1567,7 +1567,7 @@ impl Host {
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    text.push_str(&format!("；没有 DRED 命令进度记录（{e}）"));
                     return text;
                 }
             };
@@ -1598,7 +1598,7 @@ impl Host {
                     nodes = nodes.len(),
                     last_pointer = ?last.pCommandList.as_ref().map(|l| l.as_raw()),
                     last_names = %name(last.pCommandListDebugNameW, last.pCommandListDebugNameA),
-                    "no breadcrumb node named one of our lists"
+                    "DRED 命令进度记录中未找到本程序的命令列表"
                 );
             }
             // Every list's progress (done/count), in the runtime's order.
@@ -1928,7 +1928,7 @@ impl HostList {
                 .and_then(|()| self.list.Reset(&self.allocator, None))
         };
         if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
+            fail(format_args!("未能重置宿主命令列表（{e}）"));
         }
         let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let mut pool = IDLE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
@@ -2084,7 +2084,7 @@ impl HostList {
             })
         };
         if let Err(e) = recorded {
-            fail(format_args!("a host state prelude did not record ({e})"));
+            fail(format_args!("未能录制宿主前置状态命令（{e}）"));
         }
         list.cast().ok()
     }
@@ -2467,7 +2467,7 @@ impl HostList {
         for step in &self.deferred().copies {
             match step {
                 Step::Page(crate::page_queue::PageOp::Input(_)) => continue,
-                Step::Page(_) => fail(format_args!("paged operation reached legacy submission")),
+                Step::Page(_) => fail(format_args!("VNME 分页命令误进入旧提交路径")),
                 _ => {}
             }
             let started = std::time::Instant::now();
@@ -3001,7 +3001,7 @@ impl Host {
         match made {
             Ok(buffer) => Some((buffer, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
+                tracing::warn!(error = %e, size, "未能分配上传缓冲区");
                 None
             }
         }
@@ -3076,7 +3076,7 @@ impl Compositor {
                             errors.GetBufferSize(),
                         )
                     };
-                    tracing::warn!("present compositor: {}", String::from_utf8_lossy(text));
+                    tracing::warn!("画面合成器：{}", String::from_utf8_lossy(text));
                 }
                 return Err(e);
             }
@@ -3420,7 +3420,7 @@ impl Host {
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
         let Some(format) = swap_format(primary_desc.Format) else {
-            tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
+            tracing::warn!(format = primary_desc.Format.0, "无法呈现此格式");
             return None;
         };
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
@@ -3438,7 +3438,7 @@ impl Host {
             {
                 Ok(p) => Some(p),
                 Err((step, e)) => {
-                    tracing::warn!(error = %e, step, width, height, format = format.0, "no swap chain");
+                    tracing::warn!(error = %e, step, width, height, format = format.0, "无法创建交换链");
                     return None;
                 }
             };
@@ -3460,7 +3460,7 @@ impl Host {
             match resized {
                 Ok(()) => (p.width, p.height, p.format) = (width, height, format),
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, format = format.0, "swap chain not resized");
+                    tracing::warn!(error = %e, width, height, format = format.0, "未能调整交换链大小");
                     return None;
                 }
             }
@@ -3475,7 +3475,7 @@ impl Host {
                         // a single-plane present would.
                         tracing::warn!(
                             error = %e,
-                            "no present compositor; presenting the first plane"
+                            "无法建立画面合成器，仅呈现第一个平面"
                         );
                         p.compositor = None;
                     }
@@ -3705,7 +3705,7 @@ impl Host {
                 .map_err(|e| ("swap chain", e))?;
             let copy = self.new_list().map_err(|e| ("copy list", e))?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(width, height, format = format.0, "正在向窗口呈现图像");
             Ok(Presenter {
                 swap_chain,
                 width,
@@ -3831,7 +3831,7 @@ impl Host {
         match made {
             Ok(buffer) => Some((buffer, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                tracing::warn!(error = %e, size, "未能分配共享缓冲区");
                 None
             }
         }
@@ -3868,7 +3868,7 @@ fn traced(what: &str) {
         v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned).collect()
     });
     if hashes.iter().any(|h| what.contains(h.as_str())) && LOGGED.fetch_add(1, Ordering::Relaxed) < 500 {
-        tracing::info!("traced command: {what}");
+        tracing::info!("跟踪的命令：{what}");
     }
 }
 

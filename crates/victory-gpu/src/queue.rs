@@ -130,15 +130,15 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         #[cfg(feature = "paged-title")]
         {
             if host_lists.len() != lists.len() {
-                crate::host::fail(format_args!("paged title submission has a list without a host recorder"));
+                crate::host::fail(format_args!("VNME 提交包含没有宿主录制器的命令列表"));
             }
             let batch = crate::page_queue::ClosedTitleBatch::capture(&host_lists)
                 .unwrap_or_else(|e| crate::host::fail(format_args!("[VNME_SUBMISSION_REJECTED] VNME 拒绝提交 GPU 命令列表： {e:?}")));
             let heap = crate::memory::heap().unwrap_or_else(|| {
-                crate::host::fail(format_args!("paged title submission has no descriptor heap"))
+                crate::host::fail(format_args!("VNME 提交缺少描述符堆"))
             });
             if !crate::title_timeline::Lane::execute(&queue(this).lane, host, heap, batch) {
-                crate::host::fail(format_args!("VNME title queue exceeded its in-flight bound"));
+                crate::host::fail(format_args!("VNME 游戏队列超出在途任务上限"));
             }
         }
         #[cfg(not(feature = "paged-title"))]
@@ -148,7 +148,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     let _ = this;
     static ONCE: AtomicBool = AtomicBool::new(false);
     if !ONCE.swap(true, Ordering::Relaxed) {
-        tracing::warn!(count, "command lists submitted; no host GPU runs them");
+        tracing::warn!(count, "已提交命令列表，但没有宿主 GPU 执行");
     }
 }
 
@@ -366,12 +366,12 @@ fn present_now(planes: u32, plane_parameters: *const Plane) -> HRESULT {
             drawn,
             dispatches,
             dispatched,
-            "frame presented (since the last line: draws and dispatches, and those run on the host)"
+            "已呈现一帧；计数包括自上次记录以来的全部绘制和调度，以及实际提交到宿主的数量"
         );
         #[cfg(windows)]
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
-            tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            tracing::info!(hits, misses, "着色器缓存命中与翻译统计");
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -448,17 +448,17 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
             copied = shown.is_some(),
             black_frames = last.2,
             levels = ?crate::capture::recent_levels(),
-            "a black frame after a frame that was not"
+            "非黑帧之后出现黑帧"
         );
         for d in draws {
-            tracing::warn!("black frame {frame}: {d}");
+            tracing::warn!("黑帧 {frame}：{d}");
         }
         AFTER.store(frame + 6, Ordering::Relaxed);
     }
     // Six frames on: the levels around it (a fade or a single drop).
     static AFTER: AtomicU64 = AtomicU64::new(0);
     if AFTER.load(Ordering::Relaxed) == frame {
-        tracing::warn!(frame, levels = ?crate::capture::recent_levels(), "levels after the black frame");
+        tracing::warn!(frame, levels = ?crate::capture::recent_levels(), "黑帧之后的亮度统计");
     }
     *last = (black, drawn, last.2);
 }
@@ -520,7 +520,7 @@ extern "system" fn copy_page_mappings(
                 destination: *destination, count: ranges.len() as u32, ranges: ranges.as_ptr(),
             }).collect();
             if copy_page_mappings_now(batches.len() as u32, batches.as_ptr(), pool, pool_pages) != S_OK {
-                crate::host::fail(format_args!("VNME title page mapping failed before queue completion"));
+                crate::host::fail(format_args!("VNME 在队列完成前未能映射游戏内存页"));
             }
         }) {
             return crate::object::E_OUTOFMEMORY;
@@ -571,7 +571,7 @@ fn copy_page_mappings_now(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "内存页映射失败"));
         if cfg!(feature = "paged-title") {
             return E_INVALIDARG;
         }
