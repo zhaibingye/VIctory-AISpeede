@@ -731,6 +731,7 @@ pub(crate) struct HostList {
     list: ID3D12GraphicsCommandList,
     /// Closed state and whether a caller could have recorded native work.
     recording_flags: std::sync::atomic::AtomicU8,
+    page_rejection: std::sync::Mutex<Option<crate::page_slabs::ListRejection>>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1108,6 +1109,7 @@ impl Host {
                 allocator,
                 list,
                 recording_flags: 0.into(),
+                page_rejection: std::sync::Mutex::new(None),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -1733,14 +1735,22 @@ const CLOSED_RECORDING: u8 = 2;
 impl HostList {
     /// Borrow the writable native body. A list that exposes it can no
     /// longer prove that all its work is present in the title-copy stream.
+    #[track_caller]
     pub(crate) fn recording(&self) -> &ID3D12GraphicsCommandList {
         if self.recording_flags.load(Ordering::Relaxed) & NATIVE_RECORDING == 0 {
-            self.recording_flags.fetch_or(NATIVE_RECORDING, Ordering::Relaxed);
+            self.reject_page_recording(crate::page_slabs::ListRejection::NativeRecording(std::panic::Location::caller()));
         }
         &self.list
     }
 
+    #[track_caller]
     pub(crate) fn mark_unlowered(&self) {
+        self.reject_page_recording(crate::page_slabs::ListRejection::UnsupportedCommand(std::panic::Location::caller()));
+    }
+
+    pub(crate) fn reject_page_recording(&self, reason: crate::page_slabs::ListRejection) {
+        let mut first = self.page_rejection.lock().unwrap_or_else(|e| e.into_inner());
+        first.get_or_insert(reason);
         self.recording_flags.fetch_or(NATIVE_RECORDING, Ordering::Relaxed);
     }
 
@@ -1750,14 +1760,20 @@ impl HostList {
     pub(crate) fn append_closed_page_ops(
         &self,
         ops: &mut Vec<crate::page_queue::PageOp>,
-    ) -> bool {
-        if self.recording_flags.load(Ordering::Acquire) != CLOSED_RECORDING {
-            return false;
+    ) -> std::result::Result<(), crate::page_slabs::ListRejection> {
+        use crate::page_slabs::ListRejection;
+        let flags = self.recording_flags.load(Ordering::Acquire);
+        if flags & CLOSED_RECORDING == 0 {
+            return Err(ListRejection::NotClosed);
+        }
+        if flags & NATIVE_RECORDING != 0 {
+            return Err(self.page_rejection.lock().unwrap_or_else(|e| e.into_inner())
+                .unwrap_or(ListRejection::NativeState));
         }
         if !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             || !self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
         {
-            return false;
+            return Err(ListRejection::NativeState);
         }
         let deferred = self.deferred();
         if !deferred.writes.is_empty()
@@ -1765,14 +1781,14 @@ impl HostList {
             || !deferred.missed.is_empty()
             || deferred.copies.iter().any(|step| !matches!(step, Step::Copy(_) | Step::Page(_)))
         {
-            return false;
+            return Err(ListRejection::DeferredEffects);
         }
         ops.extend(deferred.copies.iter().filter_map(|step| match step {
             Step::Copy(copy) => Some(crate::page_queue::PageOp::Copy(*copy)),
             Step::Page(op) => Some(op.clone()),
             _ => None,
         }));
-        true
+        Ok(())
     }
 
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
@@ -1896,6 +1912,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         self.recording_flags.store(0, Ordering::Relaxed);
+        *self.page_rejection.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();

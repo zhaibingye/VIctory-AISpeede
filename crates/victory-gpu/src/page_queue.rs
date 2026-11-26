@@ -110,9 +110,8 @@ impl ClosedTitleBatch {
     pub(crate) fn capture(lists: &[&HostList]) -> std::result::Result<Self, BatchError> {
         let mut ops = Vec::new();
         for (index, list) in lists.iter().enumerate() {
-            if !list.append_closed_page_ops(&mut ops) {
-                return Err(BatchError::UnloweredList(index));
-            }
+            list.append_closed_page_ops(&mut ops)
+                .map_err(|reason| BatchError::UnloweredList { index, reason })?;
         }
         Ok(Self(ops))
     }
@@ -1223,7 +1222,7 @@ fn paged_title_recording_rejects_mixed_lists_before_alias_copy() {
     section.lock().unwrap()[..6].copy_from_slice(&initial);
     assert!(matches!(
         host.execute_paged_title(heap, &mut backing, &[&first, &second]),
-        Err(BatchError::UnloweredList(1))
+        Err(BatchError::UnloweredList { index: 1, reason: crate::page_slabs::ListRejection::NotClosed })
     ));
     // The native recorder is exposed; even a no-op native body is not
     // provably all copies. No early list should be submitted.
@@ -1231,7 +1230,7 @@ fn paged_title_recording_rejects_mixed_lists_before_alias_copy() {
     second.close();
     assert!(matches!(
         host.execute_paged_title(heap, &mut backing, &[&first, &second]),
-        Err(BatchError::UnloweredList(1))
+        Err(BatchError::UnloweredList { index: 1, reason: crate::page_slabs::ListRejection::NativeRecording(_) })
     ));
     assert_eq!(&section.lock().unwrap()[..6], &initial);
     second.reset();

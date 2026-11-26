@@ -405,37 +405,38 @@ impl State {
     }
 
     fn record_strict_draw(&self, list: &HostList, call: crate::page_draw::DrawCall) -> bool {
-        if let Some(draw) = self.capture_page_draw(call) {
-            list.record_page_draw(draw);
-            true
-        } else {
-            list.mark_unlowered();
-            false
+        match self.capture_page_draw(call) {
+            Ok(draw) => { list.record_page_draw(draw); true }
+            Err(reason) => {
+                list.reject_page_recording(crate::page_slabs::ListRejection::Shader { operation: "draw", reason });
+                false
+            }
         }
     }
 
     fn capture_page_draw(
         &self,
         call: crate::page_draw::DrawCall,
-    ) -> Option<crate::page_draw::ClosedDraw> {
+    ) -> Result<crate::page_draw::ClosedDraw, crate::page_shader::UnloweredShader> {
+        use crate::page_shader::UnloweredShader::GraphicsState;
         if self.page_state_opaque || !matches!(self.topology, 1..=5) {
-            return None;
+            return Err(GraphicsState);
         }
-        let targets = self.page_targets.clone()?;
-        let viewport = self.page_viewport?;
-        let scissor = self.page_scissor?;
-        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let targets = self.page_targets.clone().ok_or(GraphicsState)?;
+        let viewport = self.page_viewport.ok_or(GraphicsState)?;
+        let scissor = self.page_scissor.ok_or(GraphicsState)?;
+        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This).ok_or(GraphicsState)?;
         let mut inputs = Vec::new();
         for (slot, &view) in self.vertex.iter().enumerate() {
             if pipeline.slots & (1 << slot) != 0 {
                 let input = InputView::Vertex(slot as u32, view);
-                input.range().ok()?;
+                input.range().map_err(|_| GraphicsState)?;
                 inputs.push(input);
             }
         }
         if call.indexed() {
             let input = InputView::Index(self.index);
-            input.range().ok()?;
+            input.range().map_err(|_| GraphicsState)?;
             inputs.push(input);
         }
         let mut draw = crate::page_draw::ClosedDraw::from_translated(
@@ -451,9 +452,9 @@ impl State {
             scissor,
             inputs,
             call,
-        ).ok()?;
+        )?;
         draw.set_blend_factor(self.page_blend.unwrap_or([1.0; 4]));
-        Some(draw)
+        Ok(draw)
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -1029,19 +1030,20 @@ impl State {
     fn record_strict_dispatch(&self, list: &HostList, call: crate::page_dispatch::DispatchCall) -> bool {
         let ready = (!self.page_state_opaque)
             .then(|| crate::pipeline::host_pipeline(self.pipeline as This)).flatten()
+            .ok_or(crate::page_shader::UnloweredShader::GraphicsState)
             .and_then(|pipeline| crate::page_dispatch::ClosedDispatch::capture(
                 pipeline,
                 |slot, dword| self.page_word(true, slot, dword),
                 |root, index| self.page_view(true, root, index),
                 |slot| self.page_address(true, slot),
                 call,
-            ).ok());
-        if let Some(dispatch) = ready {
-            list.record_page_dispatch(dispatch);
-            true
-        } else {
-            list.mark_unlowered();
-            false
+            ));
+        match ready {
+            Ok(dispatch) => { list.record_page_dispatch(dispatch); true }
+            Err(reason) => {
+                list.reject_page_recording(crate::page_slabs::ListRejection::Shader { operation: "dispatch", reason });
+                false
+            }
         }
     }
 

@@ -256,9 +256,22 @@ pub(crate) struct PinnedBatch {
     aliases: BTreeMap<u64, PhysicalPage>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ListRejection {
+    NotClosed,
+    NativeRecording(&'static std::panic::Location<'static>),
+    UnsupportedCommand(&'static std::panic::Location<'static>),
+    Shader {
+        operation: &'static str,
+        reason: crate::page_shader::UnloweredShader,
+    },
+    NativeState,
+    DeferredEffects,
+}
+
 #[derive(Debug)]
 pub(crate) enum BatchError {
-    UnloweredList(usize),
+    UnloweredList { index: usize, reason: ListRejection },
     TargetNotInitialized,
     UnsupportedDepth,
     UnsupportedBarrier,
