@@ -504,7 +504,8 @@ impl Host {
             readback.encode(self, list, batch, plan, &mut dirty)?;
             Ok(dirty)
         })?;
-        readback.publish_mirror(publication.expect("readback reserved its publication"));
+        let slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
+        readback.publish_mirror(publication.expect("readback reserved its publication"), &slabs);
         Ok(())
     }
 
@@ -598,8 +599,11 @@ impl Host {
             Ok(dirty)
         })?;
         #[cfg(feature = "paged-title")]
-        for ((_, readback, _), publication) in visible.into_iter().zip(publications) {
-            readback.publish_mirror(publication);
+        if !visible.is_empty() {
+            let slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
+            for ((_, readback, _), publication) in visible.into_iter().zip(publications) {
+                readback.publish_mirror(publication, &slabs);
+            }
         }
         Ok(stats)
     }
@@ -858,6 +862,10 @@ fn submit_work<'a>(
         (None, None)
     };
     let uploads = CapturedUploads::stage(host, batch, backing)?;
+    #[cfg(feature = "paged-title")]
+    if let Some(uploads) = &uploads {
+        targets.set_snapshot(uploads.snapshot_digests());
+    }
     let slabs: BTreeMap<_, _> = batch
         .pages()
         .map(|(_, _, page)| (page.slab(), page.buffer()))
@@ -941,7 +949,7 @@ impl SubmittedRender<'_> {
         }
         // Native readiness is not guest byte visibility. Publish the
         // completed plan only after the required CPU merge succeeded.
-        self.targets.commit(self.fence, observed);
+        self.targets.commit(self.fence, observed, batch);
         drop(self.descriptors);
         if self.reusable {
             host.recycle_paged_list(self.list, self.fence, observed);

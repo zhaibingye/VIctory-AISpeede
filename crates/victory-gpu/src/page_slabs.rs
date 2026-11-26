@@ -207,6 +207,11 @@ impl PageSlabs {
         }
     }
 
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn completed_digest(&self, page: PhysicalPage) -> Option<blake3::Hash> {
+        self.pages.get(&page).and_then(|entry| entry.digest)
+    }
+
     /// Mark only the exact GPU version that was successfully merged back
     /// into RAM. A later GPU write may have superseded an older download.
     pub(crate) fn wrote_back(
@@ -419,13 +424,23 @@ impl PinnedBatch {
 pub(crate) struct CapturedUploads {
     staging: ID3D12Resource,
     mapped: std::ptr::NonNull<u8>,
-    snapshots: BTreeMap<PhysicalPage, PageSnapshot>,
+    snapshots: std::sync::Arc<BTreeMap<PhysicalPage, PageSnapshot>>,
 }
 
 struct PageSnapshot {
     va: u64,
     offset: usize,
     digest: blake3::Hash,
+}
+
+#[cfg(feature = "paged-title")]
+pub(crate) struct SnapshotDigests(std::sync::Arc<BTreeMap<PhysicalPage, PageSnapshot>>);
+
+#[cfg(feature = "paged-title")]
+impl SnapshotDigests {
+    pub(crate) fn get(&self, page: PhysicalPage) -> Option<blake3::Hash> {
+        self.0.get(&page).map(|page| page.digest)
+    }
 }
 
 impl CapturedUploads {
@@ -466,7 +481,7 @@ impl CapturedUploads {
         Ok(Some(Self {
             staging,
             mapped,
-            snapshots,
+            snapshots: std::sync::Arc::new(snapshots),
         }))
     }
 
@@ -484,6 +499,11 @@ impl CapturedUploads {
             .collect();
         upload(list, &entries);
         entries.len()
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn snapshot_digests(&self) -> SnapshotDigests {
+        SnapshotDigests(self.snapshots.clone())
     }
 
     pub(crate) fn digests(&self) -> BTreeMap<PhysicalPage, blake3::Hash> {

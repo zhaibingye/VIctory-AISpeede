@@ -22,7 +22,9 @@ pub(crate) struct SubmittedTail {
 pub(crate) struct ResourcePlan {
     inherited: SubmittedTail,
     #[cfg(feature = "paged-title")]
-    refreshed: std::collections::BTreeSet<usize>,
+    refreshed: BTreeMap<usize, Arc<HostTexture>>,
+    #[cfg(feature = "paged-title")]
+    snapshot: Option<crate::page_slabs::SnapshotDigests>,
     pending: BTreeMap<usize, (Arc<HostTexture>, Version)>,
     state: BTreeMap<usize, (Arc<HostTexture>, D3D12_RESOURCE_STATES)>,
 }
@@ -51,7 +53,7 @@ impl ResourcePlan {
 
     pub(crate) fn authoritative(&self, copy: &Arc<HostTexture>) -> bool {
         #[cfg(feature = "paged-title")]
-        if self.refreshed.contains(&Self::key(copy)) {
+        if self.refreshed.contains_key(&Self::key(copy)) {
             return true;
         }
         self.version(copy).map_or_else(
@@ -76,12 +78,17 @@ impl ResourcePlan {
             if copy.has_pointer_exposure()
                 && !self.pending.contains_key(&key)
                 && !self.inherited.versions.contains_key(&key)
-                && !self.refreshed.contains(&key)
+                && !self.refreshed.contains_key(&key)
             {
                 let source = copy.visible_linear_writeback()?.ok_or(BatchError::UnsupportedTextureMap)?;
-                self.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
-                source.copy_to(host, list, batch, &copy.texture, (0, 0))?;
-                self.refreshed.insert(key);
+                let unchanged = self.snapshot.as_ref().is_some_and(|snapshot| {
+                    copy.native_matches_snapshot(batch, snapshot)
+                });
+                if !unchanged {
+                    self.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
+                    source.copy_to(host, list, batch, &copy.texture, (0, 0))?;
+                }
+                self.refreshed.insert(key, copy.clone());
                 return Ok(());
             }
         }
@@ -142,8 +149,22 @@ impl ResourcePlan {
         Ok(())
     }
 
-    pub(crate) fn commit(self, submitted: Fence, observed: Fence) {
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn set_snapshot(&mut self, snapshot: crate::page_slabs::SnapshotDigests) {
+        self.snapshot = Some(snapshot);
+    }
+
+    pub(crate) fn commit(self, submitted: Fence, observed: Fence, batch: &crate::page_slabs::PinnedBatch) {
         assert!(observed.0 >= submitted.0, "resource authority requires a completed fence");
+        #[cfg(feature = "paged-title")]
+        if let Some(snapshot) = &self.snapshot {
+            for (key, copy) in &self.refreshed {
+                if !self.pending.contains_key(key) {
+                    copy.record_native_snapshot(batch, snapshot);
+                }
+            }
+        }
+        let _ = batch;
         for (copy, state) in self.state.into_values() {
             copy.state.store(state.0 as u32, Ordering::Release);
         }
@@ -296,8 +317,10 @@ impl TextureReadback {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn publish_mirror(&self, prepared: crate::resource::PreparedByteMirror) {
-        self.source.publish_byte_mirror(prepared);
+    pub(crate) fn publish_mirror(
+        &self, prepared: crate::resource::PreparedByteMirror, slabs: &crate::page_slabs::PageSlabs,
+    ) {
+        self.source.publish_byte_mirror(prepared, slabs);
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {

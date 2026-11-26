@@ -823,8 +823,15 @@ struct Resource {
 struct ByteMirror {
     version: Option<u64>,
     ranges: Box<[(u64, u64)]>,
-    pages: Box<[(usize, victory_memory::physical::PhysicalPage)]>,
+    pages: Box<[MirrorPage]>,
     _charge: victory_memory::physical::Reservation,
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+struct MirrorPage {
+    va: usize,
+    physical: victory_memory::physical::PhysicalPage,
+    digest: Option<blake3::Hash>,
 }
 
 /// None means the existing charged certificate matches these pins.
@@ -998,7 +1005,7 @@ impl HostTexture {
         {
             let saved = self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner());
             if saved.as_ref().is_some_and(|m| m.ranges.as_ref() == ranges && !m.pages.is_empty()
-                && m.pages.iter().all(|&(va, id)| pins.expected(va) == Some(id)))
+                && m.pages.iter().all(|page| pins.expected(page.va) == Some(page.physical)))
             {
                 return Ok(PreparedByteMirror(None));
             }
@@ -1017,11 +1024,14 @@ impl HostTexture {
             return Err(BatchError::UnsupportedTextureMap);
         }
         let bytes = std::mem::size_of_val(ranges) as u64
-            + pages.len() as u64 * std::mem::size_of::<(usize, victory_memory::physical::PhysicalPage)>() as u64;
+            + pages.len() as u64 * std::mem::size_of::<MirrorPage>() as u64;
         let charge = victory_memory::physical::HostBudget::process().reserve_ram(bytes)
             .map_err(|_| BatchError::Native(windows::Win32::Foundation::E_OUTOFMEMORY.into()))?;
         Ok(PreparedByteMirror(Some(ByteMirror {
-            version: None, ranges: ranges.into(), pages: pages.into_iter().collect(), _charge: charge,
+            version: None,
+            ranges: ranges.into(),
+            pages: pages.into_iter().map(|(va, physical)| MirrorPage { va, physical, digest: None }).collect(),
+            _charge: charge,
         })))
     }
 
@@ -1044,7 +1054,7 @@ impl HostTexture {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn publish_byte_mirror(&self, prepared: PreparedByteMirror) {
+    pub(crate) fn publish_byte_mirror(&self, prepared: PreparedByteMirror, slabs: &crate::page_slabs::PageSlabs) {
         let version = self.completed_native_version().unwrap_or_else(|| {
             crate::host::fail(format_args!("texture bytes published without completed native authority"))
         });
@@ -1052,7 +1062,11 @@ impl HostTexture {
         if let Some(mirror) = prepared.0 {
             *saved = Some(mirror);
         }
-        saved.as_mut().expect("reserved byte mirror").version = Some(version);
+        let mirror = saved.as_mut().expect("reserved byte mirror");
+        mirror.version = Some(version);
+        for page in &mut mirror.pages {
+            page.digest = slabs.completed_digest(page.physical);
+        }
     }
 
     #[cfg(feature = "paged-title")]
@@ -1068,7 +1082,37 @@ impl HostTexture {
             probe.include(start as usize, end as usize);
         }
         probe.flush();
-        mirror.pages.iter().all(|&(at, id)| probe.pins().expected(at) == Some(id))
+        mirror.pages.iter().all(|page| probe.pins().expected(page.va) == Some(page.physical))
+    }
+
+    /// Digest equality is evidence about this native texture version,
+    /// not just about what happens to occupy the current GPU page slab.
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn native_matches_snapshot(
+        &self, batch: &crate::page_slabs::PinnedBatch, snapshot: &crate::page_slabs::SnapshotDigests,
+    ) -> bool {
+        let Some(version) = self.completed_native_version() else { return false; };
+        let saved = self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner());
+        saved.as_ref().is_some_and(|mirror| mirror.version == Some(version) && !mirror.pages.is_empty()
+            && mirror.pages.iter().all(|page| {
+                batch.pinned_at(page.va as u64).is_some_and(|pin| pin.physical() == page.physical)
+                    && page.digest.is_some_and(|digest| snapshot.get(page.physical) == Some(digest))
+            }))
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn record_native_snapshot(
+        &self, batch: &crate::page_slabs::PinnedBatch, snapshot: &crate::page_slabs::SnapshotDigests,
+    ) {
+        let mut saved = self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mirror) = saved.as_mut() else { return; };
+        // Keep the existing publication identity. A remapped snapshot
+        // may be used by this draw but does not prove the old publication.
+        for page in &mut mirror.pages {
+            page.digest = batch.pinned_at(page.va as u64)
+                .filter(|pin| pin.physical() == page.physical)
+                .and_then(|_| snapshot.get(page.physical));
+        }
     }
 
     #[cfg(feature = "paged-title")]
