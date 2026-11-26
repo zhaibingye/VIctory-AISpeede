@@ -1056,6 +1056,16 @@ pub(crate) fn raw_uav_desc(first: u64, elements: u32) -> D3D12_UNORDERED_ACCESS_
     }
 }
 
+/// 表内常量缓冲区按原始字节绑定；整个可访问前缀由页批次捕获。
+pub(crate) fn paged_table_constant_range(view: &View) -> Option<(u64, u64)> {
+    let &View::Constant(address, size) = view else { return None; };
+    if address == 0 || !address.is_multiple_of(16) || size == 0 || !size.is_multiple_of(4) {
+        return None;
+    }
+    let end = address.checked_add(u64::from(size))?;
+    (end <= victory_memory::gpu_table::ADDRESS_LIMIT).then_some((address, end))
+}
+
 pub(crate) fn paged_raw_srv_range(view: &View) -> Option<(u64, u64)> {
     let View::Shader(resource, Some(words)) = view else { return None; };
     let desc = srv_desc(words);

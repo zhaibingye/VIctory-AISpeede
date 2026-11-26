@@ -82,7 +82,7 @@ pub(crate) fn constants_only(
     block: Option<(u32, u32)>,
     values: impl Fn(u8, u32) -> Option<u32>,
 ) -> Result<Option<RootWords>, UnloweredShader> {
-    stage_words(shader, used, block, values, |_| false, |_| false, |_| false, |_| false)
+    stage_words(shader, used, block, values, |_| false, |_| false, |_| false, |_| false, |_| false)
 }
 
 pub(crate) fn stage_words(
@@ -92,6 +92,7 @@ pub(crate) fn stage_words(
     values: impl Fn(u8, u32) -> Option<u32>,
     tables: impl Fn(u8) -> bool,
     uavs: impl Fn(u8) -> bool,
+    table_cbvs: impl Fn(u8) -> bool,
     cbvs: impl Fn(u8) -> bool,
     root_srvs: impl Fn(u8) -> bool,
 ) -> Result<Option<RootWords>, UnloweredShader> {
@@ -115,7 +116,8 @@ pub(crate) fn stage_words(
         }
         if u.root != RootType::Table || !tables(u.slot)
             || !(u.kind == victory_shader::ResourceType::Srv
-                || u.kind == victory_shader::ResourceType::Uav && uavs(u.slot))
+                || u.kind == victory_shader::ResourceType::Uav && uavs(u.slot)
+                || u.kind == victory_shader::ResourceType::Cbv && table_cbvs(u.slot))
         {
             return Err(UnloweredShader::DescriptorDeclaration {
                 root: u.slot, kind: u.kind, source: u.root,
@@ -282,6 +284,7 @@ enum ClosedView {
     Texture(TextureInput),
     TextureUav(crate::page_uav::ShaderTextureUav),
     Raw(BoundedBufferView),
+    TableConstant(BoundedBufferView),
     Structured(BoundedBufferView, u32),
 }
 
@@ -440,6 +443,7 @@ impl ShaderBindings {
                 |root| pipeline.compute && slots.iter().any(|s| {
                     s.slot.root == root && matches!(s.access, StaticViewAccess::RawUav { .. } | StaticViewAccess::StructuredUav { .. } | StaticViewAccess::TextureWrite { .. })
                 }),
+                |root| slots.iter().any(|s| s.slot.root == root && matches!(s.access, StaticViewAccess::ConstantTable { .. })),
                 |slot| stage.root_cbvs.iter().any(|&(bound, _)| bound == slot),
                 |root| slots.iter().any(|s| s.slot.root == root && matches!(s.access, StaticViewAccess::RootSrv { .. })),
             )? {
@@ -481,6 +485,12 @@ impl ShaderBindings {
                             StaticViewAccess::TextureWrite { .. } if pipeline.compute => {
                                 ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).ok_or(reason(DescriptorSlotReason::UnsupportedTextureWrite))?)
                             }
+                            StaticViewAccess::ConstantTable { .. } => {
+                                let (start, end) = crate::descriptor::host::paged_table_constant_range(&actual)
+                                    .ok_or(buffer)?;
+                                ClosedView::TableConstant(BoundedBufferView::new(start, end, false)
+                                    .ok_or(buffer)?)
+                            }
                             StaticViewAccess::RawSrv { .. } => {
                                 let (start, end) = crate::descriptor::host::paged_raw_srv_range(&actual)
                                     .ok_or(buffer)?;
@@ -513,7 +523,10 @@ impl ShaderBindings {
                         (Some(ClosedView::TextureUav(view)), StaticViewAccess::TextureWrite { x, y }) => {
                             if !view.allows(x, y) { return Err(reject); }
                         }
-                        (Some(ClosedView::Raw(raw)), StaticViewAccess::RawSrv { offset, bytes }) if !raw.unordered() => {
+                        (Some(ClosedView::Raw(raw)), StaticViewAccess::RawSrv { offset, bytes })
+                        | (Some(ClosedView::TableConstant(raw)), StaticViewAccess::ConstantTable { offset, bytes })
+                            if !raw.unordered() =>
+                        {
                             raw.allow_access(offset, bytes, false).ok_or(reject)?;
                         }
                         (Some(ClosedView::Structured(view, actual)), StaticViewAccess::StructuredSrv { stride, elements })
@@ -566,7 +579,7 @@ impl ShaderBindings {
                     ClosedView::Texture(texture) => texture.ranges(ranges)?,
                     // The queue footprint records writable native textures separately.
                     ClosedView::TextureUav(_) => {},
-                    ClosedView::Raw(raw) | ClosedView::Structured(raw, _) => ranges.push(raw.range()),
+                    ClosedView::Raw(raw) | ClosedView::TableConstant(raw) | ClosedView::Structured(raw, _) => ranges.push(raw.range()),
                 }
             }
         }
@@ -650,7 +663,7 @@ impl ShaderBindings {
     ) -> Result<PreparedShader, BatchError> {
         let spans = self.tables.values().flat_map(|table| table.values()).filter_map(|view| {
             match view {
-                ClosedView::Raw(raw) if !raw.unordered() => Some((raw.range(), 0)),
+                ClosedView::Raw(raw) | ClosedView::TableConstant(raw) if !raw.unordered() => Some((raw.range(), 0)),
                 ClosedView::Structured(view, stride) if !view.unordered() => Some((view.range(), *stride)),
                 _ => None,
             }
@@ -694,7 +707,7 @@ impl ShaderBindings {
                         view.prepare(host, list, batch, plan, shared.then_some(&mut shared_access))?
                     },
                     ClosedView::Raw(raw) if raw.unordered() => raw.prepare_uav(batch, &mut shader_dirty, 0)?,
-                    ClosedView::Raw(raw) => {
+                    ClosedView::Raw(raw) | ClosedView::TableConstant(raw) => {
                         let span = raw.range();
                         let (buffer, at) = bounded_reads.slot(span, 0)?;
                         TableDescriptor::Raw(buffer.clone(), at, span.1 - span.0, false)
@@ -720,7 +733,7 @@ impl ShaderBindings {
             for view in self.tables.values().flat_map(|table| table.values()) {
                 match view {
                     ClosedView::Texture(tex) => tex.ranges(&mut reads)?,
-                    ClosedView::Raw(raw) if !raw.unordered() => reads.push(raw.range()),
+                    ClosedView::Raw(raw) | ClosedView::TableConstant(raw) if !raw.unordered() => reads.push(raw.range()),
                     ClosedView::Structured(view, _) if !view.unordered() => reads.push(view.range()),
                     _ => {},
                 }

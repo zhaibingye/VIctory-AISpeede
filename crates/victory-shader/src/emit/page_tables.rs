@@ -23,6 +23,8 @@ pub enum StaticViewAccess {
     /// A statically bounded aligned byte window on a raw UAV, as used by DXIL.
     RawUav { offset: u32, bytes: u32, write: bool },
     RawSrv { offset: u32, bytes: u32 },
+    /// 游戏表内 CBV 由宿主翻译为原始只读缓冲区。
+    ConstantTable { offset: u32, bytes: u32 },
     RootSrv { bytes: u32 },
     StructuredSrv { stride: u32, elements: u32 },
     StructuredUav { stride: u32, elements: u32, write: bool },
@@ -107,6 +109,8 @@ pub fn static_view_report(container: &[u8]) -> Result<StaticViewReport, ShaderEr
             && let Some(access) = closed_image_read(name, dim)
         {
             AccessProof::Native(access)
+        } else if let Some(access) = bounded_scalar_buffer_read(inst, &mut bounds) {
+            access
         } else if let Some(access) = bounded_typed_load(inst, &mut bounds) {
             access
         } else if let Some(access) = bounded_structured_access(inst, &mut bounds) {
@@ -260,8 +264,43 @@ fn bounded_texture_write(
 
 enum AccessProof {
     Native(StaticViewAccess),
+    ScalarBufferRead { offset: u32, bytes: u32 },
     TypedRead { immediate: u32, vector_hi: u32, footprint: super::lower::TypedLoadFootprint },
     StructuredAccess { elements: u32, last_byte: u32, write: bool },
+}
+
+fn scalar_buffer_read_window(name: &str, offset: i32, scalar_hi: u32) -> Option<(u32, u32)> {
+    let read_bytes = match name.strip_prefix("s_buffer_load_dword")? {
+        "" => 4u32,
+        "x2" => 8,
+        "x4" => 16,
+        "x8" => 32,
+        "x16" => 64,
+        _ => return None,
+    };
+    let offset = u32::try_from(offset).ok()?;
+    if !offset.is_multiple_of(4) || !scalar_hi.is_multiple_of(4) {
+        return None;
+    }
+    let bytes = scalar_hi.checked_add(read_bytes)?;
+    (offset.checked_add(bytes)? <= 65536).then_some((offset, bytes))
+}
+
+fn bounded_scalar_buffer_read(
+    inst: &crate::ir::Inst,
+    bounds: &mut crate::range::Ranges<'_>,
+) -> Option<AccessProof> {
+    let Fields::Smem { offset, soffset, .. } = inst.fields else { return None; };
+    let scalar_hi = match soffset {
+        Operand::Scalar { code: NULL, .. } => 0,
+        Operand::Const(n @ 128..=192) => u32::from(n - 128),
+        Operand::Scalar { code: code @ 0..=105, dwords: 1 } =>
+            bounds.dword_offset_hi(inst.read(crate::ir::Reg::S(code))?)?,
+        _ => return None,
+    };
+    // 宿主使用字节偏移逐个读取 dword；不允许负偏移、回绕和未知对齐。
+    let (offset, bytes) = scalar_buffer_read_window(inst.name(), offset, scalar_hi)?;
+    Some(AccessProof::ScalarBufferRead { offset, bytes })
 }
 
 fn bounded_typed_load(
@@ -342,6 +381,7 @@ fn proven_root_srv(
     }
     let bytes = match proof {
         AccessProof::Native(StaticViewAccess::RawUav { offset, bytes, write: false })
+        | AccessProof::ScalarBufferRead { offset, bytes }
             if address.offset.is_multiple_of(4) =>
         {
             address.offset.checked_add(offset)?.checked_add(bytes)?
@@ -412,6 +452,13 @@ fn proven_slot(
                 _ => return None,
             }
         }
+        AccessProof::ScalarBufferRead { offset, bytes } if unique() && used.dwords == 4 => {
+            match used.kind {
+                ResourceType::Cbv => StaticViewAccess::ConstantTable { offset, bytes },
+                ResourceType::Srv if used.stride == 0 => StaticViewAccess::RawSrv { offset, bytes },
+                _ => return None,
+            }
+        }
         AccessProof::Native(access @ StaticViewAccess::TextureWrite { .. })
             if native.stage == HwStage::Cs && unique() && used.kind == ResourceType::Uav && used.dwords == 8 => access,
         AccessProof::Native(access @ StaticViewAccess::TextureRead { .. }) if used.kind == ResourceType::Srv && used.dwords == 8 => access,
@@ -436,4 +483,19 @@ fn page_texture_table_proof_requires_static_aligned_offsets() {
     assert_eq!(table_slot(Address { dynamic: Some(crate::ir::Value(0)), ..a }, 4), None);
     assert_eq!(table_slot(Address { offset: u32::MAX - 3, ..a }, 1), None);
     assert_eq!(table_slot(Address { offset: 256 * 32, ..a }, 0), None);
+}
+
+
+#[cfg(test)]
+#[test]
+fn scalar_buffer_proof_bounds_all_four_dwords_and_rejects_wrap() {
+    let name = "s_buffer_load_dwordx4";
+    assert_eq!(scalar_buffer_read_window(name, 16, 0), Some((16, 16)));
+    assert_eq!(scalar_buffer_read_window(name, 16, 12), Some((16, 28)));
+    assert_eq!(scalar_buffer_read_window(name, 65520, 0), Some((65520, 16)));
+    assert_eq!(scalar_buffer_read_window(name, 65524, 0), None);
+    assert_eq!(scalar_buffer_read_window(name, -4, 16), None);
+    assert_eq!(scalar_buffer_read_window(name, 16, 2), None);
+    assert_eq!(scalar_buffer_read_window(name, 16, u32::MAX - 3), None);
+    assert_eq!(scalar_buffer_read_window("s_buffer_store_dwordx4", 0, 0), None);
 }
