@@ -1683,3 +1683,90 @@ fn paged_linear_texture_uses_ordered_gpu_writes_and_pitched_rows() {
         readback.Unmap(0, None);
     }
 }
+
+/// 在真实 GPU 队列里，先经物理别名更新像素，再按二维分块布局读取。
+/// 这是无游戏数据的传输回归，不证明标题资源的权威来源。
+#[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+#[test]
+fn paged_display_microtile_reads_ordered_alias_write() {
+    use crate::page_texture::SharedTextureBytes;
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+    use victory_memory::physical::PageNumbers;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC};
+
+    const VA: usize = PAGE_BYTES as usize;
+    const ALIAS: usize = VA * 2;
+    let layout = Layout::new(&Desc {
+        dimension: Dimension::Tex2d, width: 4, height: 2, depth: 1,
+        mips: 1, element_bytes: 16, block: 1, samples: 1, swizzle: Swizzle::SW_256B_D,
+    }).unwrap();
+    let format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let image = SharedTextureBytes::new(VA as u64, format, &layout).unwrap();
+    let host = crate::host::host().expect("D3D12 宿主设备");
+    let heap = crate::memory::heap().unwrap();
+    let id = PageNumbers::default().allocate(11).unwrap().offset(10);
+    let (mut backing, section) = crate::title_backing::test_capture(id, &[VA, ALIAS]);
+    {
+        let mut bytes = section.lock().unwrap();
+        bytes[..256].fill(0xe3);
+        for y in 0..2 {
+            for x in 0..4 {
+                let at = layout.offset(0, x, y, 0).unwrap() as usize;
+                bytes[at..at + 16].fill((1 + y * 4 + x) as u8);
+            }
+        }
+        bytes[512..528].fill(99);
+    }
+    let copy = GuestCopy::new(ALIAS + 64, VA + 512, 16).unwrap();
+    let ranges: Vec<_> = copy.ranges().into_iter().chain(image.ranges()).collect();
+    let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 4, Height: 2,
+        DepthOrArraySize: 1, MipLevels: 1, Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
+    };
+    let mut texture = None;
+    // 安全：测试创建一个专用二维纹理，GPU 访问期间保持对象有效。
+    unsafe {
+        host.device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE, &desc, dest, None, &mut texture,
+        )
+    }.unwrap();
+    let texture: ID3D12Resource = texture.unwrap();
+    let mut output = None;
+    let stats = host.execute_paged_work(heap, &mut backing, &ranges, WriteSet::Declared,
+        |list, _, batch, pins, _, _| {
+            let scratch = host.default_buffer(16).unwrap();
+            list.keep(&scratch);
+            let mut dirty = BTreeSet::new();
+            record_copy(list, batch, &copy.bind(pins).unwrap(), &mut dirty, || Ok(scratch.clone()))
+                .map_err(BatchError::Native)?;
+            image.transfer(host, list, batch, &texture, None)?;
+            // 安全：传输保持目标为 COPY_DEST，回读前切为 COPY_SOURCE。
+            unsafe {
+                list.recording().ResourceBarrier(&[transition(&texture, dest, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            }
+            let (readback, footprint) = crate::capture::read_back(&host.device, list.recording(), &texture)
+                .ok_or_else(|| BatchError::Native(E_FAIL.into()))?;
+            list.keep(&readback);
+            output = Some((readback, footprint));
+            Ok(dirty)
+        }).unwrap();
+    assert_eq!(stats, PageStats { uploaded: 1, downloaded: 1 });
+    let (readback, footprint) = output.unwrap();
+    // 安全：真实 Fence 已完成，只访问已核验的原生足迹中两个有效行。
+    unsafe {
+        let mut ptr = std::ptr::null_mut();
+        readback.Map(0, None, Some(&mut ptr)).unwrap();
+        for (y, expected) in [[1, 2, 99, 4], [5, 6, 7, 8]].into_iter().enumerate() {
+            let row = ptr.cast::<u8>().add(footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize);
+            let data = std::slice::from_raw_parts(row, 64);
+            for (pixel, value) in data.chunks_exact(16).zip(expected) {
+                assert_eq!(pixel, [value; 16]);
+            }
+        }
+        readback.Unmap(0, None);
+    }
+    assert_eq!(section.lock().unwrap()[128..256], [0xe3; 128]);
+}
