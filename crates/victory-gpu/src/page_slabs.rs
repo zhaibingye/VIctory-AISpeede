@@ -345,6 +345,13 @@ impl PinnedBatch {
         backing: &mut crate::title_backing::SubmissionBacking,
         ranges: &[(u64, u64)],
     ) -> std::result::Result<Self, BatchError> {
+        Self::capture_backing(backing, ranges)?;
+        Self::from_capture(host, slabs, backing.pins(), ranges)
+    }
+
+    pub(crate) fn capture_backing(
+        backing: &mut crate::title_backing::SubmissionBacking, ranges: &[(u64, u64)],
+    ) -> std::result::Result<(), BatchError> {
         for &(start, end) in ranges {
             if start > end || end > ADDRESS_LIMIT {
                 return Err(BatchError::Range(start, end));
@@ -352,7 +359,7 @@ impl PinnedBatch {
             backing.include(start as usize, end as usize);
         }
         backing.flush();
-        Self::from_capture(host, slabs, backing.pins(), ranges)
+        Ok(())
     }
 
     /// The first captured VA is a source handle, not a new physical ID.

@@ -58,6 +58,11 @@ impl ClosedDispatch {
         Ok(())
     }
 
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn reads_guest_only(&self) -> bool {
+        !self.shader.uses_guest_uav()
+    }
+
     pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
         self.shader.written_targets(out);
     }

@@ -54,6 +54,7 @@ fn physical_footprint(
 ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError> {
     let mut physical = BTreeSet::new();
     for &(start, end) in ranges {
+        if start == end { continue; }
         let mut page = start & !(PAGE_BYTES - 1);
         while page < end {
             physical.insert(pins.expected(page as usize).ok_or(BatchError::NotCaptured(page))?);
@@ -125,7 +126,7 @@ impl ClosedTitleBatch {
         self.0.iter().all(|op| matches!(op,
             PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
             | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Draw(_)
-            | PageOp::Dispatch(_)))
+            | PageOp::Dispatch(_) | PageOp::Input(_) | PageOp::UploadTexture(_)))
     }
 
     #[cfg(feature = "paged-title")]
@@ -169,8 +170,13 @@ struct ClosedFootprint {
 
 impl ClosedFootprint {
     #[cfg(feature = "paged-title")]
-    fn is_page_free(&self) -> bool {
-        self.ranges.is_empty() && self.preserved.is_empty() && self.visible.is_empty()
+    fn permits_read_window(&self, ops: &[PageOp]) -> bool {
+        self.preserved.is_empty() && self.visible.is_empty() && ops.iter().all(|op| match op {
+            PageOp::Draw(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
+            | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Input(_) | PageOp::UploadTexture(_) => true,
+            PageOp::Dispatch(dispatch) => dispatch.reads_guest_only(),
+            PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) => false,
+        })
     }
 
     fn capture(ops: &[PageOp]) -> std::result::Result<Self, BatchError> {
@@ -641,66 +647,98 @@ impl Host {
     fn execute_native_window(
         &self, signal: &mut u64, heap: &HostHeap, batches: Vec<ClosedTitleBatch>,
     ) -> std::result::Result<(), BatchError> {
-        use crate::page_resource::{ResourcePlan, SubmittedTail};
+        use crate::page_resource::SubmittedTail;
 
         let mut tail = SubmittedTail::default();
-        let mut empty_backing = SubmissionBacking::default();
+        let mut occupied = BTreeSet::new();
         let mut in_flight = Vec::with_capacity(batches.len());
         let enqueue = (|| {
             for ops in batches.into_iter().map(|batch| batch.0).filter(|ops| !ops.is_empty()) {
                 let mut footprint = ClosedFootprint::capture(&ops)?;
-                if !footprint.is_page_free() {
-                    // Any guest bytes are an execution boundary. Publish
-                    // earlier work before reading current authority or
-                    // taking a new CPU snapshot of those physical pages.
-                    if !in_flight.is_empty() {
-                        self.drain_native_window(signal, &empty_backing, &mut in_flight);
-                        tail = SubmittedTail::default();
-                        footprint = ClosedFootprint::capture(&ops)?;
-                    }
+                if footprint.permits_read_window(&ops) {
                     let mut backing = SubmissionBacking::default();
-                    self.execute_paged_plan_locked(signal, heap, &mut backing, &ops, footprint)?;
-                    continue;
-                }
-                let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
-                let batch = PinnedBatch::capture(self, &mut slabs, &mut empty_backing, &[])?;
-                let render = submit_work(
-                    self, signal, heap, &empty_backing, &batch, WriteSet::Declared, ResourcePlan::after(&tail),
-                    |list, _, batch, pins, descriptors, targets| {
-                        let dirty = self.encode_closed_ops(list, batch, pins, descriptors, targets, &ops, 0)?;
-                        if !dirty.is_empty() {
-                            return Err(BatchError::UnsupportedTextureMap);
+                    PinnedBatch::capture_backing(&mut backing, &footprint.ranges)?;
+                    let physical = physical_footprint(backing.pins(), &footprint.ranges)?;
+                    // Bound additional simultaneous before-images to
+                    // 128 MiB. Resource and staging ledgers still apply.
+                    const WINDOW_PAGES: usize = 2048;
+                    // Shared physical IDs require a drain even when both
+                    // lists read: the later upload must see the latest GPU
+                    // digest, not the last completed digest before window.
+                    if occupied.is_disjoint(&physical)
+                        && occupied.len().saturating_add(physical.len()) <= WINDOW_PAGES
+                    {
+                        if let Some(work) = self.try_submit_window_work(
+                            signal, heap, backing, &footprint.ranges, &ops, &mut tail,
+                        )? {
+                            occupied.extend(physical);
+                            in_flight.push(work);
+                            continue;
                         }
-                        Ok(dirty)
-                    },
-                );
-                match render {
-                    Ok(render) => {
-                        render.targets.advance_submitted_tail(&mut tail);
-                        in_flight.push(InFlightPages { batch, render });
-                    }
-                    Err(error) => {
-                        batch.cancel(&mut slabs);
-                        return Err(error);
                     }
                 }
+                if !in_flight.is_empty() {
+                    self.drain_native_window(signal, &mut in_flight);
+                    occupied.clear();
+                    tail = SubmittedTail::default();
+                    footprint = ClosedFootprint::capture(&ops)?;
+                }
+                let mut backing = SubmissionBacking::default();
+                self.execute_paged_plan_locked(signal, heap, &mut backing, &ops, footprint)?;
             }
             Ok(())
         })();
-        // Always retire submitted GPU work, even on a later recording
-        // error. The logical fence and present boundaries come afterward.
-        self.drain_native_window(signal, &empty_backing, &mut in_flight);
+        // Already-enqueued work must finish even on a later encoding error.
+        self.drain_native_window(signal, &mut in_flight);
         enqueue
     }
 
     #[cfg(feature = "paged-title")]
+    fn try_submit_window_work<'a>(
+        &self, signal: &mut u64, heap: &'a HostHeap, backing: SubmissionBacking,
+        ranges: &[(u64, u64)], ops: &[PageOp], tail: &mut crate::page_resource::SubmittedTail,
+    ) -> std::result::Result<Option<(InFlightPages<'a>, SubmissionBacking)>, BatchError> {
+        use crate::page_resource::ResourcePlan;
+        let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
+        let batch = match PinnedBatch::from_capture(self, &mut slabs, backing.pins(), ranges) {
+            Ok(batch) => batch,
+            Err(BatchError::Native(error)) if error.code() == E_OUTOFMEMORY => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let render = submit_work(
+            self, signal, heap, &backing, &batch, WriteSet::Declared, ResourcePlan::after(tail),
+            |list, _, batch, pins, descriptors, targets| {
+                let dirty = self.encode_closed_ops(list, batch, pins, descriptors, targets, ops, 0)?;
+                if !dirty.is_empty() {
+                    return Err(BatchError::UnsupportedTextureMap);
+                }
+                Ok(dirty)
+            },
+        );
+        match render {
+            Ok(render) => {
+                render.targets.advance_submitted_tail(tail);
+                Ok(Some((InFlightPages { batch, render }, backing)))
+            }
+            Err(error) => {
+                batch.cancel(&mut slabs);
+                if matches!(&error, BatchError::Native(e) if e.code() == E_OUTOFMEMORY) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "paged-title")]
     fn drain_native_window(
-        &self, signal: &mut u64, backing: &SubmissionBacking, in_flight: &mut Vec<InFlightPages<'_>>,
+        &self, signal: &mut u64, work: &mut Vec<(InFlightPages<'_>, SubmissionBacking)>,
     ) {
-        if !in_flight.is_empty() {
+        if !work.is_empty() {
             let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
-            for work in in_flight.drain(..) {
-                work.retire(self, signal, backing, &mut slabs);
+            for (in_flight, backing) in work.drain(..) {
+                in_flight.retire(self, signal, &backing, &mut slabs);
             }
         }
     }
