@@ -521,6 +521,23 @@ pub(crate) type TableRecords = Box<[[u32; 2]]>;
 
 #[cfg(windows)]
 impl Heap {
+    /// VNME 仅捕获着色器已证明会访问的槽，避免分配和扫描此前的所有槽。
+    pub(crate) fn proven_table_view(&self, first: u64, slot: u32) -> Option<View> {
+        if self.desc.kind != VIEWS_KIND || first.checked_sub(self.start)? % 32 != 0 {
+            return None;
+        }
+        let at = first.checked_add(u64::from(slot) * 32)?;
+        self.index(at)?;
+        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: checked aligned slot within this live 32-byte descriptor heap.
+        let [tag, index, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG || generation == 0 {
+            return None;
+        }
+        let (view, current) = views.list.get(index as usize)?;
+        (*current == generation).then(|| view.clone())
+    }
+
     pub(crate) fn table_records(&self, first: u64, count: u32) -> Option<TableRecords> {
         if self.desc.kind != VIEWS_KIND || count == 0 {
             return None;
@@ -952,7 +969,15 @@ mod tests {
         assert_eq!(before[2], [0, 0]);
         assert!(heap.table_records(at(5), 2).is_none());
         assert!(heap.table_records(at(0) + 4, 2).is_none());
+        assert_eq!(heap.proven_table_view(at(3), 0), Some(View::Shader(r as usize, None)));
+        assert_eq!(heap.proven_table_view(at(3), 1), Some(View::NullConstant));
+        assert_eq!(heap.proven_table_view(at(3), 2), None);
+        assert_eq!(heap.proven_table_view(at(5), 1), None);
+        assert_eq!(heap.proven_table_view(at(0) + 4, 1), None);
+        assert_eq!(heap.proven_table_view(u64::MAX & !31, 1), None);
         forget(r as usize);
+        assert_eq!(heap.proven_table_view(at(3), 0), None);
+        assert_eq!(heap.proven_table_view(at(3), 1), Some(View::NullConstant));
         assert_eq!(heap.table_records(at(3), 3).unwrap()[0], [0, 0]);
         assert!(table_view(before[0]).is_none());
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);

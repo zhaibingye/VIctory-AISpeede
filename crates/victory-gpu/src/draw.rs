@@ -1069,9 +1069,7 @@ impl State {
 
     fn page_view(&self, compute: bool, root: u8, index: u32) -> Option<crate::descriptor::View> {
         let Root::Table(first) = *self.roots_ref(compute).get(root as usize)? else { return None };
-        let heap = self.heap_of(first)?;
-        let records = heap.table_records(first, index.checked_add(1)?)?;
-        table_view(*records.get(index as usize)?)
+        self.heap_of(first)?.proven_table_view(first, index)
     }
 
     /// Runs a dispatch on the host.
