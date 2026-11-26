@@ -403,8 +403,8 @@ impl ShaderBindings {
                     if let std::collections::btree_map::Entry::Vacant(e) = table.entry(slot.index) {
                         let actual = view(slot.root, slot.index).ok_or(UnloweredShader::DescriptorTable)?;
                         let bound = match proof.access {
-                            StaticViewAccess::TextureRead => ClosedView::Texture(
-                                actual.paged_texture_srv().ok_or(UnloweredShader::DescriptorTable)?),
+                            StaticViewAccess::TextureRead { array } => ClosedView::Texture(
+                                actual.paged_texture_srv(array).ok_or(UnloweredShader::DescriptorTable)?),
                             StaticViewAccess::TextureWrite { .. } if pipeline.compute => {
                                 ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).ok_or(reject)?)
                             }
@@ -435,7 +435,8 @@ impl ShaderBindings {
                         e.insert(bound);
                     }
                     match (table.get_mut(&slot.index), proof.access) {
-                        (Some(ClosedView::Texture(_)), StaticViewAccess::TextureRead) => {},
+                        (Some(ClosedView::Texture(texture)), StaticViewAccess::TextureRead { array })
+                            if texture.selection().slices.is_some() == array => {},
                         (Some(ClosedView::TextureUav(view)), StaticViewAccess::TextureWrite { x, y }) => {
                             if !view.allows(x, y) { return Err(reject); }
                         }
@@ -566,7 +567,7 @@ impl ShaderBindings {
                 views[index as usize] = Some(match view {
                     ClosedView::Texture(texture) => {
                         let (resource, format) = texture.encode(host, list, batch, plan)?;
-                        TableDescriptor::Texture(resource, format, texture.mips())
+                        TableDescriptor::Texture(resource, format, texture.selection())
                     }
                     ClosedView::TextureUav(view) => view.prepare(host, list, batch, plan)?,
                     ClosedView::Raw(raw) if raw.unordered() => raw.prepare_uav(batch, &mut shader_dirty, 0)?,

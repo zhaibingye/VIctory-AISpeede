@@ -27,6 +27,18 @@ impl MipSelection {
     }
 }
 
+/// Shader dimension and plane-zero subresource selection. A one-slice
+/// array is still an array view and must match the shader operand.
+#[derive(Clone, Copy)]
+pub(crate) struct TextureSelection {
+    pub(crate) mips: MipSelection,
+    pub(crate) slices: Option<MipSelection>,
+}
+
+impl TextureSelection {
+    pub(crate) const SINGLE: Self = Self { mips: MipSelection::SINGLE, slices: None };
+}
+
 /// One admitted shader view, consumed from ordered native authority or
 /// from an exact compatible byte representation.
 pub(crate) enum TextureInput {
@@ -37,7 +49,7 @@ pub(crate) enum TextureInput {
     Scoped {
         copy: std::sync::Arc<crate::resource::HostTexture>,
         format: DXGI_FORMAT,
-        mips: MipSelection,
+        selection: TextureSelection,
     },
     Native {
         copy: std::sync::Arc<crate::resource::HostTexture>,
@@ -114,24 +126,30 @@ impl TextureInput {
     }
 
     pub(crate) fn scoped_color(
-        copy: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT, mips: MipSelection,
+        copy: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT, selection: TextureSelection,
     ) -> Option<Self> {
         // SAFETY: retained native resource.
         let desc = unsafe { copy.texture.GetDesc() };
-        if !sample_color(format) || desc.Format != format || desc.DepthOrArraySize != 1 || desc.MipLevels <= 1
+        if !sample_color(format) || desc.Format != format
+            || (desc.DepthOrArraySize > 1) != selection.slices.is_some()
+            || (desc.DepthOrArraySize == 1 && desc.MipLevels <= 1)
             || desc.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
             || copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
         {
             return None;
         }
-        let mips = MipSelection::resolve(mips.first, mips.count, u32::from(desc.MipLevels))?;
-        let sub = crate::page_resource::ColorSubresource::capture(desc, mips.first)?;
+        let mips = MipSelection::resolve(selection.mips.first, selection.mips.count, u32::from(desc.MipLevels))?;
+        let slices = match selection.slices {
+            Some(slices) => Some(MipSelection::resolve(slices.first, slices.count, u32::from(desc.DepthOrArraySize))?),
+            None => None,
+        };
+        let sub = crate::page_resource::ColorSubresource::from_mip_slice(desc, mips.first, slices.map_or(0, |s| s.first))?;
         if !sub.allows(&copy) { return None; }
-        Some(Self::Scoped { copy, format, mips })
+        Some(Self::Scoped { copy, format, selection: TextureSelection { mips, slices } })
     }
 
-    pub(crate) fn mips(&self) -> MipSelection {
-        match self { Self::Scoped { mips, .. } => *mips, _ => MipSelection::SINGLE }
+    pub(crate) fn selection(&self) -> TextureSelection {
+        match self { Self::Scoped { selection, .. } => *selection, _ => TextureSelection::SINGLE }
     }
 
     pub(crate) fn native_depth(
@@ -201,17 +219,21 @@ impl TextureInput {
         plan: &mut crate::page_resource::ResourcePlan,
     ) -> Result<(ID3D12Resource, DXGI_FORMAT), BatchError> {
         match self {
-            Self::Scoped { copy, format, mips } => {
+            Self::Scoped { copy, format, selection } => {
                 if !extended_color_support(host, *format) {
                     return Err(BatchError::UnsupportedTextureMap);
                 }
                 // SAFETY: live resource retained by this view.
                 let desc = unsafe { copy.texture.GetDesc() };
-                for index in mips.first..mips.first + mips.count {
-                    let sub = crate::page_resource::ColorSubresource::capture(desc, index)
-                        .ok_or(BatchError::UnsupportedTextureMap)?;
-                    if !sub.allows(copy) { return Err(BatchError::UnsupportedTextureMap); }
-                    plan.require_color_subresource(host, list, batch, copy, sub)?;
+                let mips = selection.mips;
+                let slices = selection.slices.unwrap_or(MipSelection::SINGLE);
+                for slice in slices.first..slices.first + slices.count {
+                    for mip in mips.first..mips.first + mips.count {
+                        let sub = crate::page_resource::ColorSubresource::from_mip_slice(desc, mip, slice)
+                            .ok_or(BatchError::UnsupportedTextureMap)?;
+                        if !sub.allows(copy) { return Err(BatchError::UnsupportedTextureMap); }
+                        plan.require_color_subresource(host, list, batch, copy, sub)?;
+                    }
                 }
                 let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 plan.transition_texture(list, copy, state.0 as u32)?;

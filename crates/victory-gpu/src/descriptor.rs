@@ -390,21 +390,29 @@ impl View {
     /// A canonical 2D view with exact native color or depth format.
     /// A multi-mip view requires native authority for every named mip.
     #[cfg(windows)]
-    pub(crate) fn paged_texture_srv(&self) -> Option<crate::page_texture::TextureInput> {
-        use crate::page_texture::{MipSelection, TextureInput};
+    pub(crate) fn paged_texture_srv(&self, array: bool) -> Option<crate::page_texture::TextureInput> {
+        use crate::page_texture::{MipSelection, TextureInput, TextureSelection};
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         let Self::Shader(resource, desc) = *self else { return None };
         let resource = resource as This;
         let copy = crate::resource::host_copy(resource)?;
-        let (format, first, levels) = if let Some(words) = desc {
-            host::paged_2d_srv(&words)?
-        } else {
-            (DXGI_FORMAT(crate::resource::title_format(resource)? as i32), 0, u32::MAX)
-        };
         // SAFETY: the retained native texture is live.
         let actual = unsafe { copy.texture.GetDesc() };
-        let mips = MipSelection::resolve(first, levels, u32::from(actual.MipLevels))?;
-        if desc.is_some() && mips.first == 0 && mips.count == 1
+        let (format, mut selection) = if let Some(words) = desc {
+            host::paged_2d_srv(&words)?
+        } else {
+            let slices = (actual.DepthOrArraySize > 1).then_some(MipSelection {
+                first: 0, count: u32::from(actual.DepthOrArraySize),
+            });
+            (DXGI_FORMAT(crate::resource::title_format(resource)? as i32), TextureSelection {
+                mips: MipSelection { first: 0, count: u32::MAX }, slices,
+            })
+        };
+        if array != selection.slices.is_some() { return None; }
+        selection.mips = MipSelection::resolve(
+            selection.mips.first, selection.mips.count, u32::from(actual.MipLevels),
+        )?;
+        if desc.is_some() && !array && selection.mips.first == 0 && selection.mips.count == 1
             && let Some(depth) = TextureInput::native_depth(copy.clone(), format)
         {
             return Some(depth);
@@ -412,8 +420,8 @@ impl View {
         if crate::resource::stands_in(resource) {
             return None;
         }
-        if actual.MipLevels > 1 {
-            return TextureInput::scoped_color(copy, format, mips);
+        if actual.MipLevels > 1 || array {
+            return TextureInput::scoped_color(copy, format, selection);
         }
         let plain_linear = crate::resource::paged_linear_texture(resource).filter(|input| input.format == format);
         #[cfg(feature = "paged-title")]

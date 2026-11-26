@@ -18,7 +18,7 @@ pub struct StaticTextureSlot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StaticViewAccess {
-    TextureRead,
+    TextureRead { array: bool },
     TextureWrite { x: u32, y: u32 },
     /// A statically bounded aligned byte window on a raw UAV, as used by DXIL.
     RawUav { offset: u32, bytes: u32, write: bool },
@@ -37,7 +37,7 @@ pub struct StaticViewSlot {
 pub fn static_texture_slots(container: &[u8]) -> Result<Option<Vec<StaticTextureSlot>>, ShaderError> {
     Ok(static_view_slots(container)?.and_then(|views| {
         views.into_iter().map(|view| {
-            (view.access == StaticViewAccess::TextureRead).then_some(view.slot)
+            matches!(view.access, StaticViewAccess::TextureRead { array: false }).then_some(view.slot)
         }).collect()
     }))
 }
@@ -75,10 +75,11 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
         let name = inst.name();
         let access = if let Some(access) = bounded_texture_write(inst, &mut bounds) {
             AccessProof::Native(access)
-        } else if matches!(inst.fields, Fields::Image { dim: 1, .. })
+        } else if matches!(inst.fields, Fields::Image { dim: 1 | 4, .. })
             && (name.starts_with("image_sample") || matches!(name, "image_load" | "image_load_mip"))
         {
-            AccessProof::Native(StaticViewAccess::TextureRead)
+            let array = matches!(inst.fields, Fields::Image { dim: 4, .. });
+            AccessProof::Native(StaticViewAccess::TextureRead { array })
         } else if let Some(access) = bounded_typed_load(inst, &mut bounds) {
             access
         } else if let Some(access) = bounded_structured_access(inst, &mut bounds) {
@@ -351,7 +352,7 @@ fn proven_slot(
         }
         AccessProof::Native(access @ StaticViewAccess::TextureWrite { .. })
             if native.stage == HwStage::Cs && unique() && used.kind == ResourceType::Uav && used.dwords == 8 => access,
-        AccessProof::Native(access @ StaticViewAccess::TextureRead) if used.kind == ResourceType::Srv && used.dwords == 8 => access,
+        AccessProof::Native(access @ StaticViewAccess::TextureRead { .. }) if used.kind == ResourceType::Srv && used.dwords == 8 => access,
         AccessProof::Native(StaticViewAccess::RawUav { offset, bytes, write: false })
             if used.kind == ResourceType::Srv && used.dwords == 4 && used.stride == 0 && unique() =>
         {

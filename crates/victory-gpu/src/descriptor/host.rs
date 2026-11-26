@@ -684,18 +684,28 @@ impl HostHeap {
     /// Installs a batch-owned explicit 2D SRV in a reserved dynamic slot.
     pub(crate) fn paged_texture_at(
         &self, index: u32, texture: Option<&ID3D12Resource>, format: DXGI_FORMAT,
-        mips: crate::page_texture::MipSelection,
+        view: crate::page_texture::TextureSelection,
     ) {
         let Some(host) = host() else { return };
-        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: format,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+        let mips = view.mips;
+        let (dimension, fields) = match view.slices {
+            Some(slices) => (D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: mips.first, MipLevels: mips.count,
+                    FirstArraySlice: slices.first, ArraySize: slices.count,
+                    ..Default::default()
+                },
+            }),
+            None => (D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mips.first, MipLevels: mips.count, ..Default::default() },
-            },
+            }),
         };
-        // SAFETY: a reserved view slot and a live single-mip texture, or a
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: format, ViewDimension: dimension,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: fields,
+        };
+        // SAFETY: a reserved view slot and a live exact texture, or a
         // typed null descriptor on release.
         unsafe { host.device.CreateShaderResourceView(texture, Some(&desc), self.cpu(index)) };
         self.keep(index, texture.map(|t| (t.clone(), None)));
@@ -941,17 +951,29 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
 
 /// Exact plane-zero 2D view whose native layout can be re-created
 /// without reinterpreting swizzles, clamp, or subresource selection.
-pub(super) fn paged_2d_srv(words: &[u32; 10]) -> Option<(DXGI_FORMAT, u32, u32)> {
+pub(super) fn paged_2d_srv(words: &[u32; 10]) -> Option<(DXGI_FORMAT, crate::page_texture::TextureSelection)> {
+    use crate::page_texture::{MipSelection, TextureSelection};
     let desc = srv_desc(words);
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
-        || desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
-    {
+    if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
         return None;
     }
-    // SAFETY: checked discriminator selects the Texture2D union field.
-    let view = unsafe { desc.Anonymous.Texture2D };
-    (view.PlaneSlice == 0 && view.ResourceMinLODClamp == 0.0)
-        .then_some((desc.Format, view.MostDetailedMip, view.MipLevels))
+    let (mips, slices) = match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the dimension selects Texture2D.
+            let v = unsafe { desc.Anonymous.Texture2D };
+            if v.PlaneSlice != 0 || v.ResourceMinLODClamp != 0.0 { return None; }
+            (MipSelection { first: v.MostDetailedMip, count: v.MipLevels }, None)
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the dimension selects Texture2DArray.
+            let v = unsafe { desc.Anonymous.Texture2DArray };
+            if v.PlaneSlice != 0 || v.ResourceMinLODClamp != 0.0 || v.ArraySize == u32::MAX { return None; }
+            (MipSelection { first: v.MostDetailedMip, count: v.MipLevels },
+                Some(MipSelection { first: v.FirstArraySlice, count: v.ArraySize }))
+        }
+        _ => return None,
+    };
+    Some((desc.Format, TextureSelection { mips, slices }))
 }
 
 pub(crate) fn paged_texture_uav_desc(format: DXGI_FORMAT) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
