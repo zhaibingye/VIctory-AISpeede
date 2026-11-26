@@ -2188,6 +2188,11 @@ impl HostList {
     }
 
     #[cfg(feature = "paged-title")]
+    pub(crate) fn record_pipe_write(&self, op: crate::page_queue::PipeWrite) {
+        self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::PipeWrite(op)));
+    }
+
+    #[cfg(feature = "paged-title")]
     pub(crate) fn record_page_query(&self, query: crate::page_queue::TimestampOp) {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Timestamp(std::sync::Arc::new(query))));
     }
@@ -2285,6 +2290,7 @@ impl HostList {
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
+    #[cfg(not(feature = "paged-title"))]
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
@@ -3752,6 +3758,18 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn supports_pipe_marker(&self) -> bool {
+        static DIRECT: OnceLock<bool> = OnceLock::new();
+        *DIRECT.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: the initialized output structure matches OPTIONS3.
+            unsafe { self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3, (&raw mut options).cast(), size_of_val(&options) as u32,
+            ) }.is_ok() && options.WriteBufferImmediateSupportFlags.contains(D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT)
+        })
+    }
+
     #[cfg(feature = "paged-title")]
     pub(crate) fn timestamp_frequency(&self) -> windows::core::Result<u64> {
         // SAFETY: the retained direct queue supports timestamps.

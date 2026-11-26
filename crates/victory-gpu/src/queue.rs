@@ -234,6 +234,7 @@ const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
 
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(all(windows, feature = "paged-title"), allow(dead_code, reason = "legacy submission storage is not populated by VNME"))]
 pub(crate) enum Written {
     Value(u64),
     /// The GPU clock: [`TIMESTAMP_FREQUENCY`] ticks per second since the

@@ -48,6 +48,8 @@ pub(crate) enum PageOp {
     ClearUavTexture(std::sync::Arc<crate::page_uav::TextureClear>),
     #[cfg(feature = "paged-title")]
     Timestamp(std::sync::Arc<TimestampOp>),
+    #[cfg(feature = "paged-title")]
+    PipeWrite(PipeWrite),
 }
 
 #[cfg(feature = "paged-title")]
@@ -103,6 +105,73 @@ impl TimestampOp {
     }
 }
 
+#[cfg(feature = "paged-title")]
+#[derive(Clone, Copy)]
+pub(crate) enum PipeWriteValue { Word(u32), GpuTimestamp }
+
+#[cfg(feature = "paged-title")]
+#[derive(Clone, Copy)]
+pub(crate) struct PipeWrite {
+    span: (u64, u64),
+    value: PipeWriteValue,
+}
+
+#[cfg(feature = "paged-title")]
+impl PipeWrite {
+    pub(crate) fn capture(address: u64, value: PipeWriteValue) -> Option<Self> {
+        let width = match value { PipeWriteValue::Word(_) => 4, PipeWriteValue::GpuTimestamp => 8 };
+        let end = address.checked_add(width)?;
+        (address != 0 && address.is_multiple_of(width) && end <= victory_memory::gpu_table::ADDRESS_LIMIT)
+            .then_some(Self { span: (address, end), value })
+    }
+
+    fn encode(
+        self, host: &Host, list: &HostList, batch: &PinnedBatch,
+        timestamp: &mut Option<ID3D12QueryHeap>, dirty: &mut BTreeSet<PhysicalPage>,
+    ) -> std::result::Result<(), BatchError> {
+        let cmd = list.recording();
+        match self.value {
+            PipeWriteValue::Word(value) => {
+                if !host.supports_pipe_marker() { return Err(BatchError::UnsupportedBarrier); }
+                let cmd2: ID3D12GraphicsCommandList2 = cmd.cast().map_err(BatchError::Native)?;
+                let page = batch.pinned_at(self.span.0).ok_or(BatchError::NotCaptured(self.span.0))?;
+                let buffer = page.buffer();
+                list.keep(buffer);
+                let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+                // SAFETY: a checked dword fits this retained canonical slab;
+                // MARKER_OUT waits for prior commands before writing it.
+                unsafe {
+                    let gpu = buffer.GetGPUVirtualAddress() + page.offset() + self.span.0 % PAGE_BYTES;
+                    let parameter = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu, Value: value };
+                    cmd.ResourceBarrier(&[transition(buffer, uav, dest)]);
+                    cmd2.WriteBufferImmediate(1, &parameter, Some(&D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT));
+                    cmd.ResourceBarrier(&[transition(buffer, dest, uav)]);
+                }
+                dirty.insert(page.physical());
+            }
+            PipeWriteValue::GpuTimestamp => {
+                if timestamp.is_none() {
+                    // SAFETY: one same-queue slot, used in ordered end/resolve pairs.
+                    unsafe { host.device.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 1, NodeMask: 0,
+                    }, timestamp) }.map_err(BatchError::Native)?;
+                }
+                let heap = timestamp.as_ref().ok_or_else(|| BatchError::Native(oom()))?;
+                let stage = host.default_buffer(8).ok_or_else(|| BatchError::Native(oom()))?;
+                list.keep(heap);
+                // SAFETY: end initializes the slot before resolve; stage fits one result.
+                unsafe {
+                    cmd.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                    cmd.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, &stage, 0);
+                }
+                crate::page_view::scatter_regions(list, batch, [(self.span, 0)], &stage, dirty)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl PageOp {
     fn failure(&self, phase: &'static str, index: usize, cause: BatchError) -> BatchError {
         let operation = match self {
@@ -118,6 +187,8 @@ impl PageOp {
             Self::Barrier(_) => "resource barrier",
             Self::ClearRaw(_) => "buffer UAV clear",
             Self::ClearUavTexture(_) => "texture UAV clear",
+            #[cfg(feature = "paged-title")]
+            Self::PipeWrite(_) => "bottom-of-pipe write",
             #[cfg(feature = "paged-title")]
             Self::Timestamp(op) => match op.as_ref() {
                 TimestampOp::End { .. } => "timestamp end",
@@ -257,7 +328,7 @@ impl ClosedFootprint {
             PageOp::Draw(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
             | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Input(_) | PageOp::UploadTexture(_) => true,
             PageOp::Dispatch(dispatch) => dispatch.reads_guest_only(),
-            PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) | PageOp::Timestamp(_) => false,
+            PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) | PageOp::Timestamp(_) | PageOp::PipeWrite(_) => false,
         })
     }
 
@@ -271,6 +342,8 @@ impl ClosedFootprint {
                         ranges.extend(copy.ranges());
                         max_copy = max_copy.max(copy.len as u64);
                     }
+                    #[cfg(feature = "paged-title")]
+                    PageOp::PipeWrite(op) => ranges.push(op.span),
                     #[cfg(feature = "paged-title")]
                     PageOp::Timestamp(op) => {
                         if let TimestampOp::Resolve { span, .. } = op.as_ref() { ranges.push(*span); }
@@ -712,6 +785,8 @@ impl Host {
         };
         let mut dirty = BTreeSet::new();
         let mut indirect_budget = None;
+        #[cfg(feature = "paged-title")]
+        let mut pipe_timestamp = None;
         for (index, op) in ops.iter().enumerate() {
             (|| -> std::result::Result<(), BatchError> {
                 match op {
@@ -736,6 +811,8 @@ impl Host {
                     PageOp::ClearUavTexture(clear) => clear.encode(self, list, batch, descriptors, targets)?,
                     #[cfg(feature = "paged-title")]
                     PageOp::Timestamp(op) => op.encode(self, list, batch, targets, &mut dirty)?,
+                    #[cfg(feature = "paged-title")]
+                    PageOp::PipeWrite(op) => op.encode(self, list, batch, &mut pipe_timestamp, &mut dirty)?,
                 }
                 Ok(())
             })().map_err(|error| op.failure("encode", index, error))?;

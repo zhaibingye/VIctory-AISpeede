@@ -15,6 +15,7 @@ use std::mem::offset_of;
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
 };
+#[cfg(not(all(windows, feature = "paged-title")))]
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
@@ -1621,19 +1622,47 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    #[cfg(all(windows, feature = "paged-title"))]
+    {
+        record_pipe_write(this, address, (_flush == 0 && _flags == 0)
+            .then_some(crate::page_queue::PipeWriteValue::Word(value)));
+        return;
+    }
+    #[cfg(not(all(windows, feature = "paged-title")))]
     defer_write(this, address, Written::Value(u64::from(value)), 4);
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
     const GPU_TIMESTAMP: u32 = 1;
-    const SYSTEM_TIMESTAMP: u32 = 2;
-    let what = match flags {
-        GPU_TIMESTAMP => Written::GpuTimestamp,
-        SYSTEM_TIMESTAMP => Written::SystemTimestamp,
-        _ => Written::Value(value),
-    };
-    defer_write(this, address, what, 8);
+    #[cfg(all(windows, feature = "paged-title"))]
+    {
+        let _ = value;
+        record_pipe_write(this, address, (_flush == 0 && flags == GPU_TIMESTAMP)
+            .then_some(crate::page_queue::PipeWriteValue::GpuTimestamp));
+    }
+    #[cfg(not(all(windows, feature = "paged-title")))]
+    {
+        const SYSTEM_TIMESTAMP: u32 = 2;
+        let what = match flags {
+            GPU_TIMESTAMP => Written::GpuTimestamp,
+            SYSTEM_TIMESTAMP => Written::SystemTimestamp,
+            _ => Written::Value(value),
+        };
+        defer_write(this, address, what, 8);
+    }
 }
 
+#[cfg(all(windows, feature = "paged-title"))]
+fn record_pipe_write(this: This, address: u64, value: Option<crate::page_queue::PipeWriteValue>) {
+    if let Some(list) = host_list(this) {
+        if let Some(op) = value.and_then(|value| crate::page_queue::PipeWrite::capture(address, value)) {
+            list.record_pipe_write(op);
+        } else {
+            list.mark_unlowered();
+        }
+    }
+}
+
+#[cfg(not(all(windows, feature = "paged-title")))]
 fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     if address == 0 {
         return;
