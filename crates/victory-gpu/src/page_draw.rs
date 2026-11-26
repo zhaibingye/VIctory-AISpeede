@@ -6,7 +6,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use std::sync::{Arc, atomic::Ordering};
 
-use crate::host::{Host, HostList, transition};
+use crate::host::{Host, HostList, transition_subresource};
+#[cfg(all(test, feature = "diagnostics"))]
+use crate::host::transition;
 use crate::page_resource::{ColorSubresource, ResourcePlan};
 use crate::page_shader::{ShaderBindings, UnloweredShader};
 #[cfg(all(test, feature = "diagnostics"))]
@@ -186,7 +188,7 @@ pub(crate) struct DepthTarget {
     desc: Option<D3D12_DEPTH_STENCIL_VIEW_DESC>,
     format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
     planes: u32,
-    read_only: bool,
+    read_only_planes: u32,
     samples: u32,
 }
 
@@ -228,55 +230,78 @@ impl DepthTarget {
         if tex.Format != format && tex.Format != typeless {
             return None;
         }
-        // The ledger currently treats the DSV as one resource. Mixed
-        // read/write planes need per-plane state and are not admitted.
-        let read_only = match desc.as_ref().map_or(0, |d| d.Flags.0 as u32) {
-            0 => false,
-            flags if flags == planes => true,
-            _ => return None,
-        };
-        Some(Self { copy, desc, format, planes, read_only, samples: tex.SampleDesc.Count })
+        let read_only_planes = desc.as_ref().map_or(0, |d| d.Flags.0 as u32);
+        if read_only_planes & !planes != 0 {
+            return None;
+        }
+        Some(Self { copy, desc, format, planes, read_only_planes, samples: tex.SampleDesc.Count })
     }
 
-    fn validate_samples(&self) -> Result<(), BatchError> {
-        if self.samples > 1 && (self.copy.uses_unproven_alias_backing() || self.copy.has_pointer_exposure()
-            || self.copy.twin.get().is_some_and(Option::is_some))
+    fn validate_backing(&self) -> Result<(), BatchError> {
+        if self.copy.twin.get().is_some_and(Option::is_some)
+            || (self.samples > 1 || self.read_only_planes != 0)
+                && (self.copy.uses_unproven_alias_backing() || self.copy.has_pointer_exposure())
         {
             return Err(BatchError::UnsupportedDepth);
         }
         Ok(())
     }
 
-    fn desired(&self, sampled: bool) -> D3D12_RESOURCE_STATES {
-        if !self.read_only {
-            return D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        }
-        let depth = D3D12_RESOURCE_STATE_DEPTH_READ;
-        if sampled {
-            depth | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-                | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-        } else {
-            depth
-        }
-    }
-
     fn begin(
-        &self, host: &Host, list: &HostList, initialized: &ResourcePlan, desired: D3D12_RESOURCE_STATES,
-    ) -> (D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_RESOURCE_STATES) {
-        let texture = &self.copy.texture;
-        let before = initialized.state(&self.copy);
-        list.keep(texture);
-        if before != desired {
-            // SAFETY: retained under the queue lock; restored in end.
-            unsafe { list.recording().ResourceBarrier(&[transition(texture, before, desired)]); }
+        &self, host: &Host, list: &HostList, initialized: &ResourcePlan, sampled: bool,
+    ) -> (D3D12_CPU_DESCRIPTOR_HANDLE, DepthScope) {
+        let state_for = |plane_mask| {
+            if self.read_only_planes & plane_mask != 0 {
+                D3D12_RESOURCE_STATE_DEPTH_READ
+            } else {
+                D3D12_RESOURCE_STATE_DEPTH_WRITE
+            }
+        };
+        let mut depth = state_for(1);
+        if sampled {
+            depth |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         }
-        (host.dsv(texture, self.desc.as_ref()), before)
+        let scope = DepthScope {
+            before: initialized.state(&self.copy),
+            depth,
+            stencil: (self.planes & 2 != 0).then(|| state_for(2)),
+        };
+        let texture = &self.copy.texture;
+        list.keep(texture);
+        scope.transition(list.recording(), texture, false);
+        (host.dsv(texture, self.desc.as_ref()), scope)
     }
+}
 
-    fn end(&self, list: &HostList, before: D3D12_RESOURCE_STATES, desired: D3D12_RESOURCE_STATES) {
-        if before != desired {
-            // SAFETY: the scope kept the resource in the recorded state.
-            unsafe { list.recording().ResourceBarrier(&[transition(&self.copy.texture, desired, before)]); }
+/// Only the command body sees mixed states. Restore the uniform baseline
+/// before another operation or the submitted tail can observe this image.
+struct DepthScope {
+    before: D3D12_RESOURCE_STATES,
+    depth: D3D12_RESOURCE_STATES,
+    stencil: Option<D3D12_RESOURCE_STATES>,
+}
+
+impl DepthScope {
+    fn transition(&self, cmd: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, restore: bool) {
+        let one = |index, desired| {
+            let (old, new) = if restore { (desired, self.before) } else { (self.before, desired) };
+            (old != new).then(|| transition_subresource(texture, index, old, new))
+        };
+        let states = if let Some(stencil) = self.stencil.filter(|&state| state != self.depth) {
+            // The captured DSV has one mip and slice. D3D12 plane indices
+            // therefore equal native subresource indices for this layout.
+            [one(0, self.depth), one(1, stencil)]
+        } else {
+            [one(D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, self.depth), None]
+        };
+        // SAFETY: the exact texture and both states are retained; the
+        // scope is paired within this command under the queue lock.
+        unsafe {
+            match states {
+                [Some(depth), Some(stencil)] => cmd.ResourceBarrier(&[depth, stencil]),
+                [Some(barrier), None] | [None, Some(barrier)] => cmd.ResourceBarrier(&[barrier]),
+                [None, None] => {}
+            }
         }
     }
 }
@@ -298,9 +323,9 @@ impl DepthClear {
     pub(crate) fn encode(
         &self, host: &Host, list: &HostList, initialized: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
-        self.target.validate_samples()?;
+        self.target.validate_backing()?;
         let planes = self.target.planes;
-        if self.target.read_only || self.flags == 0 || self.flags & !planes != 0
+        if self.flags == 0 || self.flags & !planes != 0 || self.flags & self.target.read_only_planes != 0
             || self.flags & 1 != 0 && !(0.0..=1.0).contains(&self.depth)
         {
             return Err(BatchError::UnsupportedDepth);
@@ -314,15 +339,14 @@ impl DepthClear {
         if !replaces_planes {
             initialized.require_depth_planes(&self.target.copy, self.flags)?;
         }
-        let desired = self.target.desired(false);
-        let (handle, before) = self.target.begin(host, list, initialized, desired);
+        let (handle, scope) = self.target.begin(host, list, initialized, false);
         // SAFETY: retained matching DSV in the scoped depth state.
         unsafe {
             let rects = (!self.rects.is_empty()).then_some(self.rects.as_slice());
             list.recording().ClearDepthStencilView(handle, D3D12_CLEAR_FLAGS(self.flags as i32),
                 self.depth, self.stencil, rects);
         }
-        self.target.end(list, before, desired);
+        scope.transition(list.recording(), &self.target.copy.texture, true);
         initialized.record_depth_writes(&self.target.copy, self.flags)?;
         Ok(())
     }
@@ -415,8 +439,9 @@ impl ClosedDraw {
         let shader = ShaderBindings::capture(pipeline, values, view, address)?;
         if depth.as_ref().is_some_and(|d| {
             pipeline.closed_depth_tests & !d.planes != 0
-                || d.read_only && pipeline.closed_depth_writes != 0
-                || shader.samples_target(&d.copy) && (!d.read_only || !shader.depth_reads_are_exact(&d.copy))
+                || pipeline.closed_depth_writes & d.read_only_planes != 0
+                || shader.samples_target(&d.copy)
+                    && (d.read_only_planes & 1 == 0 || !shader.depth_reads_are_exact(&d.copy))
         }) {
             return Err(UnloweredShader::GraphicsState);
         }
@@ -480,15 +505,11 @@ impl ClosedDraw {
         dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
     ) -> Result<(), BatchError> {
         if let Some(depth) = &self.depth {
-            depth.validate_samples()?;
+            depth.validate_backing()?;
             initialized.require_depth_planes(&depth.copy, self.depth_tests)?;
         }
         let sampled_depth = self.depth.as_ref().is_some_and(|d| self.shader.samples_target(&d.copy));
-        if let Some(depth) = &self.depth && depth.read_only
-            && (depth.copy.has_pointer_exposure() || depth.copy.uses_unproven_alias_backing()
-                || depth.copy.twin.get().is_some_and(Option::is_some)
-                || sampled_depth && !self.shader.depth_reads_are_exact(&depth.copy))
-        {
+        if let Some(depth) = &self.depth && sampled_depth && !self.shader.depth_reads_are_exact(&depth.copy) {
             return Err(BatchError::UnsupportedDepth);
         }
         // New guest views of a native allocation can be created after
@@ -532,11 +553,7 @@ impl ClosedDraw {
             list.keep(texture);
             rtvs[slot] = host.rtv(texture, target.desc.as_ref());
         }
-        let dsv = self.depth.as_ref().map(|d| {
-            let desired = d.desired(sampled_depth);
-            let (handle, before) = d.begin(host, list, initialized, desired);
-            (handle, before, desired)
-        });
+        let dsv = self.depth.as_ref().map(|d| d.begin(host, list, initialized, sampled_depth));
         // SAFETY: the proven draw owns its pipeline, root and target. The
         // inputs are bound from admitted pages or retained copies of them.
         unsafe {
@@ -568,7 +585,7 @@ impl ClosedDraw {
                 self.targets.len() as u32,
                 (!self.targets.is_empty()).then_some(rtvs.as_ptr()),
                 false,
-                dsv.as_ref().map(|(h, _, _)| std::ptr::from_ref(h)),
+                dsv.as_ref().map(|(h, _)| std::ptr::from_ref(h)),
             );
             match self.call {
                 DrawCall::Direct { vertices, instances, first, first_instance } => {
@@ -587,8 +604,8 @@ impl ClosedDraw {
                 }
             }
         }
-        if let (Some(depth), Some((_, before, desired))) = (&self.depth, dsv) {
-            depth.end(list, before, desired);
+        if let (Some(depth), Some((_, scope))) = (&self.depth, dsv) {
+            scope.transition(list.recording(), &depth.copy.texture, true);
             initialized.record_depth_writes(&depth.copy, self.depth_writes)?;
         }
         for target in &self.targets {
