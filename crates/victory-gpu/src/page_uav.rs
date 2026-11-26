@@ -236,7 +236,7 @@ impl TextureClear {
 
 /// A captured descriptor prefix and its independently proven access windows.
 /// Keeping the prefix preserves byte offsets in the translated shader.
-pub(crate) struct BoundedRawView {
+pub(crate) struct BoundedBufferView {
     unordered: bool,
     start: u64,
     limit: u64,
@@ -244,7 +244,7 @@ pub(crate) struct BoundedRawView {
     writes: Vec<(u64, u64)>,
 }
 
-impl BoundedRawView {
+impl BoundedBufferView {
     pub(crate) fn new(start: u64, limit: u64, unordered: bool) -> Option<Self> {
         let alignment = if unordered { 16 } else { 4 };
         (start != 0 && start.is_multiple_of(alignment) && start < limit && limit <= ADDRESS_LIMIT)
@@ -270,7 +270,7 @@ impl BoundedRawView {
     pub(crate) fn range(&self) -> (u64, u64) { (self.start, self.end) }
 
     pub(crate) fn prepare_uav(
-        &self, batch: &PinnedBatch, dirty: &mut BTreeSet<PhysicalPage>,
+        &self, batch: &PinnedBatch, dirty: &mut BTreeSet<PhysicalPage>, stride: u32,
     ) -> Result<crate::page_queue::TableDescriptor, BatchError> {
         if !self.unordered {
             return Err(BatchError::Range(self.start, self.end));
@@ -287,6 +287,11 @@ impl BoundedRawView {
             }
             at += PAGE_BYTES;
         }
+        let offset = first.offset() + self.start % PAGE_BYTES;
+        let bytes = self.end - self.start;
+        if stride != 0 && (!offset.is_multiple_of(u64::from(stride)) || !bytes.is_multiple_of(u64::from(stride))) {
+            return Err(BatchError::Range(self.start, self.end));
+        }
         for &(start, end) in &self.writes {
             let mut at = start & !(PAGE_BYTES - 1);
             while at < end {
@@ -294,8 +299,12 @@ impl BoundedRawView {
                 at += PAGE_BYTES;
             }
         }
-        Ok(crate::page_queue::TableDescriptor::Raw(
-            first.buffer().clone(), first.offset() + self.start % PAGE_BYTES, self.end - self.start, true,
-        ))
+        Ok(if stride == 0 {
+            crate::page_queue::TableDescriptor::Raw(first.buffer().clone(), offset, bytes, true)
+        } else {
+            crate::page_queue::TableDescriptor::Structured(
+                first.buffer().clone(), offset, (bytes / u64::from(stride)) as u32, stride, true,
+            )
+        })
     }
 }

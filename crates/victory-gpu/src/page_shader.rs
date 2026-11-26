@@ -7,7 +7,7 @@ use crate::page_queue::PageDescriptors;
 use crate::page_slabs::{BatchError, PinnedBatch};
 use crate::descriptor::View;
 use crate::page_texture::TextureInput;
-use crate::page_uav::BoundedRawView;
+use crate::page_uav::BoundedBufferView;
 use crate::page_queue::TableDescriptor;
 use victory_shader::emit::StaticViewAccess;
 use victory_memory::{PAGE_BYTES, physical::PhysicalPage};
@@ -240,8 +240,8 @@ pub(crate) struct ShaderBindings {
 enum ClosedView {
     Texture(TextureInput),
     TextureUav(crate::page_uav::ShaderTextureUav),
-    Raw(BoundedRawView),
-    Structured(BoundedRawView, u32),
+    Raw(BoundedBufferView),
+    Structured(BoundedBufferView, u32),
 }
 
 #[derive(Clone, Copy)]
@@ -375,7 +375,7 @@ impl ShaderBindings {
                 &t.host, &t.used, stage.user_data, &values,
                 |root| slots.iter().any(|s| s.slot.root == root && !matches!(s.access, StaticViewAccess::RootSrv { .. })),
                 |root| pipeline.compute && slots.iter().any(|s| {
-                    s.slot.root == root && matches!(s.access, StaticViewAccess::RawUav { .. } | StaticViewAccess::TextureWrite { .. })
+                    s.slot.root == root && matches!(s.access, StaticViewAccess::RawUav { .. } | StaticViewAccess::StructuredUav { .. } | StaticViewAccess::TextureWrite { .. })
                 }),
                 |slot| stage.root_cbvs.iter().any(|&(bound, _)| bound == slot),
                 |root| slots.iter().any(|s| s.slot.root == root && matches!(s.access, StaticViewAccess::RootSrv { .. })),
@@ -411,18 +411,23 @@ impl ShaderBindings {
                             StaticViewAccess::RawSrv { .. } => {
                                 let (start, end) = crate::descriptor::host::paged_raw_srv_range(&actual)
                                     .ok_or(UnloweredShader::DescriptorTable)?;
-                                ClosedView::Raw(BoundedRawView::new(start, end, false)
+                                ClosedView::Raw(BoundedBufferView::new(start, end, false)
                                     .ok_or(UnloweredShader::DescriptorTable)?)
                             }
                             StaticViewAccess::StructuredSrv { stride, .. } => {
                                 let (start, end) = crate::descriptor::host::paged_structured_srv_range(&actual, stride)
                                     .ok_or(reject)?;
-                                ClosedView::Structured(BoundedRawView::new(start, end, false).ok_or(reject)?, stride)
+                                ClosedView::Structured(BoundedBufferView::new(start, end, false).ok_or(reject)?, stride)
+                            }
+                            StaticViewAccess::StructuredUav { stride, .. } if pipeline.compute => {
+                                let (start, end) = crate::descriptor::host::paged_structured_uav_range(&actual, stride)
+                                    .ok_or(reject)?;
+                                ClosedView::Structured(BoundedBufferView::new(start, end, true).ok_or(reject)?, stride)
                             }
                             StaticViewAccess::RawUav { .. } if pipeline.compute => {
                                 let (start, end) = crate::descriptor::host::paged_raw_range(&actual)
                                     .ok_or(UnloweredShader::DescriptorTable)?;
-                                ClosedView::Raw(BoundedRawView::new(start, end, true)
+                                ClosedView::Raw(BoundedBufferView::new(start, end, true)
                                     .ok_or(UnloweredShader::DescriptorTable)?)
                             }
                             _ => return Err(reject),
@@ -438,9 +443,14 @@ impl ShaderBindings {
                             raw.allow_access(offset, bytes, false).ok_or(UnloweredShader::DescriptorTable)?;
                         }
                         (Some(ClosedView::Structured(view, actual)), StaticViewAccess::StructuredSrv { stride, elements })
-                            if *actual == stride =>
+                            if *actual == stride && !view.unordered() =>
                         {
                             view.allow_access(0, elements.checked_mul(stride).ok_or(reject)?, false).ok_or(reject)?;
+                        }
+                        (Some(ClosedView::Structured(view, actual)), StaticViewAccess::StructuredUav { stride, elements, write })
+                            if *actual == stride && view.unordered() =>
+                        {
+                            view.allow_access(0, elements.checked_mul(stride).ok_or(reject)?, write).ok_or(reject)?;
                         }
                         (Some(ClosedView::Raw(raw)), StaticViewAccess::RawUav { offset, bytes, write }) if raw.unordered() => {
                             raw.allow_access(offset, bytes, write).ok_or(UnloweredShader::DescriptorTable)?;
@@ -497,13 +507,13 @@ impl ShaderBindings {
     pub(crate) fn uses_uav(&self) -> bool {
         self.tables.values().flat_map(|table| table.values())
             .any(|view| matches!(view, ClosedView::TextureUav(_))
-                || matches!(view, ClosedView::Raw(raw) if raw.unordered()))
+                || matches!(view, ClosedView::Raw(raw) | ClosedView::Structured(raw, _) if raw.unordered()))
     }
 
     #[cfg(feature = "paged-title")]
     pub(crate) fn uses_guest_uav(&self) -> bool {
         self.tables.values().flat_map(|table| table.values())
-            .any(|view| matches!(view, ClosedView::Raw(raw) if raw.unordered()))
+            .any(|view| matches!(view, ClosedView::Raw(raw) | ClosedView::Structured(raw, _) if raw.unordered()))
     }
 
     #[cfg(feature = "paged-title")]
@@ -534,7 +544,7 @@ impl ShaderBindings {
         let spans = self.tables.values().flat_map(|table| table.values()).filter_map(|view| {
             match view {
                 ClosedView::Raw(raw) if !raw.unordered() => Some((raw.range(), 0)),
-                ClosedView::Structured(view, stride) => Some((view.range(), *stride)),
+                ClosedView::Structured(view, stride) if !view.unordered() => Some((view.range(), *stride)),
                 _ => None,
             }
         });
@@ -559,17 +569,19 @@ impl ShaderBindings {
                         TableDescriptor::Texture(resource, format)
                     }
                     ClosedView::TextureUav(view) => view.prepare(host, list, batch, plan)?,
-                    ClosedView::Raw(raw) if raw.unordered() => raw.prepare_uav(batch, &mut shader_dirty)?,
+                    ClosedView::Raw(raw) if raw.unordered() => raw.prepare_uav(batch, &mut shader_dirty, 0)?,
                     ClosedView::Raw(raw) => {
                         let span = raw.range();
                         let (buffer, at) = ReadOnlyArena::slot(arena.as_ref(), span, 0)?;
                         TableDescriptor::Raw(buffer.clone(), at, span.1 - span.0, false)
                     }
+                    ClosedView::Structured(view, stride) if view.unordered() =>
+                        view.prepare_uav(batch, &mut shader_dirty, *stride)?,
                     ClosedView::Structured(view, stride) => {
                         let span = view.range();
                         let (buffer, at) = ReadOnlyArena::slot(arena.as_ref(), span, *stride)?;
                         let elements = ((span.1 - span.0) / u64::from(*stride)) as u32;
-                        TableDescriptor::Structured(buffer.clone(), at, elements, *stride)
+                        TableDescriptor::Structured(buffer.clone(), at, elements, *stride, false)
                     }
                 });
             }
@@ -585,7 +597,7 @@ impl ShaderBindings {
                 match view {
                     ClosedView::Texture(tex) => tex.ranges(&mut reads)?,
                     ClosedView::Raw(raw) if !raw.unordered() => reads.push(raw.range()),
-                    ClosedView::Structured(view, _) => reads.push(view.range()),
+                    ClosedView::Structured(view, _) if !view.unordered() => reads.push(view.range()),
                     _ => {},
                 }
             }

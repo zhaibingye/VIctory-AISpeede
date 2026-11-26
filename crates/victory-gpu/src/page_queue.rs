@@ -338,7 +338,7 @@ pub(crate) struct PageDescriptors<'a> {
     slots: Vec<u32>,
     textures: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>,
     raw_views: Vec<(u32, bool)>,
-    structured_views: Vec<(u32, u32)>,
+    structured_views: Vec<(u32, u32, bool)>,
     texture_uavs: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>,
 }
 
@@ -346,7 +346,7 @@ pub(crate) enum TableDescriptor {
     Texture(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT),
     TextureUav(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT),
     Raw(ID3D12Resource, u64, u64, bool),
-    Structured(ID3D12Resource, u64, u32, u32),
+    Structured(ID3D12Resource, u64, u32, u32, bool),
 }
 
 impl PageDescriptors<'_> {
@@ -380,9 +380,9 @@ impl PageDescriptors<'_> {
                     self.heap.paged_texture_uav_at(slot, Some(texture), *format);
                     self.texture_uavs.push((slot, *format));
                 }
-                Some(TableDescriptor::Structured(buffer, at, elements, stride)) => {
-                    self.heap.paged_structured_at(slot, Some(buffer), *at, *elements, *stride);
-                    self.structured_views.push((slot, *stride));
+                Some(TableDescriptor::Structured(buffer, at, elements, stride, unordered)) => {
+                    self.heap.paged_structured_at(slot, Some(buffer), *at, *elements, *stride, *unordered);
+                    self.structured_views.push((slot, *stride, *unordered));
                 }
                 Some(TableDescriptor::Raw(buffer, at, len, unordered)) => {
                     self.heap.raw_view_at(slot, Some(buffer), *at, *len, *unordered);
@@ -428,8 +428,8 @@ impl Drop for PageDescriptors<'_> {
             self.heap.paged_texture_uav_at(slot, None, format);
             self.heap.release(slot, 1);
         }
-        for (slot, stride) in self.structured_views.drain(..) {
-            self.heap.paged_structured_at(slot, None, 0, 1, stride);
+        for (slot, stride, unordered) in self.structured_views.drain(..) {
+            self.heap.paged_structured_at(slot, None, 0, 1, stride, unordered);
             self.heap.release(slot, 1);
         }
         for (slot, unordered) in self.raw_views.drain(..) {

@@ -710,11 +710,30 @@ impl HostHeap {
         self.keep(index, texture.map(|resource| (resource.clone(), None)));
     }
 
-    /// Installs a bounded structured buffer SRV in a dynamic table slot.
+    /// Installs a bounded, counter-free structured buffer view.
     pub(crate) fn paged_structured_at(
         &self, index: u32, resource: Option<&ID3D12Resource>, offset: u64, elements: u32, stride: u32,
+        unordered: bool,
     ) {
         let Some(host) = host() else { return };
+        if unordered {
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: offset / u64::from(stride),
+                        NumElements: elements,
+                        StructureByteStride: stride,
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: reserved slot and a retained structured buffer, or a null descriptor.
+            unsafe { host.device.CreateUnorderedAccessView(resource, None, Some(&desc), self.cpu(index)) };
+            self.keep(index, resource.map(|buffer| (buffer.clone(), None)));
+            return;
+        }
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_UNKNOWN,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -1035,6 +1054,22 @@ pub(crate) fn paged_structured_srv_range(view: &View, stride: u32) -> Option<(u6
     // SAFETY: the checked view discriminator selects Buffer.
     let buffer = unsafe { desc.Anonymous.Buffer };
     if buffer.StructureByteStride != stride || buffer.Flags != D3D12_BUFFER_SRV_FLAG_NONE {
+        return None;
+    }
+    checked_buffer_view(*resource, buffer.FirstElement, buffer.NumElements, stride)
+}
+
+pub(crate) fn paged_structured_uav_range(view: &View, stride: u32) -> Option<(u64, u64)> {
+    let View::Unordered(resource, 0, Some(words)) = view else { return None; };
+    let desc = uav_desc(words);
+    if desc.Format != DXGI_FORMAT_UNKNOWN || desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the checked view dimension selects Buffer.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    if buffer.StructureByteStride != stride
+        || buffer.Flags != D3D12_BUFFER_UAV_FLAG_NONE || buffer.CounterOffsetInBytes != 0
+    {
         return None;
     }
     checked_buffer_view(*resource, buffer.FirstElement, buffer.NumElements, stride)

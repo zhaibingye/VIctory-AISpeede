@@ -25,6 +25,7 @@ pub enum StaticViewAccess {
     RawSrv { offset: u32, bytes: u32 },
     RootSrv { bytes: u32 },
     StructuredSrv { stride: u32, elements: u32 },
+    StructuredUav { stride: u32, elements: u32, write: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,7 +81,7 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
             AccessProof::Native(StaticViewAccess::TextureRead)
         } else if let Some(access) = bounded_typed_load(inst, &mut bounds) {
             access
-        } else if let Some(access) = bounded_structured_read(inst, &mut bounds) {
+        } else if let Some(access) = bounded_structured_access(inst, &mut bounds) {
             access
         } else if let Some(access) = bounded_raw_access(inst, &mut bounds) {
             AccessProof::Native(access)
@@ -197,7 +198,7 @@ fn bounded_texture_write(
 enum AccessProof {
     Native(StaticViewAccess),
     TypedRead { immediate: u32, vector_hi: u32, footprint: super::lower::TypedLoadFootprint },
-    StructuredRead { elements: u32, last_byte: u32 },
+    StructuredAccess { elements: u32, last_byte: u32, write: bool },
 }
 
 fn bounded_typed_load(
@@ -229,14 +230,16 @@ fn bounded_typed_load(
     })
 }
 
-fn bounded_structured_read(
+fn bounded_structured_access(
     inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>,
 ) -> Option<AccessProof> {
-    let bytes = match inst.name() {
-        "buffer_load_dword" => 4,
-        "buffer_load_dwordx2" => 8,
-        "buffer_load_dwordx3" => 12,
-        "buffer_load_dwordx4" => 16,
+    let (op, size) = inst.name().strip_prefix("buffer_")?.split_once('_')?;
+    let write = match op { "load" => false, "store" => true, _ => return None };
+    let bytes = match size {
+        "dword" => 4,
+        "dwordx2" => 8,
+        "dwordx3" => 12,
+        "dwordx4" => 16,
         _ => return None,
     };
     let Fields::Buffer {
@@ -247,9 +250,10 @@ fn bounded_structured_read(
         return None;
     }
     let max_index = bounds.unsigned_upper_bound(inst.read(crate::ir::Reg::V(*reg))?)?;
-    Some(AccessProof::StructuredRead {
+    Some(AccessProof::StructuredAccess {
         elements: max_index.checked_add(1)?,
         last_byte: u32::from(*offset).checked_add(bytes)?,
+        write,
     })
 }
 
@@ -333,12 +337,17 @@ fn proven_slot(
     let unique = || relevant.clone()
         .filter(|u| u.table_offset_dwords == used.table_offset_dwords).count() == 1;
     let access = match proof {
-        AccessProof::StructuredRead { elements, last_byte }
-            if unique() && used.kind == ResourceType::Srv && used.dwords == 4
+        AccessProof::StructuredAccess { elements, last_byte, write }
+            if unique() && used.dwords == 4
                 && (4..=2048).contains(&used.stride) && used.stride.is_multiple_of(4)
                 && last_byte <= used.stride && elements.checked_mul(used.stride)? <= 65536 =>
         {
-            StaticViewAccess::StructuredSrv { stride: used.stride, elements }
+            match used.kind {
+                ResourceType::Srv if !write => StaticViewAccess::StructuredSrv { stride: used.stride, elements },
+                ResourceType::Uav if native.stage == HwStage::Cs =>
+                    StaticViewAccess::StructuredUav { stride: used.stride, elements, write },
+                _ => return None,
+            }
         }
         AccessProof::Native(access @ StaticViewAccess::TextureWrite { .. })
             if native.stage == HwStage::Cs && unique() && used.kind == ResourceType::Uav && used.dwords == 8 => access,
