@@ -512,6 +512,13 @@ impl ShaderBindings {
             .any(|view| matches!(view, ClosedView::Texture(tex) if tex.aliases_target(target)))
     }
 
+    pub(crate) fn depth_reads_are_exact(&self, target: &std::sync::Arc<crate::resource::HostTexture>) -> bool {
+        self.tables.values().flat_map(|table| table.values()).all(|view| match view {
+            ClosedView::Texture(tex) if tex.aliases_target(target) => tex.is_native_depth_read_of(target),
+            _ => true,
+        })
+    }
+
     pub(crate) fn conflicts_color(
         &self, target: &std::sync::Arc<crate::resource::HostTexture>,
         sub: crate::page_resource::ColorSubresource,

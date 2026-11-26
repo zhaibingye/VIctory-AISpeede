@@ -170,7 +170,8 @@ pub(crate) struct DepthTarget {
     copy: Arc<HostTexture>,
     desc: Option<D3D12_DEPTH_STENCIL_VIEW_DESC>,
     format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
-    planes: i32,
+    planes: u32,
+    read_only: bool,
 }
 
 impl DepthTarget {
@@ -189,7 +190,7 @@ impl DepthTarget {
             return None;
         }
         let format = if let Some(d) = &desc {
-            if d.ViewDimension != D3D12_DSV_DIMENSION_TEXTURE2D || d.Flags.0 != 0 {
+            if d.ViewDimension != D3D12_DSV_DIMENSION_TEXTURE2D {
                 return None;
             }
             // SAFETY: dimension selects Texture2D.
@@ -210,34 +211,50 @@ impl DepthTarget {
         if tex.Format != format && tex.Format != typeless {
             return None;
         }
-        Some(Self { copy, desc, format, planes })
+        // The ledger currently treats the DSV as one resource. Mixed
+        // read/write planes need per-plane state and are not admitted.
+        let read_only = match desc.as_ref().map_or(0, |d| d.Flags.0 as u32) {
+            0 => false,
+            flags if flags == planes => true,
+            _ => return None,
+        };
+        Some(Self { copy, desc, format, planes, read_only })
     }
 
     fn authoritative(&self, plan: &ResourcePlan) -> bool {
         plan.authoritative(&self.copy)
     }
 
+    fn desired(&self, sampled: bool) -> D3D12_RESOURCE_STATES {
+        if !self.read_only {
+            return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        }
+        let depth = D3D12_RESOURCE_STATE_DEPTH_READ;
+        if sampled {
+            depth | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        } else {
+            depth
+        }
+    }
+
     fn begin(
-        &self, host: &Host, list: &HostList, initialized: &ResourcePlan,
+        &self, host: &Host, list: &HostList, initialized: &ResourcePlan, desired: D3D12_RESOURCE_STATES,
     ) -> (D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_RESOURCE_STATES) {
         let texture = &self.copy.texture;
         let before = initialized.state(&self.copy);
         list.keep(texture);
-        if before != D3D12_RESOURCE_STATE_DEPTH_WRITE {
-            // SAFETY: held resource and direct queue lock; restored in end.
-            unsafe { list.recording().ResourceBarrier(&[transition(
-                texture, before, D3D12_RESOURCE_STATE_DEPTH_WRITE,
-            )]); }
+        if before != desired {
+            // SAFETY: retained under the queue lock; restored in end.
+            unsafe { list.recording().ResourceBarrier(&[transition(texture, before, desired)]); }
         }
         (host.dsv(texture, self.desc.as_ref()), before)
     }
 
-    fn end(&self, list: &HostList, before: D3D12_RESOURCE_STATES) {
-        if before != D3D12_RESOURCE_STATE_DEPTH_WRITE {
-            // SAFETY: the scoped depth use kept the resource in DEPTH_WRITE.
-            unsafe { list.recording().ResourceBarrier(&[transition(
-                &self.copy.texture, D3D12_RESOURCE_STATE_DEPTH_WRITE, before,
-            )]); }
+    fn end(&self, list: &HostList, before: D3D12_RESOURCE_STATES, desired: D3D12_RESOURCE_STATES) {
+        if before != desired {
+            // SAFETY: the scope kept the resource in the recorded state.
+            unsafe { list.recording().ResourceBarrier(&[transition(&self.copy.texture, desired, before)]); }
         }
     }
 }
@@ -259,8 +276,8 @@ impl DepthClear {
     pub(crate) fn encode(
         &self, host: &Host, list: &HostList, initialized: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
-        let planes = self.target.planes as u32;
-        if self.flags == 0 || self.flags & !planes != 0
+        let planes = self.target.planes;
+        if self.target.read_only || self.flags == 0 || self.flags & !planes != 0
             || self.flags & 1 != 0 && !(0.0..=1.0).contains(&self.depth)
         {
             return Err(BatchError::UnsupportedDepth);
@@ -268,14 +285,15 @@ impl DepthClear {
         if (!self.rects.is_empty() || self.flags != planes) && !self.target.authoritative(initialized) {
             return Err(BatchError::TargetNotInitialized);
         }
-        let (handle, before) = self.target.begin(host, list, initialized);
+        let desired = self.target.desired(false);
+        let (handle, before) = self.target.begin(host, list, initialized, desired);
         // SAFETY: retained matching DSV in the scoped depth state.
         unsafe {
             let rects = (!self.rects.is_empty()).then_some(self.rects.as_slice());
             list.recording().ClearDepthStencilView(handle, D3D12_CLEAR_FLAGS(self.flags as i32),
                 self.depth, self.stencil, rects);
         }
-        self.target.end(list, before);
+        self.target.end(list, before, desired);
         initialized.record_write(&self.target.copy)?;
         Ok(())
     }
@@ -307,7 +325,7 @@ impl ClosedDraw {
     #[cfg(feature = "paged-title")]
     pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
         out.extend(self.targets.iter().map(|target| &target.copy));
-        if let Some(depth) = &self.depth { out.push(&depth.copy); }
+        if let Some(depth) = &self.depth && !depth.read_only { out.push(&depth.copy); }
     }
 
     // The trusted producer must prove that the pipeline has no shader
@@ -361,7 +379,10 @@ impl ClosedDraw {
             return Err(UnloweredShader::GraphicsState);
         }
         let shader = ShaderBindings::capture(pipeline, values, view, address)?;
-        if depth.as_ref().is_some_and(|d| shader.samples_target(&d.copy)) {
+        if depth.as_ref().is_some_and(|d| {
+            d.read_only && pipeline.closed_depth_writes & d.planes != 0
+                || shader.samples_target(&d.copy) && (!d.read_only || !shader.depth_reads_are_exact(&d.copy))
+        }) {
             return Err(UnloweredShader::GraphicsState);
         }
         let extent = |desc: D3D12_RESOURCE_DESC| (desc.Width, desc.Height);
@@ -425,6 +446,14 @@ impl ClosedDraw {
         if self.depth.as_ref().is_some_and(|d| !d.authoritative(initialized)) {
             return Err(BatchError::TargetNotInitialized);
         }
+        let sampled_depth = self.depth.as_ref().is_some_and(|d| self.shader.samples_target(&d.copy));
+        if let Some(depth) = &self.depth && depth.read_only
+            && (depth.copy.has_pointer_exposure() || depth.copy.uses_unproven_alias_backing()
+                || depth.copy.twin.get().is_some_and(Option::is_some)
+                || sampled_depth && !self.shader.depth_reads_are_exact(&depth.copy))
+        {
+            return Err(BatchError::UnsupportedDepth);
+        }
         // New guest views of a native allocation can be created after
         // list capture. Recheck backing restrictions under the queue lock.
         if self.targets.len() > 1
@@ -466,7 +495,11 @@ impl ClosedDraw {
             list.keep(texture);
             rtvs[slot] = host.rtv(texture, target.desc.as_ref());
         }
-        let dsv = self.depth.as_ref().map(|d| d.begin(host, list, initialized));
+        let dsv = self.depth.as_ref().map(|d| {
+            let desired = d.desired(sampled_depth);
+            let (handle, before) = d.begin(host, list, initialized, desired);
+            (handle, before, desired)
+        });
         // SAFETY: the proven draw owns its pipeline, root and target. The
         // inputs are bound from admitted pages or retained copies of them.
         unsafe {
@@ -498,7 +531,7 @@ impl ClosedDraw {
                 self.targets.len() as u32,
                 (!self.targets.is_empty()).then_some(rtvs.as_ptr()),
                 false,
-                dsv.as_ref().map(|(h, _)| std::ptr::from_ref(h)),
+                dsv.as_ref().map(|(h, _, _)| std::ptr::from_ref(h)),
             );
             match self.call {
                 DrawCall::Direct { vertices, instances, first, first_instance } => {
@@ -517,9 +550,11 @@ impl ClosedDraw {
                 }
             }
         }
-        if let (Some(depth), Some((_, before))) = (&self.depth, dsv) {
-            depth.end(list, before);
-            initialized.record_write(&depth.copy)?;
+        if let (Some(depth), Some((_, before, desired))) = (&self.depth, dsv) {
+            depth.end(list, before, desired);
+            if !depth.read_only {
+                initialized.record_write(&depth.copy)?;
+            }
         }
         for target in &self.targets {
             initialized.record_color_write(&target.copy, target.sub)?;

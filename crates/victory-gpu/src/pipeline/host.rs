@@ -344,6 +344,8 @@ pub(crate) struct HostPipeline {
     pub(crate) stages: Vec<Stage>,
     pub(crate) closed_color_formats: Option<Vec<DXGI_FORMAT>>,
     pub(crate) closed_depth_format: Option<DXGI_FORMAT>,
+    /// Planes to which this host PSO can write: depth (1), stencil (2).
+    pub(crate) closed_depth_writes: u32,
     /// A graphics pipeline of the console's rectangle lists whose geometry
     /// shader completes each rectangle (`victory_shader::emit::rectangle_gs`):
     /// it draws them as triangles, one per rectangle.
@@ -620,6 +622,7 @@ impl HostPipeline {
                 stages: bound,
                 closed_color_formats: None,
                 closed_depth_format: None,
+                closed_depth_writes: 0,
                 name: format!("{shaders:?}"),
                 rectangles: false,
                 slots: 0,
@@ -656,6 +659,7 @@ impl HostPipeline {
                 stages: bound,
                 closed_color_formats: None,
                 closed_depth_format: None,
+                closed_depth_writes: 0,
                 name: format!("{shaders:?}"),
                 rectangles: false,
                 slots: 0,
@@ -754,6 +758,9 @@ impl HostPipeline {
                 })
                 .then(|| g.targets.RTFormats[..g.targets.NumRenderTargets as usize].to_vec()),
             closed_depth_format: (g.depth_format != DXGI_FORMAT_UNKNOWN).then_some(g.depth_format),
+            closed_depth_writes: u32::from(g.depth.DepthEnable.as_bool()
+                && g.depth.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO)
+                | (u32::from(g.depth.StencilEnable.as_bool() && g.depth.StencilWriteMask != 0) << 1),
             name: format!("{shaders:?}"),
             rectangles: !gs.is_empty(),
             slots: g.slots(),

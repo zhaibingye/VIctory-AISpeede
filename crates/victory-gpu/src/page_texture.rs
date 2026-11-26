@@ -254,6 +254,14 @@ impl TextureInput {
         copy.texture == target.texture
     }
 
+    pub(crate) fn is_native_depth_read_of(
+        &self, target: &std::sync::Arc<crate::resource::HostTexture>,
+    ) -> bool {
+        matches!(self, Self::Native { copy, exact_backing: true, compatible_input: None, .. }
+            if std::sync::Arc::ptr_eq(copy, target)
+                && !copy.has_pointer_exposure() && !copy.uses_unproven_alias_backing())
+    }
+
     pub(crate) fn conflicts_color(
         &self, target: &std::sync::Arc<crate::resource::HostTexture>,
         sub: crate::page_resource::ColorSubresource,
