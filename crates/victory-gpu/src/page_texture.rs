@@ -10,12 +10,34 @@ use windows::core::Error;
 use crate::host::{Host, HostList, transition};
 use crate::page_slabs::{BatchError, PinnedBatch};
 
-/// One admitted shader view. A native-capable view can use exact byte
-/// backing before its first GPU write; selection follows ordered authority.
+/// Exact mip interval expressed by a canonical 2D shader view.
+#[derive(Clone, Copy)]
+pub(crate) struct MipSelection {
+    pub(crate) first: u32,
+    pub(crate) count: u32,
+}
+
+impl MipSelection {
+    pub(crate) const SINGLE: Self = Self { first: 0, count: 1 };
+
+    pub(crate) fn resolve(first: u32, count: u32, total: u32) -> Option<Self> {
+        let available = total.checked_sub(first)?;
+        let count = if count == u32::MAX { available } else { count };
+        (count != 0 && count <= available).then_some(Self { first, count })
+    }
+}
+
+/// One admitted shader view, consumed from ordered native authority or
+/// from an exact compatible byte representation.
 pub(crate) enum TextureInput {
     Linear {
         copy: std::sync::Arc<crate::resource::HostTexture>,
         input: LinearTexture,
+    },
+    Scoped {
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        format: DXGI_FORMAT,
+        mips: MipSelection,
     },
     Native {
         copy: std::sync::Arc<crate::resource::HostTexture>,
@@ -91,6 +113,27 @@ impl TextureInput {
         Some(Self::Native { copy, format, exact_backing, compatible_input })
     }
 
+    pub(crate) fn scoped_color(
+        copy: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT, mips: MipSelection,
+    ) -> Option<Self> {
+        // SAFETY: retained native resource.
+        let desc = unsafe { copy.texture.GetDesc() };
+        if !sample_color(format) || desc.Format != format || desc.DepthOrArraySize != 1 || desc.MipLevels <= 1
+            || desc.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+            || copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
+        {
+            return None;
+        }
+        let mips = MipSelection::resolve(mips.first, mips.count, u32::from(desc.MipLevels))?;
+        let sub = crate::page_resource::ColorSubresource::capture(desc, mips.first)?;
+        if !sub.allows(&copy) { return None; }
+        Some(Self::Scoped { copy, format, mips })
+    }
+
+    pub(crate) fn mips(&self) -> MipSelection {
+        match self { Self::Scoped { mips, .. } => *mips, _ => MipSelection::SINGLE }
+    }
+
     pub(crate) fn native_depth(
         copy: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT,
     ) -> Option<Self> {
@@ -122,6 +165,7 @@ impl TextureInput {
             return Ok(());
         }
         match self {
+            Self::Scoped { .. } => {},
             Self::Linear { input, .. } => ranges.extend(input.rows()?),
             Self::Native { copy, compatible_input: Some(input), .. } => {
                 // A queued earlier operation can establish native
@@ -147,7 +191,7 @@ impl TextureInput {
 
     pub(crate) fn aliases_target(&self, target: &crate::resource::HostTexture) -> bool {
         let copy = match self {
-            Self::Linear { copy, .. } | Self::Native { copy, .. } => copy,
+            Self::Linear { copy, .. } | Self::Native { copy, .. } | Self::Scoped { copy, .. } => copy,
         };
         copy.texture == target.texture
     }
@@ -157,6 +201,23 @@ impl TextureInput {
         plan: &mut crate::page_resource::ResourcePlan,
     ) -> Result<(ID3D12Resource, DXGI_FORMAT), BatchError> {
         match self {
+            Self::Scoped { copy, format, mips } => {
+                if !extended_color_support(host, *format) {
+                    return Err(BatchError::UnsupportedTextureMap);
+                }
+                // SAFETY: live resource retained by this view.
+                let desc = unsafe { copy.texture.GetDesc() };
+                for index in mips.first..mips.first + mips.count {
+                    let sub = crate::page_resource::ColorSubresource::capture(desc, index)
+                        .ok_or(BatchError::UnsupportedTextureMap)?;
+                    if !sub.allows(copy) { return Err(BatchError::UnsupportedTextureMap); }
+                    plan.require_color_subresource(host, list, batch, copy, sub)?;
+                }
+                let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                plan.transition_texture(list, copy, state.0 as u32)?;
+                list.keep(&copy.texture);
+                Ok((copy.texture.clone(), *format))
+            }
             Self::Linear { copy, input } => {
                 if plan.authoritative(copy) {
                     return Err(BatchError::UnsupportedTextureMap);
@@ -296,8 +357,8 @@ impl LinearTexture {
 
     /// Keep a native texture-to-linear copy on the GPU so subsequent
     /// commands can observe it before the submission's single CPU merge.
-    pub(crate) fn copy_from(
-        self, host: &Host, list: &HostList, batch: &PinnedBatch, texture: &ID3D12Resource,
+    pub(crate) fn copy_from_subresource(
+        self, host: &Host, list: &HostList, batch: &PinnedBatch, texture: &ID3D12Resource, index: u32,
         dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
     ) -> Result<(), BatchError> {
         let rows = self.rows()?;
@@ -313,7 +374,7 @@ impl LinearTexture {
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(texture),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
             };
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&staging),

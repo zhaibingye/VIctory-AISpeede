@@ -114,7 +114,7 @@ impl ResourcePlan {
         Err(BatchError::TargetNotInitialized)
     }
 
-    fn require_color_subresource(
+    pub(crate) fn require_color_subresource(
         &mut self, host: &crate::host::Host, list: &HostList, batch: &crate::page_slabs::PinnedBatch,
         copy: &Arc<HostTexture>, sub: ColorSubresource,
     ) -> Result<(), BatchError> {
@@ -246,13 +246,6 @@ impl PageBarrier {
     }
 }
 
-fn single_color(d: D3D12_RESOURCE_DESC) -> bool {
-    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
-        && d.MipLevels == 1 && d.DepthOrArraySize == 1
-        && d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0
-        && !d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
-}
-
 /// Plane zero of an exact 2D color texture. State transitions remain
 /// whole-resource for now, but byte authority is scoped to the copy.
 #[derive(Clone, Copy)]
@@ -286,7 +279,7 @@ impl ColorSubresource {
 
     fn authority(self) -> Option<u32> { self.scoped.then_some(self.index) }
 
-    fn allows(self, copy: &HostTexture) -> bool {
+    pub(crate) fn allows(self, copy: &HostTexture) -> bool {
         !self.scoped || (!copy.uses_unproven_alias_backing() && !copy.has_pointer_exposure())
     }
 }
@@ -361,22 +354,30 @@ impl TextureUpload {
 pub(crate) struct TextureReadback {
     source: Arc<HostTexture>,
     target: crate::page_texture::LinearTexture,
+    sub: ColorSubresource,
 }
 
 impl TextureReadback {
     pub(crate) fn capture(source: Arc<HostTexture>, target: crate::page_texture::LinearTexture) -> Option<Self> {
+        Self::capture_subresource(source, 0, target).filter(|readback| !readback.sub.scoped)
+    }
+
+    pub(crate) fn capture_subresource(
+        source: Arc<HostTexture>, index: u32, target: crate::page_texture::LinearTexture,
+    ) -> Option<Self> {
         // SAFETY: the retained resource is live.
         let desc = unsafe { source.texture.GetDesc() };
-        if !single_color(desc)
-            || desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0
+        let sub = ColorSubresource::capture(desc, index)?;
+        if !sub.allows(&source)
+            || (!sub.scoped && desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0)
             || source.sparse.is_some()
             || source.twin.get().is_some_and(Option::is_some)
-            || desc.Width != u64::from(target.width) || desc.Height != target.height
+            || sub.width != u64::from(target.width) || sub.height != target.height
             || desc.Format != target.format
         {
             return None;
         }
-        Some(Self { source, target })
+        Some(Self { source, target, sub })
     }
 
     #[cfg(feature = "paged-title")]
@@ -403,12 +404,17 @@ impl TextureReadback {
         plan: &mut ResourcePlan,
         dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
     ) -> Result<(), BatchError> {
-        if !plan.authoritative(&self.source) {
+        if !self.sub.allows(&self.source) {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
+        if self.sub.scoped {
+            plan.require_color_subresource(host, list, batch, &self.source, self.sub)?;
+        } else if !plan.authoritative(&self.source) {
             return Err(BatchError::TargetNotInitialized);
         }
         let before = plan.state(&self.source);
         plan.transition_texture(list, &self.source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)?;
-        self.target.copy_from(host, list, batch, &self.source.texture, dirty)?;
+        self.target.copy_from_subresource(host, list, batch, &self.source.texture, self.sub.index, dirty)?;
         plan.transition_texture(list, &self.source, before.0 as u32)
     }
 }

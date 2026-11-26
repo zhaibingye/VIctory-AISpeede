@@ -566,7 +566,7 @@ impl ShaderBindings {
                 views[index as usize] = Some(match view {
                     ClosedView::Texture(texture) => {
                         let (resource, format) = texture.encode(host, list, batch, plan)?;
-                        TableDescriptor::Texture(resource, format)
+                        TableDescriptor::Texture(resource, format, texture.mips())
                     }
                     ClosedView::TextureUav(view) => view.prepare(host, list, batch, plan)?,
                     ClosedView::Raw(raw) if raw.unordered() => raw.prepare_uav(batch, &mut shader_dirty, 0)?,

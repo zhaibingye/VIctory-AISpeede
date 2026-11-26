@@ -684,6 +684,7 @@ impl HostHeap {
     /// Installs a batch-owned explicit 2D SRV in a reserved dynamic slot.
     pub(crate) fn paged_texture_at(
         &self, index: u32, texture: Option<&ID3D12Resource>, format: DXGI_FORMAT,
+        mips: crate::page_texture::MipSelection,
     ) {
         let Some(host) = host() else { return };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -691,7 +692,7 @@ impl HostHeap {
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mips.first, MipLevels: mips.count, ..Default::default() },
             },
         };
         // SAFETY: a reserved view slot and a live single-mip texture, or a
@@ -940,7 +941,7 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
 
 /// Exact plane-zero 2D view whose native layout can be re-created
 /// without reinterpreting swizzles, clamp, or subresource selection.
-pub(super) fn paged_exact_2d_srv_format(words: &[u32; 10]) -> Option<DXGI_FORMAT> {
+pub(super) fn paged_2d_srv(words: &[u32; 10]) -> Option<(DXGI_FORMAT, u32, u32)> {
     let desc = srv_desc(words);
     if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
         || desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
@@ -949,8 +950,8 @@ pub(super) fn paged_exact_2d_srv_format(words: &[u32; 10]) -> Option<DXGI_FORMAT
     }
     // SAFETY: checked discriminator selects the Texture2D union field.
     let view = unsafe { desc.Anonymous.Texture2D };
-    (view.MostDetailedMip == 0 && view.MipLevels == 1 && view.PlaneSlice == 0
-        && view.ResourceMinLODClamp == 0.0).then_some(desc.Format)
+    (view.PlaneSlice == 0 && view.ResourceMinLODClamp == 0.0)
+        .then_some((desc.Format, view.MostDetailedMip, view.MipLevels))
 }
 
 pub(crate) fn paged_texture_uav_desc(format: DXGI_FORMAT) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {

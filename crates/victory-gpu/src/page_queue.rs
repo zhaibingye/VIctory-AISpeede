@@ -343,7 +343,7 @@ pub(crate) struct PageDescriptors<'a> {
 }
 
 pub(crate) enum TableDescriptor {
-    Texture(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT),
+    Texture(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, crate::page_texture::MipSelection),
     TextureUav(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT),
     Raw(ID3D12Resource, u64, u64, bool),
     Structured(ID3D12Resource, u64, u32, u32, bool),
@@ -389,11 +389,11 @@ impl PageDescriptors<'_> {
                     self.raw_views.push((slot, *unordered));
                 }
                 _ => {
-                    let (resource, format) = match view {
-                        Some(TableDescriptor::Texture(tex, format)) => (Some(tex), *format),
-                        _ => (None, DXGI_FORMAT_R8G8B8A8_UNORM),
+                    let (resource, format, mips) = match view {
+                        Some(TableDescriptor::Texture(tex, format, mips)) => (Some(tex), *format, *mips),
+                        _ => (None, DXGI_FORMAT_R8G8B8A8_UNORM, crate::page_texture::MipSelection::SINGLE),
                     };
-                    self.heap.paged_texture_at(slot, resource, format);
+                    self.heap.paged_texture_at(slot, resource, format, mips);
                     self.textures.push((slot, format));
                 }
             }
@@ -416,7 +416,7 @@ impl PageDescriptors<'_> {
         format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
     ) -> Result<u32> {
         let slot = self.heap.dynamic(1).ok_or_else(oom)?;
-        self.heap.paged_texture_at(slot, Some(texture), format);
+        self.heap.paged_texture_at(slot, Some(texture), format, crate::page_texture::MipSelection::SINGLE);
         self.textures.push((slot, format));
         Ok(slot)
     }
@@ -437,7 +437,7 @@ impl Drop for PageDescriptors<'_> {
             self.heap.release(slot, 1);
         }
         for (slot, format) in self.textures.drain(..) {
-            self.heap.paged_texture_at(slot, None, format);
+            self.heap.paged_texture_at(slot, None, format, crate::page_texture::MipSelection::SINGLE);
             self.heap.release(slot, 1);
         }
         for slot in self.slots.drain(..) {

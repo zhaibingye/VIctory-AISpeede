@@ -614,8 +614,8 @@ extern "system" fn copy_texture_region(
                 let readback = if x == 0 && y == 0 && z == 0 && bounds.is_none() {
                     // SAFETY: the initialized footprint variant.
                     let target = unsafe { (*dst).footprint.linear_page_view((*dst).resource) };
-                    native(src).and_then(|(copy, index)| (index == 0).then_some(copy)).zip(target)
-                        .and_then(|(from, to)| crate::page_resource::TextureReadback::capture(from, to))
+                    native(src).zip(target)
+                        .and_then(|((from, index), to)| crate::page_resource::TextureReadback::capture_subresource(from, index, to))
                 } else {
                     None
                 };

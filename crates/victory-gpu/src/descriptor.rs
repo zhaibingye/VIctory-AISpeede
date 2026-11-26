@@ -387,27 +387,33 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
-    /// A canonical one-mip 2D view. An explicit override must describe
-    /// exactly the same shape, with a matching color format or depth plane.
+    /// A canonical 2D view with exact native color or depth format.
+    /// A multi-mip view requires native authority for every named mip.
     #[cfg(windows)]
     pub(crate) fn paged_texture_srv(&self) -> Option<crate::page_texture::TextureInput> {
-        use crate::page_texture::TextureInput;
+        use crate::page_texture::{MipSelection, TextureInput};
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         let Self::Shader(resource, desc) = *self else { return None };
         let resource = resource as This;
         let copy = crate::resource::host_copy(resource)?;
-        let format = if let Some(words) = desc {
-            host::paged_exact_2d_srv_format(&words)?
+        let (format, first, levels) = if let Some(words) = desc {
+            host::paged_2d_srv(&words)?
         } else {
-            DXGI_FORMAT(crate::resource::title_format(resource)? as i32)
+            (DXGI_FORMAT(crate::resource::title_format(resource)? as i32), 0, u32::MAX)
         };
-        if desc.is_some()
+        // SAFETY: the retained native texture is live.
+        let actual = unsafe { copy.texture.GetDesc() };
+        let mips = MipSelection::resolve(first, levels, u32::from(actual.MipLevels))?;
+        if desc.is_some() && mips.first == 0 && mips.count == 1
             && let Some(depth) = TextureInput::native_depth(copy.clone(), format)
         {
             return Some(depth);
         }
         if crate::resource::stands_in(resource) {
-            return None; // a different host format needs its own semantics
+            return None;
+        }
+        if actual.MipLevels > 1 {
+            return TextureInput::scoped_color(copy, format, mips);
         }
         let plain_linear = crate::resource::paged_linear_texture(resource).filter(|input| input.format == format);
         #[cfg(feature = "paged-title")]
