@@ -469,15 +469,6 @@ impl Host {
     /// Materialize a completed native texture at an actual CPU Map
     /// demand, using the same physical-page writeback as title work.
     #[cfg(feature = "paged-title")]
-    pub(crate) fn materialize_texture_bytes(
-        &self, heap: &HostHeap, source: std::sync::Arc<crate::resource::HostTexture>,
-        target: crate::page_texture::LinearTexture,
-    ) -> std::result::Result<(), BatchError> {
-        let mut signal = self.direct_queue();
-        self.materialize_texture_bytes_locked(&mut signal, heap, source, target)
-    }
-
-    #[cfg(feature = "paged-title")]
     pub(crate) fn materialize_texture_bytes_locked(
         &self, signal: &mut u64, heap: &HostHeap,
         source: std::sync::Arc<crate::resource::HostTexture>,

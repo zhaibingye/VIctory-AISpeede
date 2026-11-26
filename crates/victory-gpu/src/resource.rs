@@ -830,7 +830,6 @@ struct ByteMirror {
 #[derive(Default)]
 struct MapEpoch {
     active: usize,
-    materialized: Option<u64>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -925,43 +924,46 @@ impl HostTexture {
             .ok_or(crate::page_slabs::BatchError::UnsupportedTextureMap)
     }
 
-    /// GetGPUVirtualAddress hands out a dereferenceable title address,
-    /// not an opaque descriptor. First exposure of existing native output
-    /// must materialize it, then arm publication for future writes.
+    /// Called under ordered ownership of both the CPU epoch and the
+    /// direct queue. A live mapping must never be overwritten by another
+    /// readback; require a certificate for the latest version and backing.
+    #[cfg(feature = "paged-title")]
+    fn ensure_cpu_bytes_locked(
+        self: &std::sync::Arc<Self>,
+        host: &crate::host::Host,
+        ordered: &mut u64,
+        mapped: &MapEpoch,
+        layout: Option<crate::page_texture::LinearTexture>,
+    ) -> Result<(), crate::page_slabs::BatchError> {
+        use crate::page_slabs::BatchError;
+        if self.completed_native_version().is_none() {
+            return Ok(());
+        }
+        let layout = layout.ok_or(BatchError::UnsupportedTextureMap)?;
+        if mapped.active != 0 {
+            let rows: Vec<_> = layout.rows()?.collect();
+            return self.reusable_byte_mirror(&rows).then_some(())
+                .ok_or(BatchError::UnsupportedTextureMap);
+        }
+        let heap = crate::memory::heap().ok_or(BatchError::UnsupportedTextureMap)?;
+        host.materialize_texture_bytes_locked(ordered, heap, self.clone(), layout)
+    }
+
+    /// A guest GPU address is also observable as a CPU pointer.
     #[cfg(feature = "paged-title")]
     fn publish_guest_address(self: &std::sync::Arc<Self>) -> bool {
         use victory_memory::authority::ByteExposure::GuestGpuAddress;
         let Some(host) = crate::host::host() else { return false; };
         let mapped = self.mapped_pointers.lock().unwrap_or_else(|e| e.into_inner());
-        for _ in 0..3 {
-            let ordered = host.direct_queue();
-            if self.byte_exposure.load(std::sync::atomic::Ordering::Acquire) & GuestGpuAddress as u8 != 0 {
-                return true;
-            }
-            let version = self.completed_native_version();
-            if version.is_none() || (mapped.active != 0 && mapped.materialized == version) {
-                self.expose_bytes(GuestGpuAddress);
-                return true;
-            }
-            if mapped.active != 0 {
-                return false;
-            }
-            let Some(target) = self.exact_committed_bytes() else { return false; };
-            let Some(heap) = crate::memory::heap() else { return false; };
-            drop(ordered);
-            if let Err(error) = host.materialize_texture_bytes(heap, self.clone(), target) {
+        let mut ordered = host.direct_queue();
+        if self.byte_exposure.load(std::sync::atomic::Ordering::Acquire) & GuestGpuAddress as u8 == 0 {
+            if let Err(error) = self.ensure_cpu_bytes_locked(host, &mut ordered, &mapped, self.exact_committed_bytes()) {
                 tracing::warn!(?error, "VNME could not materialize a title texture address");
                 return false;
             }
-            // A logical worker may have submitted newer output while the
-            // lock was released. Never approve a stale version.
-            let _ordered = host.direct_queue();
-            if self.completed_native_version() == version && self.exact_committed_bytes().is_some() {
-                self.expose_bytes(GuestGpuAddress);
-                return true;
-            }
+            self.expose_bytes(GuestGpuAddress);
         }
-        false
+        true
     }
 
     #[cfg(feature = "paged-title")]
@@ -2328,43 +2330,33 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
         let resource = resource(this);
         #[cfg(windows)]
         if let Some(texture) = &resource.host {
-            {
-                #[cfg(feature = "paged-title")]
-                let _ordered = crate::host::host().map(|host| host.direct_queue());
-                texture.expose_bytes(victory_memory::authority::ByteExposure::MappedPointer);
-            }
+            use victory_memory::authority::ByteExposure::MappedPointer;
+            #[cfg(not(feature = "paged-title"))]
+            texture.expose_bytes(MappedPointer);
             #[cfg(feature = "paged-title")]
             {
-                // The read range says what the CPU intends to read, not
-                // that it will replace every byte. A writable pointer must
-                // start with current bytes even for an empty read range.
                 if accesses_bytes(_read).is_none() {
                     return E_INVALIDARG;
                 }
-                let mut mapped = texture.mapped_pointers.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(version) = texture.completed_native_version() {
-                    if _sub != 0 || !matches!(resource.backing, Backing::Committed(_)) {
-                        return crate::object::E_NOTIMPL;
-                    }
-                    let Some(destination) = texture.exact_committed_bytes()
-                        else { return crate::object::E_NOTIMPL; };
-                    // Nested maps share the current compatible bytes. Do
-                    // not replace possible CPU edits with another copy.
-                    if mapped.active != 0 && mapped.materialized != Some(version) {
-                        return crate::object::E_NOTIMPL;
-                    }
-                    if mapped.active == 0 {
-                        let Some((host, heap)) = crate::host::host().zip(crate::memory::heap())
-                            else { return crate::object::E_NOTIMPL; };
-                        if let Err(error) = host.materialize_texture_bytes(heap, texture.clone(), destination) {
-                            tracing::warn!(?error, "VNME texture Map could not materialize bytes");
-                            return crate::object::E_NOTIMPL;
-                        }
-                        mapped.materialized = Some(version);
-                    }
+                if _sub != 0 {
+                    return crate::object::E_NOTIMPL;
                 }
+                let Some(host) = crate::host::host() else { return crate::object::E_NOTIMPL; };
+                let mut mapped = texture.mapped_pointers.lock().unwrap_or_else(|e| e.into_inner());
+                let mut ordered = host.direct_queue();
+                let layout = texture.exact_committed_bytes();
                 let Some(next) = mapped.active.checked_add(1) else { return E_INVALIDARG; };
+                if let Err(error) = texture.ensure_cpu_bytes_locked(host, &mut ordered, &mapped, layout) {
+                    tracing::warn!(?error, "VNME texture Map could not materialize bytes");
+                    return crate::object::E_NOTIMPL;
+                }
+                // Exposure is committed only for a successful pointer return,
+                // while GPU write planning is still excluded by the queue lock.
                 mapped.active = next;
+                texture.expose_bytes(MappedPointer);
+                // SAFETY: the ABI supplied valid, non-null pointer output.
+                unsafe { out.write(resource.data()) };
+                return S_OK;
             }
         }
         // SAFETY: checked non-null; the guest provides room for a pointer.
@@ -2377,10 +2369,10 @@ extern "system" fn unmap(_this: This, _sub: u32, _written: *const c_void) {
     #[cfg(all(windows, feature = "paged-title"))]
     if let Some(texture) = &resource(_this).host {
         let mut mapped = texture.mapped_pointers.lock().unwrap_or_else(|e| e.into_inner());
-        mapped.active = mapped.active.saturating_sub(1);
-        if mapped.active == 0 {
-            mapped.materialized = None;
+        if _sub != 0 || mapped.active == 0 {
+            return;
         }
+        mapped.active -= 1;
         if accesses_bytes(_written) != Some(false)
             && let Some(host) = crate::host::host()
         {
@@ -2427,7 +2419,7 @@ fn cpu_texture_copy(
     let Some(texture) = &resource.host else { return E_NOTIMPL; };
     let Some(host) = crate::host::host() else { return E_NOTIMPL; };
     // As in Unmap, take the mapping mutex before the direct-queue lock.
-    let mut mapped = texture.mapped_pointers.lock().unwrap_or_else(|e| e.into_inner());
+    let mapped = texture.mapped_pointers.lock().unwrap_or_else(|e| e.into_inner());
     let mut ordered = host.direct_queue();
     let Some(layout) = texture.exact_committed_bytes() else { return E_NOTIMPL; };
     // SAFETY: the resource ABI supplies six UINTs or a null box.
@@ -2464,17 +2456,11 @@ fn cpu_texture_copy(
         return E_INVALIDARG;
     }
     let replaces_all = write && left == 0 && top == 0 && right == layout.width && bottom == layout.height;
-    if let Some(version) = texture.completed_native_version() {
-        if mapped.active != 0 && mapped.materialized != Some(version) {
-            return E_NOTIMPL;
-        }
-        if mapped.active == 0 && !replaces_all {
-            let Some(heap) = crate::memory::heap() else { return E_NOTIMPL; };
-            if let Err(error) = host.materialize_texture_bytes_locked(&mut ordered, heap, texture.clone(), layout) {
-                tracing::warn!(?error, "VNME CPU texture copy could not preserve native bytes");
-                return E_NOTIMPL;
-            }
-        }
+    if (!replaces_all || mapped.active != 0)
+        && let Err(error) = texture.ensure_cpu_bytes_locked(host, &mut ordered, &mapped, Some(layout))
+    {
+        tracing::warn!(?error, "VNME CPU texture copy could not preserve native bytes");
+        return E_NOTIMPL;
     }
     // SAFETY: the title provides a valid pitched input/output buffer.
     // The compatible texture layout and non-overlapping row spans were checked.
@@ -2490,7 +2476,6 @@ fn cpu_texture_copy(
     }
     if write {
         texture.record_cpu_bytes();
-        mapped.materialized = None;
     }
     S_OK
 }
