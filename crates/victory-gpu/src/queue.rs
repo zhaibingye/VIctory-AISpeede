@@ -287,10 +287,7 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// 按原始顺序将画面平面送到窗口。每个平面目前只读取首个资源。
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -302,16 +299,23 @@ extern "system" fn present(
         let sources: Vec<_> = if planes == 0 || plane_parameters.is_null() {
             Vec::new()
         } else {
-            // SAFETY: snapshot the supported leading plane/resource pairs
-            // while the caller's arrays and resources are live.
+            // SAFETY: the caller's plane array and each nonempty resource array are live.
             unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) }
-                .iter().filter(|p| p.count != 0 && !p.resources.is_null())
-                .filter_map(|p| OwnedResource::retain(unsafe { *p.resources })).collect()
+                .iter()
+                .map(|plane| OwnedResource::retain(unsafe { first_plane_resource(plane) }))
+                .collect()
         };
         if !crate::title_timeline::Lane::work(&queue(this).lane, move || {
-            let handles: Vec<_> = sources.iter().map(|resource| resource.0 as This).collect();
+            // 即使某层没有资源，也保留它的位置，不能让后面的叠加层变成主画面。
+            let handles: Vec<_> = sources
+                .iter()
+                .map(|resource| resource.as_ref().map_or(std::ptr::null(), |r| r.0 as This))
+                .collect();
             let planes: Vec<_> = handles.iter().map(|resource| Plane {
-                token: 0, count: 1, resources: resource, _rest: [0; 6],
+                token: 0,
+                count: u32::from(!resource.is_null()),
+                resources: resource,
+                _rest: [0; 6],
             }).collect();
             present_now(planes.len() as u32, planes.as_ptr());
         }) {
@@ -341,6 +345,17 @@ impl Drop for OwnedResource {
     fn drop(&mut self) {
         let this = self.0 as This;
         crate::resource::resource_release(this);
+    }
+}
+
+/// 调用者须保证非空资源数组至少有一个可读元素。
+#[cfg(windows)]
+unsafe fn first_plane_resource(plane: &Plane) -> This {
+    if plane.count == 0 || plane.resources.is_null() {
+        std::ptr::null()
+    } else {
+        // SAFETY: the caller guarantees the first array element is readable.
+        unsafe { *plane.resources }
     }
 }
 
@@ -393,12 +408,9 @@ fn present_now(planes: u32, plane_parameters: *const Plane) -> HRESULT {
         let mut sources: Vec<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> =
             Vec::with_capacity(slice.len());
         let mut restore = Vec::with_capacity(slice.len());
-        for plane in slice {
-            if plane.count == 0 || plane.resources.is_null() {
-                continue;
-            }
-            // SAFETY: the plane lists count resources.
-            let resource = unsafe { *plane.resources };
+        for (index, plane) in slice.iter().enumerate() {
+            // SAFETY: the title passes each plane's resource array.
+            let resource = unsafe { first_plane_resource(plane) };
             if let Some(texture) = crate::resource::host_resource(resource) {
                 // Several title objects may share one host texture. Keep their
                 // plane order but transition and restore that host copy once.
@@ -412,20 +424,21 @@ fn present_now(planes: u32, plane_parameters: *const Plane) -> HRESULT {
                     }
                 };
                 sources.push((texture, state));
+            } else if index == 0 {
+                // 此时尚未触碰任何资源状态。不能把字幕或界面叠加层当成底图。
+                tracing::debug!(frame, planes, "主画面层没有可用的宿主纹理，未呈现叠加层");
+                return S_OK;
             }
         }
-        if !sources.is_empty() {
-            let shown = host.present(&sources, frame);
-            for &(resource, state) in &restore {
-                crate::resource::host_transition(resource, state);
-            }
-            #[cfg(feature = "diagnostics")]
-            blinks(frame, restore[0].0, restore[0].1, shown);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = shown;
-        } else {
-            tracing::debug!(frame, planes, "呈现请求没有可用的宿主纹理");
+        // 主画面层不可用时已提前返回，因此这里至少有一个源和它的原状态。
+        let shown = host.present(&sources, frame);
+        for &(resource, state) in &restore {
+            crate::resource::host_transition(resource, state);
         }
+        #[cfg(feature = "diagnostics")]
+        blinks(frame, restore[0].0, restore[0].1, shown);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = shown;
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
