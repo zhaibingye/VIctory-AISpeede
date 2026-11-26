@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
-use victory_memory::{authority::{Representation, Version}, coherence::Fence};
+use victory_memory::{PAGE_BYTES, authority::{Representation, Version}, coherence::Fence, physical::PhysicalPage};
 
 use crate::host::{HostList, legal_state, transition};
 use crate::page_slabs::BatchError;
@@ -26,6 +26,7 @@ pub(crate) struct ResourcePlan {
     #[cfg(feature = "paged-title")]
     snapshot: Option<crate::page_slabs::SnapshotDigests>,
     pending: BTreeMap<(usize, Option<u32>), (Arc<HostTexture>, Version)>,
+    guest_overwrites: BTreeMap<PhysicalPage, Vec<std::ops::Range<usize>>>,
     state: BTreeMap<usize, (Arc<HostTexture>, D3D12_RESOURCE_STATES)>,
     #[cfg(feature = "paged-title")]
     query_writes: BTreeMap<usize, (Arc<crate::query::NativeQueryHeap>, BTreeMap<u32, Option<D3D12_QUERY_TYPE>>)>,
@@ -187,6 +188,39 @@ impl ResourcePlan {
     #[cfg(feature = "paged-title")]
     pub(crate) fn set_snapshot(&mut self, snapshot: crate::page_slabs::SnapshotDigests) {
         self.snapshot = Some(snapshot);
+    }
+
+    /// Unconditional writes own these exact bytes even if their new
+    /// value equals the pre-submit snapshot. Conditional shader writes
+    /// deliberately do not use this proof.
+    pub(crate) fn record_guest_overwrite(&mut self, page: PhysicalPage, start: usize, count: usize) {
+        assert!(count != 0 && start + count <= PAGE_BYTES as usize);
+        let spans = self.guest_overwrites.entry(page).or_default();
+        let mut merged = start..start + count;
+        let first = spans.partition_point(|span| span.end < merged.start);
+        let mut last = first;
+        while let Some(span) = spans.get(last).filter(|span| span.start <= merged.end) {
+            merged.start = merged.start.min(span.start);
+            merged.end = merged.end.max(span.end);
+            last += 1;
+        }
+        spans.splice(first..last, [merged]);
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn record_guest_span(&mut self, batch: &crate::page_slabs::PinnedBatch, (mut at, end): (u64, u64)) -> Result<(), BatchError> {
+        while at < end {
+            let page = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?;
+            let offset = at % PAGE_BYTES;
+            let count = (end - at).min(PAGE_BYTES - offset);
+            self.record_guest_overwrite(page.physical(), offset as usize, count as usize);
+            at += count;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn guest_overwrites(&self, page: PhysicalPage) -> &[std::ops::Range<usize>] {
+        self.guest_overwrites.get(&page).map_or(&[], Vec::as_slice)
     }
 
     #[cfg(feature = "paged-title")]

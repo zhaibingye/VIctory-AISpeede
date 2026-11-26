@@ -135,7 +135,8 @@ impl SubmissionBacking {
         ok && read == PAGE
     }
 
-    /// Merge bytes the GPU changed, preserving independent title writes.
+    /// Publish proven GPU overwrites and other observed GPU changes,
+    /// preserving independent title writes outside those byte ranges.
     /// Moving a mapping never invalidates its pinned original section.
     /// The caller may retire dirty residency only after a true result.
     pub(crate) fn merge_page(
@@ -145,6 +146,7 @@ impl SubmissionBacking {
         before: &[u8],
         gpu: &[u8],
         scratch: &mut [u8],
+        overwrites: &[std::ops::Range<usize>],
     ) -> bool {
         const PAGE: usize = PAGE_BYTES as usize;
         if !va.is_multiple_of(PAGE)
@@ -153,14 +155,21 @@ impl SubmissionBacking {
         {
             return false;
         }
-        if before == gpu {
+        if before == gpu && overwrites.is_empty() {
             return true;
         }
         self.write_delta(va, PAGE, |target| {
             if !crate::host::read_into(target.address as *const u8, scratch) {
                 return false;
             }
-            if !merge_page_delta(scratch, before, gpu) {
+            let mut changed = merge_page_delta(scratch, before, gpu);
+            for span in overwrites {
+                let current = &mut scratch[span.clone()];
+                let result = &gpu[span.clone()];
+                changed |= current != result;
+                current.copy_from_slice(result);
+            }
+            if !changed {
                 return true;
             }
             let _writing = target.original_va.then(|| crate::watch::writing(va, PAGE));
@@ -294,9 +303,14 @@ fn captured_page_snapshot_and_merge_use_original_section() {
     gpu[2] = 0x77;
     let mut scratch = vec![0; PAGE];
     section.lock().unwrap()[1] = 0xab;
-    assert!(!submission.merge_page(VA, replacement, &before, &gpu, &mut scratch));
-    assert!(submission.merge_page(VA, first, &before, &gpu, &mut scratch));
+    assert!(!submission.merge_page(VA, replacement, &before, &gpu, &mut scratch, &[]));
+    assert!(submission.merge_page(VA, first, &before, &gpu, &mut scratch, &[]));
     assert_eq!(&section.lock().unwrap()[..4], &[0x11, 0xab, 0x77, 0x11]);
+
+    // A GPU overwrite equal to its before-image still owns that byte;
+    // the neighboring CPU byte was not part of the operation.
+    assert!(submission.merge_page(VA, first, &before, &before, &mut scratch, &[2..3]));
+    assert_eq!(&section.lock().unwrap()[..4], &[0x11, 0xab, 0x11, 0x11]);
 }
 
 fn merge(ranges: &mut Vec<Range>) {

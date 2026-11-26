@@ -111,6 +111,7 @@ impl QueryOp {
                     &heap.native, *kind, *first, *count, &stage, 0,
                 ) };
                 crate::page_view::scatter_regions(list, batch, [(*span, 0)], &stage, dirty)?;
+                plan.record_guest_span(batch, *span)?;
             }
         }
         Ok(())
@@ -140,6 +141,7 @@ impl PipeWrite {
     fn encode(
         self, host: &Host, list: &HostList, batch: &PinnedBatch,
         timestamp: &mut Option<ID3D12QueryHeap>, dirty: &mut BTreeSet<PhysicalPage>,
+        plan: &mut crate::page_resource::ResourcePlan,
     ) -> std::result::Result<(), BatchError> {
         let cmd = list.recording();
         match self.value {
@@ -180,7 +182,7 @@ impl PipeWrite {
                 crate::page_view::scatter_regions(list, batch, [(self.span, 0)], &stage, dirty)?;
             }
         }
-        Ok(())
+        plan.record_guest_span(batch, self.span)
     }
 }
 
@@ -842,6 +844,9 @@ impl Host {
                         })?;
                         record_copy(list, batch, scratch.as_ref().expect("copy reserved scratch"), &pieces, &mut dirty)
                             .map_err(BatchError::Native)?;
+                        for piece in &pieces {
+                            targets.record_guest_overwrite(piece.dst, piece.dst_offset as usize, piece.count as usize);
+                        }
                     }
                     PageOp::CopyTexture(copy) => copy.encode(self, list, batch, targets)?,
                     PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty)?,
@@ -857,7 +862,7 @@ impl Host {
                     #[cfg(feature = "paged-title")]
                     PageOp::Query(op) => op.encode(self, list, batch, targets, &mut dirty)?,
                     #[cfg(feature = "paged-title")]
-                    PageOp::PipeWrite(op) => op.encode(self, list, batch, &mut pipe_timestamp, &mut dirty)?,
+                    PageOp::PipeWrite(op) => op.encode(self, list, batch, &mut pipe_timestamp, &mut dirty, targets)?,
                     #[cfg(feature = "paged-title")]
                     PageOp::UploadLease(lease) => { let _ = lease; },
                 }
@@ -1166,7 +1171,7 @@ impl SubmittedRender<'_> {
             let mut scratch = vec![0; PAGE_BYTES as usize];
             for (i, (page, _, _)) in batch.pages().filter(|(id, _, _)| dirty.contains(id)).enumerate() {
                 let bytes = readback.bytes(i);
-                if !snapshots.merge(backing, page, bytes, &mut scratch) {
+                if !snapshots.merge(backing, page, bytes, &mut scratch, self.targets.guest_overwrites(page)) {
                     fail(format_args!("paged writeback failed for physical page {}", page.number()));
                 }
                 digests.insert(page, blake3::hash(bytes));
