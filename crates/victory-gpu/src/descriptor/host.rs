@@ -712,10 +712,10 @@ impl HostHeap {
     }
 
     pub(crate) fn paged_texture_uav_at(
-        &self, index: u32, texture: Option<&ID3D12Resource>, format: DXGI_FORMAT, mip: u32,
+        &self, index: u32, texture: Option<&ID3D12Resource>, format: DXGI_FORMAT, selection: crate::page_uav::TextureUavSelection,
     ) {
         let Some(host) = host() else { return; };
-        let desc = paged_texture_uav_desc(format, mip);
+        let desc = paged_texture_uav_desc(format, selection);
         // SAFETY: this slot is owned by the reservation and retains the texture.
         unsafe { host.device.CreateUnorderedAccessView(texture, None, Some(&desc), self.cpu(index)) };
         self.keep(index, texture.map(|resource| (resource.clone(), None)));
@@ -976,47 +976,66 @@ pub(super) fn paged_2d_srv(words: &[u32; 10]) -> Option<(DXGI_FORMAT, crate::pag
     Some((desc.Format, TextureSelection { mips, slices }))
 }
 
-pub(crate) fn paged_texture_uav_desc(format: DXGI_FORMAT, mip: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
-    D3D12_UNORDERED_ACCESS_VIEW_DESC {
-        Format: format,
-        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
-        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-            Texture2D: D3D12_TEX2D_UAV { MipSlice: mip, PlaneSlice: 0 },
-        },
-    }
+pub(crate) fn paged_texture_uav_desc(
+    format: DXGI_FORMAT, selection: crate::page_uav::TextureUavSelection,
+) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let (dimension, fields) = if let Some(slice) = selection.slice {
+        (D3D12_UAV_DIMENSION_TEXTURE2DARRAY, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                MipSlice: selection.mip, FirstArraySlice: slice, ArraySize: 1, PlaneSlice: 0,
+            },
+        })
+    } else {
+        (D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_UAV { MipSlice: selection.mip, PlaneSlice: 0 },
+        })
+    };
+    D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: format, ViewDimension: dimension, Anonymous: fields }
 }
 
-fn exact_texture_uav(view: &View) -> Option<(std::sync::Arc<crate::resource::HostTexture>, DXGI_FORMAT, Option<u32>)> {
+fn exact_texture_uav(view: &View) -> Option<(
+    std::sync::Arc<crate::resource::HostTexture>, DXGI_FORMAT, Option<crate::page_uav::TextureUavSelection>,
+)> {
+    use crate::page_uav::TextureUavSelection;
     let View::Unordered(resource, 0, words) = view else { return None; };
     let resource = *resource as crate::object::This;
     if crate::resource::stands_in(resource) {
         return None;
     }
-    let (format, mip) = if let Some(words) = words {
+    let (format, selection) = if let Some(words) = words {
         let desc = uav_desc(words);
-        if desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D {
-            return None;
-        }
-        // SAFETY: the dimension selects Texture2D.
-        let tex = unsafe { desc.Anonymous.Texture2D };
-        if tex.PlaneSlice != 0 { return None; }
-        (desc.Format, Some(tex.MipSlice))
+        let selection = match desc.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE2D => {
+                // SAFETY: the dimension selects Texture2D.
+                let tex = unsafe { desc.Anonymous.Texture2D };
+                if tex.PlaneSlice != 0 { return None; }
+                TextureUavSelection { mip: tex.MipSlice, slice: None }
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                // SAFETY: the dimension selects Texture2DArray.
+                let tex = unsafe { desc.Anonymous.Texture2DArray };
+                if tex.PlaneSlice != 0 || tex.ArraySize != 1 { return None; }
+                TextureUavSelection { mip: tex.MipSlice, slice: Some(tex.FirstArraySlice) }
+            }
+            _ => return None,
+        };
+        (desc.Format, Some(selection))
     } else {
         (DXGI_FORMAT(crate::resource::title_format(resource)? as i32), None)
     };
-    Some((crate::resource::host_copy(resource)?, format, mip))
+    Some((crate::resource::host_copy(resource)?, format, selection))
 }
 
 pub(crate) fn paged_shader_texture_uav(view: &View) -> Option<crate::page_uav::ShaderTextureUav> {
-    let (target, format, mip) = exact_texture_uav(view)?;
-    crate::page_uav::ShaderTextureUav::capture(target, format, mip)
+    let (target, format, selection) = exact_texture_uav(view)?;
+    crate::page_uav::ShaderTextureUav::capture(target, format, selection)
 }
 
 pub(crate) fn paged_texture_clear(
     view: &View, values: [u32; 4], float: bool, rects: &[windows::Win32::Foundation::RECT],
 ) -> Option<crate::page_uav::TextureClear> {
-    let (target, format, mip) = exact_texture_uav(view)?;
-    crate::page_uav::TextureClear::capture(target, format, mip, values, float, rects)
+    let (target, format, selection) = exact_texture_uav(view)?;
+    crate::page_uav::TextureClear::capture(target, format, selection, values, float, rects)
 }
 
 pub(crate) fn raw_uav_desc(first: u64, elements: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {

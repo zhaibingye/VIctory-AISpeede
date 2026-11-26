@@ -80,28 +80,40 @@ impl RawClear {
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
 
+#[derive(Clone, Copy)]
+pub(crate) struct TextureUavSelection {
+    pub(crate) mip: u32,
+    pub(crate) slice: Option<u32>,
+}
+
+impl TextureUavSelection {
+    const SINGLE: Self = Self { mip: 0, slice: None };
+}
+
 /// Native descriptor identity, bounds and byte authority shared by clears
 /// and shader stores. Only a non-array 2D UAV can use the shader proof.
 struct NativeTextureUav {
     target: std::sync::Arc<crate::resource::HostTexture>,
     format: DXGI_FORMAT,
+    selection: TextureUavSelection,
     sub: ColorSubresource,
 }
 
 impl NativeTextureUav {
-    fn capture(target: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT, mip: Option<u32>) -> Option<Self> {
+    fn capture(target: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT, selection: Option<TextureUavSelection>) -> Option<Self> {
         // SAFETY: the retained native allocation is live.
         let desc = unsafe { target.texture.GetDesc() };
-        if desc.Format != format || desc.DepthOrArraySize != 1
-            || (mip.is_none() && desc.MipLevels != 1)
+        if desc.Format != format || (selection.is_none() && desc.MipLevels != 1)
+            || (selection.and_then(|view| view.slice).is_none() && desc.DepthOrArraySize != 1)
             || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
             || target.sparse.is_some() || target.twin.get().is_some_and(Option::is_some)
             || target.uses_unproven_alias_backing()
         {
             return None;
         }
-        let sub = ColorSubresource::from_mip_slice(desc, mip.unwrap_or(0), 0)?;
-        sub.allows(&target).then_some(Self { target, format, sub })
+        let selection = selection.unwrap_or(TextureUavSelection::SINGLE);
+        let sub = ColorSubresource::from_mip_slice(desc, selection.mip, selection.slice.unwrap_or(0))?;
+        sub.allows(&target).then_some(Self { target, format, selection, sub })
     }
 
     fn check_native(&self, host: &Host) -> Result<(), BatchError> {
@@ -132,11 +144,12 @@ impl NativeTextureUav {
 pub(crate) struct ShaderTextureUav(NativeTextureUav);
 
 impl ShaderTextureUav {
-    pub(crate) fn capture(target: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT, mip: Option<u32>) -> Option<Self> {
-        if !matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R16G16B16A16_FLOAT) {
+    pub(crate) fn capture(target: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT, selection: Option<TextureUavSelection>) -> Option<Self> {
+        if selection.is_some_and(|view| view.slice.is_some())
+            || !matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R16G16B16A16_FLOAT) {
             return None;
         }
-        NativeTextureUav::capture(target, format, mip).map(Self)
+        NativeTextureUav::capture(target, format, selection).map(Self)
     }
 
     pub(crate) fn target(&self) -> &std::sync::Arc<crate::resource::HostTexture> {
@@ -167,7 +180,7 @@ impl ShaderTextureUav {
             resources.transition_texture(list, self.target(), wanted.0 as u32)?;
         }
         list.keep(texture);
-        Ok(crate::page_queue::TableDescriptor::TextureUav(texture.clone(), self.0.format, self.0.sub.index))
+        Ok(crate::page_queue::TableDescriptor::TextureUav(texture.clone(), self.0.format, self.0.selection))
     }
 }
 
@@ -183,7 +196,7 @@ pub(crate) struct TextureClear {
 impl TextureClear {
     pub(crate) fn capture(
         target: std::sync::Arc<crate::resource::HostTexture>,
-        format: DXGI_FORMAT, mip: Option<u32>, values: [u32; 4], float: bool, rects: &[RECT],
+        format: DXGI_FORMAT, selection: Option<TextureUavSelection>, values: [u32; 4], float: bool, rects: &[RECT],
     ) -> Option<Self> {
         let typed = if float {
             matches!(format, DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R16G16B16A16_FLOAT
@@ -192,7 +205,7 @@ impl TextureClear {
             matches!(format, DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8B8A8_UINT)
         };
         if !typed { return None; }
-        let view = NativeTextureUav::capture(target, format, mip)?;
+        let view = NativeTextureUav::capture(target, format, selection)?;
         let (w, h) = (i32::try_from(view.sub.width).ok()?, i32::try_from(view.sub.height).ok()?);
         if rects.iter().any(|r| r.left < 0 || r.top < 0 || r.left >= r.right || r.top >= r.bottom
             || r.right > w || r.bottom > h)
@@ -225,9 +238,9 @@ impl TextureClear {
         PageBarrier::Uav.encode(list, resources)?;
         let texture = &self.target().texture;
         list.keep(texture);
-        let slot = descriptors.reserve_texture_uav(texture, self.view.format, self.view.sub.index).map_err(BatchError::Native)?;
+        let slot = descriptors.reserve_texture_uav(texture, self.view.format, self.view.selection).map_err(BatchError::Native)?;
         let cpu = host.cpu_view();
-        let view = crate::descriptor::host::paged_texture_uav_desc(self.view.format, self.view.sub.index);
+        let view = crate::descriptor::host::paged_texture_uav_desc(self.view.format, self.view.selection);
         // SAFETY: both descriptors describe the same retained texture
         // in UNORDERED_ACCESS and every rectangle fits its subresource.
         unsafe {
