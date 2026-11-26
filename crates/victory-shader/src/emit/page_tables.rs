@@ -19,7 +19,7 @@ pub struct StaticTextureSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StaticViewAccess {
     TextureRead { array: bool },
-    TextureWrite { x: u32, y: u32 },
+    TextureWrite { x: u32, y: u32, z: Option<u32> },
     /// A statically bounded aligned byte window on a raw UAV, as used by DXIL.
     RawUav { offset: u32, bytes: u32, write: bool },
     RawSrv { offset: u32, bytes: u32 },
@@ -250,16 +250,21 @@ fn bounded_texture_write(
     inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>,
 ) -> Option<StaticViewAccess> {
     let Fields::Image {
-        addr, dim: 1, dmask: 15, a16: false, d16: false, tfe: false, lwe: false, ..
+        addr, dim, dmask: 15, a16: false, d16: false, tfe: false, lwe: false, ..
     } = &inst.fields else { return None; };
-    if inst.name() != "image_store" { return None; }
+    if inst.name() != "image_store" || !matches!(*dim, 1 | 2) { return None; }
     let mut regs = addr.iter().flat_map(|operand| match *operand {
         Operand::Vector { reg, dwords } => reg..reg.saturating_add(dwords),
         _ => 0..0,
     });
     let x = bounds.unsigned_upper_bound(inst.read(crate::ir::Reg::V(regs.next()?))?)?;
     let y = bounds.unsigned_upper_bound(inst.read(crate::ir::Reg::V(regs.next()?))?)?;
-    Some(StaticViewAccess::TextureWrite { x, y })
+    let z = if *dim == 2 {
+        Some(bounds.unsigned_upper_bound(inst.read(crate::ir::Reg::V(regs.next()?))?)?)
+    } else {
+        None
+    };
+    Some(StaticViewAccess::TextureWrite { x, y, z })
 }
 
 enum AccessProof {

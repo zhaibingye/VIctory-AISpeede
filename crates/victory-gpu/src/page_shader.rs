@@ -520,8 +520,8 @@ impl ShaderBindings {
                     match (table.get_mut(&slot.index), proof.access) {
                         (Some(ClosedView::Texture(texture)), StaticViewAccess::TextureRead { array })
                             if texture.selection().slices.is_some() == array => {},
-                        (Some(ClosedView::TextureUav(view)), StaticViewAccess::TextureWrite { x, y }) => {
-                            if !view.allows(x, y) { return Err(reject); }
+                        (Some(ClosedView::TextureUav(view)), StaticViewAccess::TextureWrite { x, y, z }) => {
+                            if !view.allows(x, y, z) { return Err(reject); }
                         }
                         (Some(ClosedView::Raw(raw)), StaticViewAccess::RawSrv { offset, bytes })
                         | (Some(ClosedView::TableConstant(raw)), StaticViewAccess::ConstantTable { offset, bytes })

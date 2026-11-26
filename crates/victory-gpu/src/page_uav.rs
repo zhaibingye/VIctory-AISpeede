@@ -85,14 +85,14 @@ use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
 pub(crate) struct TextureUavSelection {
     pub(crate) mip: u32,
     pub(crate) slices: Option<crate::page_texture::MipSelection>,
+    pub(crate) volume: Option<crate::page_texture::MipSelection>,
 }
 
 impl TextureUavSelection {
-    const SINGLE: Self = Self { mip: 0, slices: None };
+    const SINGLE: Self = Self { mip: 0, slices: None, volume: None };
 }
 
-/// Native descriptor identity, bounds and byte authority shared by clears
-/// and shader stores. Only a non-array 2D UAV can use the shader proof.
+/// 清除与着色器写入共享的原生描述符、范围及权威版本。
 struct NativeTextureUav {
     target: std::sync::Arc<crate::resource::HostTexture>,
     format: DXGI_FORMAT,
@@ -105,7 +105,6 @@ impl NativeTextureUav {
         // SAFETY: the retained native allocation is live.
         let desc = unsafe { target.texture.GetDesc() };
         if desc.Format != format || (selection.is_none() && desc.MipLevels != 1)
-            || (selection.and_then(|view| view.slices).is_none() && desc.DepthOrArraySize != 1)
             || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
             || target.sparse.is_some() || target.twin.get().is_some_and(Option::is_some)
             || target.uses_unproven_alias_backing()
@@ -113,7 +112,27 @@ impl NativeTextureUav {
             return None;
         }
         use crate::page_texture::MipSelection;
-        let selection = selection.unwrap_or(TextureUavSelection::SINGLE);
+        let mut selection = selection.unwrap_or_else(|| {
+            if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                TextureUavSelection {
+                    volume: Some(MipSelection { first: 0, count: u32::from(desc.DepthOrArraySize) }),
+                    ..TextureUavSelection::SINGLE
+                }
+            } else {
+                TextureUavSelection::SINGLE
+            }
+        });
+        if let Some(depth) = selection.volume {
+            if selection.slices.is_some() || target.has_pointer_exposure() {
+                return None;
+            }
+            let sub = ColorSubresource::single_volume(desc, selection.mip)?;
+            selection.volume = Some(MipSelection::resolve(depth.first, depth.count, u32::from(desc.DepthOrArraySize))?);
+            return Some(Self { target, format, selection, subresources: vec![sub] });
+        }
+        if selection.slices.is_none() && desc.DepthOrArraySize != 1 {
+            return None;
+        }
         let slices = selection.slices.unwrap_or(MipSelection::SINGLE);
         let slices = MipSelection::resolve(slices.first, slices.count, u32::from(desc.DepthOrArraySize))?;
         let mut subresources = Vec::with_capacity(slices.count as usize);
@@ -128,6 +147,7 @@ impl NativeTextureUav {
     fn check_native(&self, host: &Host) -> Result<(), BatchError> {
         if !self.subresources.iter().all(|sub| sub.allows(&self.target)) || self.target.uses_unproven_alias_backing()
             || self.target.twin.get().is_some_and(Option::is_some)
+            || self.selection.volume.is_some() && self.target.has_pointer_exposure()
         {
             return Err(BatchError::UnsupportedTextureMap);
         }
@@ -139,6 +159,7 @@ impl NativeTextureUav {
             )
         }.map_err(BatchError::Native)?;
         if !support.Support1.contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
+            || self.selection.volume.is_some() && !support.Support1.contains(D3D12_FORMAT_SUPPORT1_TEXTURE3D)
             || !support.Support2.contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)
         {
             return Err(BatchError::UnsupportedTextureMap);
@@ -167,8 +188,13 @@ impl ShaderTextureUav {
 
     pub(crate) fn subresource(&self) -> ColorSubresource { self.0.subresources[0] }
 
-    pub(crate) fn allows(&self, x: u32, y: u32) -> bool {
+    pub(crate) fn allows(&self, x: u32, y: u32, z: Option<u32>) -> bool {
         u64::from(x) < self.subresource().width && y < self.subresource().height
+            && match (self.0.selection.volume, z) {
+                (Some(depth), Some(z)) => z < depth.count,
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     pub(crate) fn record_write(&self, resources: &mut ResourcePlan) -> Result<(), BatchError> {
@@ -215,6 +241,7 @@ impl TextureClear {
         };
         if !typed { return None; }
         let view = NativeTextureUav::capture(target, format, selection)?;
+        if view.selection.volume.is_some() { return None; }
         let sub = view.subresources[0];
         let (w, h) = (i32::try_from(sub.width).ok()?, i32::try_from(sub.height).ok()?);
         if rects.iter().any(|r| r.left < 0 || r.top < 0 || r.left >= r.right || r.top >= r.bottom

@@ -979,7 +979,13 @@ pub(super) fn paged_2d_srv(words: &[u32; 10]) -> Option<(DXGI_FORMAT, crate::pag
 pub(crate) fn paged_texture_uav_desc(
     format: DXGI_FORMAT, selection: crate::page_uav::TextureUavSelection,
 ) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
-    let (dimension, fields) = if let Some(slices) = selection.slices {
+    let (dimension, fields) = if let Some(depth) = selection.volume {
+        (D3D12_UAV_DIMENSION_TEXTURE3D, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Texture3D: D3D12_TEX3D_UAV {
+                MipSlice: selection.mip, FirstWSlice: depth.first, WSize: depth.count,
+            },
+        })
+    } else if let Some(slices) = selection.slices {
         (D3D12_UAV_DIMENSION_TEXTURE2DARRAY, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
             Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
                 MipSlice: selection.mip, FirstArraySlice: slices.first, ArraySize: slices.count, PlaneSlice: 0,
@@ -1009,7 +1015,7 @@ fn exact_texture_uav(view: &View) -> Option<(
                 // SAFETY: the dimension selects Texture2D.
                 let tex = unsafe { desc.Anonymous.Texture2D };
                 if tex.PlaneSlice != 0 { return None; }
-                TextureUavSelection { mip: tex.MipSlice, slices: None }
+                TextureUavSelection { mip: tex.MipSlice, slices: None, volume: None }
             }
             D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
                 // SAFETY: the dimension selects Texture2DArray.
@@ -1018,6 +1024,16 @@ fn exact_texture_uav(view: &View) -> Option<(
                 TextureUavSelection {
                     mip: tex.MipSlice,
                     slices: Some(crate::page_texture::MipSelection { first: tex.FirstArraySlice, count: tex.ArraySize }),
+                    volume: None,
+                }
+            }
+            D3D12_UAV_DIMENSION_TEXTURE3D => {
+                // SAFETY: the dimension selects Texture3D.
+                let tex = unsafe { desc.Anonymous.Texture3D };
+                TextureUavSelection {
+                    mip: tex.MipSlice,
+                    slices: None,
+                    volume: Some(crate::page_texture::MipSelection { first: tex.FirstWSlice, count: tex.WSize }),
                 }
             }
             _ => return None,

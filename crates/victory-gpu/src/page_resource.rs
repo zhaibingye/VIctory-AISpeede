@@ -347,6 +347,21 @@ pub(crate) struct ColorSubresource {
 }
 
 impl ColorSubresource {
+    /// 体纹理的深度分片不是 D3D12 子资源。此路径只接纳单 mip；
+    /// 所有 W 分片遵守同一份权威版本和完整资源屏障。
+    pub(crate) fn single_volume(desc: D3D12_RESOURCE_DESC, mip: u32) -> Option<Self> {
+        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || mip != 0
+            || desc.MipLevels != 1 || desc.DepthOrArraySize == 0
+            || desc.Width == 0 || desc.Height == 0
+            || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
+            || desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        {
+            return None;
+        }
+        crate::page_texture::linear_texel_bytes(desc.Format)?;
+        Some(Self { index: 0, width: desc.Width, height: desc.Height, scoped: false })
+    }
+
     /// Multisample color attachments are whole, single-plane 2D resources.
     /// Keep this separate from byte-footprint and region-copy admission.
     pub(crate) fn multisample(desc: D3D12_RESOURCE_DESC) -> Option<Self> {
@@ -405,6 +420,24 @@ impl ColorSubresource {
     pub(crate) fn allows(self, copy: &HostTexture) -> bool {
         !self.scoped || (!copy.uses_unproven_alias_backing() && !copy.has_pointer_exposure())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn volume_depth_does_not_create_independent_array_authorities() {
+    let mut desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+        Width: 64, Height: 32, DepthOrArraySize: 8, MipLevels: 1,
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    let one = ColorSubresource::single_volume(desc, 0).unwrap();
+    assert_eq!((one.index, one.width, one.height, one.authority()), (0, 64, 32, None));
+    assert!(ColorSubresource::from_mip_slice(desc, 0, 1).is_none());
+    assert!(ColorSubresource::single_volume(desc, 1).is_none());
+    desc.MipLevels = 2;
+    assert!(ColorSubresource::single_volume(desc, 0).is_none());
 }
 
 pub(crate) fn supported_samples(samples: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC) -> bool {
