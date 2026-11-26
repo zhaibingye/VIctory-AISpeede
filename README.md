@@ -128,6 +128,15 @@ victory config
 可用 `VICTORY_LOG=victory_loader=trace,info` 设置日志筛选。普通发布构建只会
 输出 `info` 及更高级别；更细的日志需要诊断版。
 
+若 Windows 终端中的中文显示为乱码，推荐设置 `$env:VICTORY_LOG_FILE = 'vnme-startup.log'`。
+程序会把运行日志直接追加到 UTF-8 文件，不经过 PowerShell 的管道解码。该文件
+不包含单独通过命令行标准输出打印的内容；文件位置也必须位于源码仓库外。
+
+如果需要用 PowerShell 保存完整的命令行输出，先在同一窗口执行
+`[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`，
+再运行带有 `2>&1 | Tee-Object -FilePath vnme-startup.log` 的命令。
+`Tee-Object` 无法修复已经被错误解码的旧日志。
+
 ### Windows 着色器验证
 
 着色器测试使用 `dxil.dll` 验证 Shader Model 6.6。较旧的 Windows SDK

@@ -426,15 +426,26 @@ impl ClosedDraw {
         if pipeline.compute || pipeline.mesh || pipeline.rectangles || pipeline.marks.is_some() {
             return Err(UnloweredShader::UnknownUserData);
         }
-        let formats = pipeline.closed_color_formats.as_ref().ok_or(UnloweredShader::GraphicsState)?;
-        let samples = pipeline.closed_samples.ok_or(UnloweredShader::GraphicsState)?.Count;
-        if formats.len() != targets.len()
-            || (targets.is_empty() && depth.is_none())
-            || pipeline.closed_depth_format != depth.as_ref().map(|d| d.format)
-            || depth.as_ref().is_some_and(|d| d.samples != samples)
-            || targets.iter().any(|target| target.samples != samples)
+        use crate::page_shader::{DrawState as Reason, UnloweredShader::DrawState};
+        let formats = pipeline.closed_color_formats.as_ref().ok_or(DrawState(Reason::PipelineAttachments))?;
+        let samples = pipeline.closed_samples.ok_or(DrawState(Reason::PipelineAttachments))?.Count;
+        if formats.len() != targets.len() {
+            return Err(DrawState(Reason::AttachmentCount { expected: formats.len(), actual: targets.len() }));
+        }
+        if targets.is_empty() && depth.is_none() {
+            return Err(DrawState(Reason::NoAttachments));
+        }
+        let actual_depth = depth.as_ref().map(|d| d.format);
+        if pipeline.closed_depth_format != actual_depth {
+            return Err(DrawState(Reason::DepthFormat {
+                expected: pipeline.closed_depth_format.map(|format| format.0),
+                actual: actual_depth.map(|format| format.0),
+            }));
+        }
+        if let Some(actual) = depth.iter().map(|d| d.samples).chain(targets.iter().map(|t| t.samples))
+            .find(|&actual| actual != samples)
         {
-            return Err(UnloweredShader::GraphicsState);
+            return Err(DrawState(Reason::SampleCount { expected: samples, actual }));
         }
         let shader = ShaderBindings::capture(pipeline, values, view, address)?;
         if depth.as_ref().is_some_and(|d| {
@@ -443,7 +454,7 @@ impl ClosedDraw {
                 || shader.samples_target(&d.copy)
                     && (d.read_only_planes & 1 == 0 || !shader.depth_reads_are_exact(&d.copy))
         }) {
-            return Err(UnloweredShader::GraphicsState);
+            return Err(DrawState(Reason::DepthPlaneConflict));
         }
         let extent = |desc: D3D12_RESOURCE_DESC| (desc.Width, desc.Height);
         let mut first_extent = None;
@@ -451,10 +462,13 @@ impl ClosedDraw {
             let view_format = target.format;
             if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN
                 || view_format != format
-                || shader.conflicts_color(&target.copy, target.sub)
+            {
+                return Err(DrawState(Reason::ColorFormat { slot: index, expected: format.0, actual: view_format.0 }));
+            }
+            if shader.conflicts_color(&target.copy, target.sub)
                 || depth.as_ref().is_some_and(|d| d.copy.texture == target.copy.texture)
             {
-                return Err(UnloweredShader::GraphicsState);
+                return Err(DrawState(Reason::AttachmentAlias { slot: index }));
             }
             if targets.len() > 1 || target.sub.is_scoped() || samples > 1 {
                 if target.copy.uses_unproven_alias_backing()
@@ -463,7 +477,7 @@ impl ClosedDraw {
                     || depth.as_ref().is_some_and(|d| d.copy.uses_unproven_alias_backing()
                         || extent(unsafe { d.copy.texture.GetDesc() }) != target.extent())
                 {
-                    return Err(UnloweredShader::GraphicsState);
+                    return Err(DrawState(Reason::AttachmentBackingOrExtent { slot: index }));
                 }
             }
         }

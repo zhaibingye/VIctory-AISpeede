@@ -418,25 +418,32 @@ impl State {
         &self,
         call: crate::page_draw::DrawCall,
     ) -> Result<crate::page_draw::ClosedDraw, crate::page_shader::UnloweredShader> {
-        use crate::page_shader::UnloweredShader::GraphicsState;
-        if self.page_state_opaque || !matches!(self.topology, 1..=5) {
-            return Err(GraphicsState);
+        use crate::page_shader::{DrawState as Reason, UnloweredShader::DrawState};
+        if self.page_state_opaque {
+            return Err(DrawState(Reason::Opaque));
         }
-        let targets = self.page_targets.clone().ok_or(GraphicsState)?;
-        let viewport = self.page_viewport.ok_or(GraphicsState)?;
-        let scissor = self.page_scissor.ok_or(GraphicsState)?;
-        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This).ok_or(GraphicsState)?;
+        if !matches!(self.topology, 1..=5) {
+            return Err(DrawState(Reason::Topology(self.topology)));
+        }
+        let targets = self.page_targets.clone().ok_or(DrawState(Reason::TargetsNotCaptured))?;
+        let viewport = self.page_viewport.ok_or(DrawState(Reason::ViewportNotCaptured))?;
+        let scissor = self.page_scissor.ok_or(DrawState(Reason::ScissorNotCaptured))?;
+        if self.pipeline == 0 {
+            return Err(DrawState(Reason::PipelineNotBound));
+        }
+        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)
+            .ok_or(DrawState(Reason::PipelineUnavailable))?;
         let mut inputs = Vec::new();
         for (slot, &view) in self.vertex.iter().enumerate() {
             if pipeline.slots & (1 << slot) != 0 {
                 let input = InputView::Vertex(slot as u32, view);
-                input.range().map_err(|_| GraphicsState)?;
+                input.range().map_err(|_| DrawState(Reason::VertexInput { slot: slot as u32 }))?;
                 inputs.push(input);
             }
         }
         if call.indexed() {
             let input = InputView::Index(self.index);
-            input.range().map_err(|_| GraphicsState)?;
+            input.range().map_err(|_| DrawState(Reason::IndexInput))?;
             inputs.push(input);
         }
         let mut draw = crate::page_draw::ClosedDraw::from_translated(

@@ -21,6 +21,7 @@ use victory_shader::{RootType, UsedResource};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnloweredShader {
     GraphicsState,
+    DrawState(DrawState),
     DynamicAddress,
     DescriptorHeap,
     RootView,
@@ -28,6 +29,29 @@ pub(crate) enum UnloweredShader {
     UnknownUserData,
     MissingConstant { slot: u8, dword: u32 },
     ConstantLayout,
+}
+
+/// 无法闭合的绘制状态。字段为稳定诊断键，不输出资源地址。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DrawState {
+    Opaque,
+    Topology(u32),
+    TargetsNotCaptured,
+    ViewportNotCaptured,
+    ScissorNotCaptured,
+    PipelineNotBound,
+    PipelineUnavailable,
+    VertexInput { slot: u32 },
+    IndexInput,
+    PipelineAttachments,
+    AttachmentCount { expected: usize, actual: usize },
+    NoAttachments,
+    DepthFormat { expected: Option<i32>, actual: Option<i32> },
+    SampleCount { expected: u32, actual: u32 },
+    DepthPlaneConflict,
+    ColorFormat { slot: usize, expected: i32, actual: i32 },
+    AttachmentAlias { slot: usize },
+    AttachmentBackingOrExtent { slot: usize },
 }
 
 pub(crate) struct RootWords {
