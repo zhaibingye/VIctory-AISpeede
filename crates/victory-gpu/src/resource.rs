@@ -875,17 +875,23 @@ impl HostTexture {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn compatible_texture_source(&self) -> Option<crate::page_texture::LinearTexture> {
-        use victory_memory::authority::{ByteExposure::*, Representation};
+    fn exact_committed_bytes(&self) -> Option<crate::page_texture::LinearTexture> {
+        use victory_memory::authority::ByteExposure::*;
         let flags = self.byte_exposure.load(std::sync::atomic::Ordering::Acquire);
         if flags & ((SharedHeap as u8) | (ExternalAddress as u8)) != 0 {
             return None;
         }
+        self.committed_linear.get().copied()
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn compatible_texture_source(&self) -> Option<crate::page_texture::LinearTexture> {
+        use victory_memory::authority::Representation;
         let value = self.native_authority.lock().unwrap_or_else(|e| e.into_inner());
         if value.as_ref()?.version.representation != Representation::CompatibleBytes {
             return None;
         }
-        self.committed_linear.get().copied()
+        self.exact_committed_bytes()
     }
 
     #[cfg(feature = "paged-title")]
@@ -895,14 +901,47 @@ impl HostTexture {
         if flags & ((MappedPointer as u8) | (GuestGpuAddress as u8)) == 0 {
             return Ok(None);
         }
-        // A placed/external alias is not yet tied to the same verified
-        // physical extent. Do not publish a completion with stale bytes.
-        if flags & ((SharedHeap as u8) | (ExternalAddress as u8)) == 0 {
-            if let Some(layout) = self.committed_linear.get() {
-                return Ok(Some(*layout));
+        self.exact_committed_bytes().map(Some)
+            .ok_or(crate::page_slabs::BatchError::UnsupportedTextureMap)
+    }
+
+    /// GetGPUVirtualAddress hands out a dereferenceable title address,
+    /// not an opaque descriptor. First exposure of existing native output
+    /// must materialize it, then arm publication for future writes.
+    #[cfg(feature = "paged-title")]
+    fn publish_guest_address(self: &std::sync::Arc<Self>) -> bool {
+        use victory_memory::authority::ByteExposure::GuestGpuAddress;
+        let Some(host) = crate::host::host() else { return false; };
+        let mapped = self.mapped_pointers.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..3 {
+            let ordered = host.direct_queue();
+            if self.byte_exposure.load(std::sync::atomic::Ordering::Acquire) & GuestGpuAddress as u8 != 0 {
+                return true;
+            }
+            let version = self.completed_native_version();
+            if version.is_none() || (mapped.active != 0 && mapped.materialized == version) {
+                self.expose_bytes(GuestGpuAddress);
+                return true;
+            }
+            if mapped.active != 0 {
+                return false;
+            }
+            let Some(target) = self.exact_committed_bytes() else { return false; };
+            let Some(heap) = crate::memory::heap() else { return false; };
+            drop(ordered);
+            if let Err(error) = host.materialize_texture_bytes(heap, self.clone(), target) {
+                tracing::warn!(?error, "VNME could not materialize a title texture address");
+                return false;
+            }
+            // A logical worker may have submitted newer output while the
+            // lock was released. Never approve a stale version.
+            let _ordered = host.direct_queue();
+            if self.completed_native_version() == version && self.exact_committed_bytes().is_some() {
+                self.expose_bytes(GuestGpuAddress);
+                return true;
             }
         }
-        Err(crate::page_slabs::BatchError::UnsupportedTextureMap)
+        false
     }
 
     #[cfg(feature = "paged-title")]
@@ -2243,7 +2282,7 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
                     if _sub != 0 || !matches!(resource.backing, Backing::Committed(_)) {
                         return crate::object::E_NOTIMPL;
                     }
-                    let Some(destination) = linear_texture_bytes(resource.data() as u64, &resource.desc)
+                    let Some(destination) = texture.exact_committed_bytes()
                         else { return crate::object::E_NOTIMPL; };
                     // Nested maps share the current compatible bytes. Do
                     // not replace possible CPU edits with another copy.
@@ -2331,9 +2370,11 @@ extern "system" fn gpu_address(this: This) -> u64 {
     let r = resource(this);
     #[cfg(windows)]
     if let Some(texture) = &r.host {
-        // The console address here is the actual title VA, not an opaque token.
         #[cfg(feature = "paged-title")]
-        let _ordered = crate::host::host().map(|host| host.direct_queue());
+        if !texture.publish_guest_address() {
+            return 0;
+        }
+        #[cfg(not(feature = "paged-title"))]
         texture.expose_bytes(victory_memory::authority::ByteExposure::GuestGpuAddress);
     }
     let at = r.data() as u64;
