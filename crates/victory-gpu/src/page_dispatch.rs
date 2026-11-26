@@ -103,12 +103,6 @@ impl ClosedDispatch {
                 DispatchCall::Indirect(_) => args.as_ref().expect("indirect args prepared").execute(cmd),
             }
         }
-        let mut outputs = Vec::new();
-        self.written_targets(&mut outputs);
-        if !outputs.is_empty() {
-            crate::page_resource::PageBarrier::Uav.encode(list, plan)?;
-            for target in outputs { plan.record_write(target)?; }
-        }
-        Ok(())
+        self.shader.finish_texture_writes(list, plan)
     }
 }

@@ -527,13 +527,28 @@ impl ShaderBindings {
         }));
     }
 
-    pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
-        out.extend(self.tables.values().flat_map(|table| table.values()).filter_map(|view| {
-            match view {
-                ClosedView::TextureUav(uav) => Some(uav.target()),
-                _ => None,
+    fn texture_outputs(&self) -> impl Iterator<Item = &crate::page_uav::ShaderTextureUav> {
+        self.tables.values().flat_map(|table| table.values()).filter_map(|view| match view {
+            ClosedView::TextureUav(uav) => Some(uav),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn finish_texture_writes(
+        &self, list: &HostList, plan: &mut crate::page_resource::ResourcePlan,
+    ) -> Result<(), BatchError> {
+        let mut outputs = self.texture_outputs().peekable();
+        if outputs.peek().is_some() {
+            crate::page_resource::PageBarrier::Uav.encode(list, plan)?;
+            for output in outputs {
+                output.record_write(plan)?;
             }
-        }));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
+        out.extend(self.texture_outputs().map(crate::page_uav::ShaderTextureUav::target));
     }
 
     pub(crate) fn prepare(

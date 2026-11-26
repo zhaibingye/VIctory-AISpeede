@@ -339,12 +339,12 @@ pub(crate) struct PageDescriptors<'a> {
     textures: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>,
     raw_views: Vec<(u32, bool)>,
     structured_views: Vec<(u32, u32, bool)>,
-    texture_uavs: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>,
+    texture_uavs: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, u32)>,
 }
 
 pub(crate) enum TableDescriptor {
     Texture(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, crate::page_texture::TextureSelection),
-    TextureUav(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT),
+    TextureUav(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, u32),
     Raw(ID3D12Resource, u64, u64, bool),
     Structured(ID3D12Resource, u64, u32, u32, bool),
 }
@@ -376,9 +376,9 @@ impl PageDescriptors<'_> {
             use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
             let slot = first + offset as u32;
             match view {
-                Some(TableDescriptor::TextureUav(texture, format)) => {
-                    self.heap.paged_texture_uav_at(slot, Some(texture), *format);
-                    self.texture_uavs.push((slot, *format));
+                Some(TableDescriptor::TextureUav(texture, format, mip)) => {
+                    self.heap.paged_texture_uav_at(slot, Some(texture), *format, *mip);
+                    self.texture_uavs.push((slot, *format, *mip));
                 }
                 Some(TableDescriptor::Structured(buffer, at, elements, stride, unordered)) => {
                     self.heap.paged_structured_at(slot, Some(buffer), *at, *elements, *stride, *unordered);
@@ -402,11 +402,11 @@ impl PageDescriptors<'_> {
     }
 
     pub(crate) fn reserve_texture_uav(
-        &mut self, texture: &ID3D12Resource, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        &mut self, texture: &ID3D12Resource, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, mip: u32,
     ) -> Result<u32> {
         let slot = self.heap.dynamic(1).ok_or_else(oom)?;
-        self.heap.paged_texture_uav_at(slot, Some(texture), format);
-        self.texture_uavs.push((slot, format));
+        self.heap.paged_texture_uav_at(slot, Some(texture), format, mip);
+        self.texture_uavs.push((slot, format, mip));
         Ok(slot)
     }
 
@@ -424,8 +424,8 @@ impl PageDescriptors<'_> {
 
 impl Drop for PageDescriptors<'_> {
     fn drop(&mut self) {
-        for (slot, format) in self.texture_uavs.drain(..) {
-            self.heap.paged_texture_uav_at(slot, None, format);
+        for (slot, format, mip) in self.texture_uavs.drain(..) {
+            self.heap.paged_texture_uav_at(slot, None, format, mip);
             self.heap.release(slot, 1);
         }
         for (slot, stride, unordered) in self.structured_views.drain(..) {
