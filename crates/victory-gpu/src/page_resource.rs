@@ -10,19 +10,39 @@ use crate::host::{HostList, legal_state, transition};
 use crate::page_slabs::BatchError;
 use crate::resource::HostTexture;
 
+/// Latest submitted values on the direct queue. Only its current
+/// bounded window sees these; guest-visible completion is independent.
+#[derive(Clone, Default)]
+pub(crate) struct SubmittedTail {
+    versions: BTreeMap<usize, Version>,
+    states: BTreeMap<usize, D3D12_RESOURCE_STATES>,
+}
+
 #[derive(Default)]
 pub(crate) struct ResourcePlan {
+    inherited: SubmittedTail,
     pending: BTreeMap<usize, (Arc<HostTexture>, Version)>,
     state: BTreeMap<usize, (Arc<HostTexture>, D3D12_RESOURCE_STATES)>,
 }
 
 impl ResourcePlan {
+    pub(crate) fn after(tail: &SubmittedTail) -> Self {
+        Self { inherited: tail.clone(), ..Self::default() }
+    }
+
+    pub(crate) fn advance_submitted_tail(&self, tail: &mut SubmittedTail) {
+        tail.versions.extend(self.pending.iter().map(|(&key, (_, version))| (key, *version)));
+        tail.states.extend(self.state.iter().map(|(&key, (_, state))| (key, *state)));
+    }
+
     fn key(copy: &Arc<HostTexture>) -> usize {
         Arc::as_ptr(copy) as usize
     }
 
     fn version(&self, copy: &Arc<HostTexture>) -> Option<Version> {
-        self.pending.get(&Self::key(copy)).map(|(_, version)| *version)
+        let key = Self::key(copy);
+        self.pending.get(&key).map(|(_, version)| *version)
+            .or_else(|| self.inherited.versions.get(&key).copied())
             .or_else(|| copy.native_authority.lock().unwrap_or_else(|e| e.into_inner())
                 .as_ref().map(|complete| complete.version))
     }
@@ -67,10 +87,10 @@ impl ResourcePlan {
     }
 
     pub(crate) fn state(&self, copy: &Arc<HostTexture>) -> D3D12_RESOURCE_STATES {
-        self.state.get(&Self::key(copy)).map_or_else(
-            || D3D12_RESOURCE_STATES(copy.state.load(Ordering::Acquire) as i32),
-            |(_, state)| *state,
-        )
+        let key = Self::key(copy);
+        self.state.get(&key).map(|(_, state)| *state)
+            .or_else(|| self.inherited.states.get(&key).copied())
+            .unwrap_or_else(|| D3D12_RESOURCE_STATES(copy.state.load(Ordering::Acquire) as i32))
     }
 
     pub(crate) fn transition_texture(

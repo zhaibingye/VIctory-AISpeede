@@ -140,14 +140,12 @@ impl ClosedTitleBatch {
         // A scheduler hint may have become stale while waiting for the
         // direct queue. Recheck before erasing submission boundaries.
         if batches.len() > 1 && batches.iter().all(Self::page_free_candidate) {
-            let ops: Vec<_> = batches.iter().flat_map(|batch| batch.0.iter().cloned()).collect();
-            if !ops.is_empty()
-                && let Ok(locked_plan) = ClosedFootprint::capture(&ops)
-                && locked_plan.is_page_free()
-            {
-                let mut backing = SubmissionBacking::default();
-                host.execute_paged_plan_locked(&mut signal, heap, &mut backing, &ops, locked_plan)?;
-                return Ok(());
+            // Hold the queue lock for the entire native-only window.
+            // Each original batch must have an empty guest footprint.
+            if batches.iter().all(|batch| {
+                ClosedFootprint::capture(&batch.0).is_ok_and(|plan| plan.is_page_free())
+            }) {
+                return host.execute_page_free_window(&mut signal, heap, batches);
             }
         }
         for batch in batches {
@@ -556,38 +554,7 @@ impl Host {
                     }
                 }
             }
-            let scratch = if max_copy > 0 {
-                let buffer = self.default_buffer(max_copy)
-                    .ok_or_else(|| BatchError::Native(oom()))?;
-                list.keep(&buffer);
-                Some(buffer)
-            } else {
-                None
-            };
-            let mut dirty = BTreeSet::new();
-            let mut indirect_budget = None;
-            for op in ops {
-                match op {
-                    PageOp::Copy(copy) => {
-                        let pieces = copy.bind(pins).map_err(|miss| match miss {
-                            Unbound::AddressWidth => BatchError::Range(copy.src as u64, copy.dst as u64),
-                            Unbound::Source(va) | Unbound::Destination(va) => BatchError::NotCaptured(va as u64),
-                        })?;
-                        record_copy(list, batch, scratch.as_ref().expect("copy reserved scratch"), &pieces, &mut dirty)
-                            .map_err(BatchError::Native)?;
-                    }
-                    PageOp::CopyTexture(copy) => copy.encode(self, list, batch, targets)?,
-                    PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty)?,
-                    PageOp::UploadTexture(upload) => upload.encode(self, list, batch, targets)?,
-                    PageOp::Input(input) => input.encode(self, list, batch)?,
-                    PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
-                    PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
-                    PageOp::Clear(clear) => clear.encode(self, list, batch, targets)?,
-                    PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,
-                    PageOp::Barrier(barrier) => barrier.encode(list, targets)?,
-                    PageOp::ClearRaw(clear) => clear.encode(self, list, batch, descriptors, targets, &mut dirty)?,
-                }
-            }
+            let mut dirty = self.encode_closed_ops(list, batch, pins, descriptors, targets, ops, max_copy)?;
             #[cfg(feature = "paged-title")]
             for (_, readback, _) in &visible {
                 readback.encode(self, list, batch, targets, &mut dirty)?;
@@ -599,6 +566,91 @@ impl Host {
             readback.publish_mirror(&ranges[span], backing);
         }
         Ok(stats)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_closed_ops(
+        &self, list: &HostList, batch: &PinnedBatch, pins: &BackingPins,
+        descriptors: &mut PageDescriptors<'_>, targets: &mut crate::page_resource::ResourcePlan,
+        ops: &[PageOp], max_copy: u64,
+    ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError> {
+        let scratch = if max_copy > 0 {
+            let buffer = self.default_buffer(max_copy)
+                .ok_or_else(|| BatchError::Native(oom()))?;
+            list.keep(&buffer);
+            Some(buffer)
+        } else {
+            None
+        };
+        let mut dirty = BTreeSet::new();
+        let mut indirect_budget = None;
+        for op in ops {
+            match op {
+                PageOp::Copy(copy) => {
+                    let pieces = copy.bind(pins).map_err(|miss| match miss {
+                        Unbound::AddressWidth => BatchError::Range(copy.src as u64, copy.dst as u64),
+                        Unbound::Source(va) | Unbound::Destination(va) => BatchError::NotCaptured(va as u64),
+                    })?;
+                    record_copy(list, batch, scratch.as_ref().expect("copy reserved scratch"), &pieces, &mut dirty)
+                        .map_err(BatchError::Native)?;
+                }
+                PageOp::CopyTexture(copy) => copy.encode(self, list, batch, targets)?,
+                PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty)?,
+                PageOp::UploadTexture(upload) => upload.encode(self, list, batch, targets)?,
+                PageOp::Input(input) => input.encode(self, list, batch)?,
+                PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
+                PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
+                PageOp::Clear(clear) => clear.encode(self, list, batch, targets)?,
+                PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,
+                PageOp::Barrier(barrier) => barrier.encode(list, targets)?,
+                PageOp::ClearRaw(clear) => clear.encode(self, list, batch, descriptors, targets, &mut dirty)?,
+            }
+        }
+        Ok(dirty)
+    }
+
+    #[cfg(feature = "paged-title")]
+    fn execute_page_free_window(
+        &self, signal: &mut u64, heap: &HostHeap, batches: Vec<ClosedTitleBatch>,
+    ) -> std::result::Result<(), BatchError> {
+        use crate::page_resource::{ResourcePlan, SubmittedTail};
+
+        let mut tail = SubmittedTail::default();
+        let mut backing = SubmissionBacking::default();
+        let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
+        let mut in_flight = Vec::with_capacity(batches.len());
+        let enqueue = (|| {
+            for ops in batches.into_iter().map(|batch| batch.0).filter(|ops| !ops.is_empty()) {
+                let batch = PinnedBatch::capture(self, &mut slabs, &mut backing, &[])?;
+                let render = submit_work(
+                    self, signal, heap, &backing, &batch, WriteSet::Declared, ResourcePlan::after(&tail),
+                    |list, _, batch, pins, descriptors, targets| {
+                        let dirty = self.encode_closed_ops(list, batch, pins, descriptors, targets, &ops, 0)?;
+                        if !dirty.is_empty() {
+                            return Err(BatchError::UnsupportedTextureMap);
+                        }
+                        Ok(dirty)
+                    },
+                );
+                match render {
+                    Ok(render) => {
+                        render.targets.advance_submitted_tail(&mut tail);
+                        in_flight.push(InFlightPages { batch, render });
+                    }
+                    Err(error) => {
+                        batch.cancel(&mut slabs);
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        // Always retire what actually reached the GPU, including on a
+        // later recording error. Guest fence/present boundaries follow.
+        for work in in_flight {
+            work.retire(self, signal, &backing, &mut slabs);
+        }
+        enqueue
     }
 
     fn execute_paged_work(
@@ -638,7 +690,9 @@ impl Host {
     ) -> std::result::Result<PageStats, BatchError> {
         let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
         let batch = PinnedBatch::capture(self, &mut slabs, backing, ranges)?;
-        let render = match submit_work(self, signal, heap, backing, &batch, writes, record) {
+        let render = match submit_work(
+            self, signal, heap, backing, &batch, writes, crate::page_resource::ResourcePlan::default(), record,
+        ) {
             Ok(render) => render,
             Err(e) => {
                 batch.cancel(&mut slabs);
@@ -658,6 +712,7 @@ fn submit_work<'a>(
     backing: &SubmissionBacking,
     batch: &PinnedBatch,
     writes: WriteSet,
+    mut targets: crate::page_resource::ResourcePlan,
     record: impl FnOnce(
         &HostList,
         Option<PageRoots>,
@@ -717,7 +772,6 @@ fn submit_work<'a>(
     list.keep(&heap.heap);
     let uploaded = uploads.as_ref().map_or(0, |stage| stage.record(&list, batch));
     barrier(&list, slabs.values().copied(), false);
-    let mut targets = crate::page_resource::ResourcePlan::default();
     let declared_dirty = record(&list, roots, batch, backing.pins(), &mut pairs, &mut targets)?;
     barrier(&list, slabs.values().copied(), true);
     // Closed work knows every page it may write before native enqueue.
