@@ -261,11 +261,12 @@ impl ClosedDraw {
     #[cfg(feature = "paged-title")]
     pub(crate) fn preserved_colors<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
         out.extend(self.targets.iter().map(|target| &target.copy));
+        self.shader.pointer_sources(out);
     }
 
     #[cfg(feature = "paged-title")]
     pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
-        self.preserved_colors(out);
+        out.extend(self.targets.iter().map(|target| &target.copy));
         if let Some(depth) = &self.depth { out.push(&depth.copy); }
     }
 

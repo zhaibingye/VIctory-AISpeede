@@ -472,6 +472,16 @@ impl ShaderBindings {
             .any(|view| matches!(view, ClosedView::Raw(raw) if raw.unordered()))
     }
 
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn pointer_sources<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
+        out.extend(self.tables.values().flat_map(|table| table.values()).filter_map(|view| {
+            match view {
+                ClosedView::Texture(input) => input.pointer_source(),
+                _ => None,
+            }
+        }));
+    }
+
     pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
         out.extend(self.tables.values().flat_map(|table| table.values()).filter_map(|view| {
             match view {

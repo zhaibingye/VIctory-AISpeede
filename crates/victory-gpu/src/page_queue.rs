@@ -68,10 +68,13 @@ fn physical_footprint(
 impl PageOp {
     fn preserved_colors<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
         let target = match self {
-            Self::CopyTexture(copy) => copy.preserves_color(),
+            Self::CopyTexture(copy) => {
+                out.extend(copy.pointer_source());
+                copy.preserves_color()
+            },
             Self::UploadTexture(upload) => upload.preserves_color(),
             Self::Draw(draw) => return draw.preserved_colors(out),
-            Self::Dispatch(dispatch) => return dispatch.written_targets(out),
+            Self::Dispatch(dispatch) => return dispatch.preserved_colors(out),
             Self::Clear(clear) => clear.preserves_color(),
             Self::ClearUavTexture(clear) => clear.preserves_color(),
             _ => None,
@@ -207,7 +210,7 @@ impl ClosedFootprint {
                 op.preserved_colors(&mut preserve_targets);
             }
             for target in preserve_targets {
-                if let Some(layout) = target.compatible_texture_source() {
+                if let Some(layout) = target.visible_linear_writeback()?.or_else(|| target.compatible_texture_source()) {
                     let key = std::sync::Arc::as_ptr(target) as usize;
                     if let std::collections::btree_map::Entry::Vacant(entry) = preserved.entry(key) {
                         let start = ranges.len();

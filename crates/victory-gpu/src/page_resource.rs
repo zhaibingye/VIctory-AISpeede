@@ -21,6 +21,8 @@ pub(crate) struct SubmittedTail {
 #[derive(Default)]
 pub(crate) struct ResourcePlan {
     inherited: SubmittedTail,
+    #[cfg(feature = "paged-title")]
+    refreshed: std::collections::BTreeSet<usize>,
     pending: BTreeMap<usize, (Arc<HostTexture>, Version)>,
     state: BTreeMap<usize, (Arc<HostTexture>, D3D12_RESOURCE_STATES)>,
 }
@@ -48,6 +50,10 @@ impl ResourcePlan {
     }
 
     pub(crate) fn authoritative(&self, copy: &Arc<HostTexture>) -> bool {
+        #[cfg(feature = "paged-title")]
+        if self.refreshed.contains(&Self::key(copy)) {
+            return true;
+        }
         self.version(copy).map_or_else(
             || copy.host_written.load(Ordering::Acquire),
             |version| version.representation == Representation::NativeGpu,
@@ -60,6 +66,25 @@ impl ResourcePlan {
         &mut self, host: &crate::host::Host, list: &HostList,
         batch: &crate::page_slabs::PinnedBatch, copy: &Arc<HostTexture>,
     ) -> Result<(), BatchError> {
+        #[cfg(feature = "paged-title")]
+        {
+            let key = Self::key(copy);
+            // A persistent guest pointer can modify compatible backing
+            // without Unmap. Before its first GPU consumer in this batch,
+            // read current bytes. Never replace writes produced earlier in
+            // the same ordered native stream with the old CPU snapshot.
+            if copy.has_pointer_exposure()
+                && !self.pending.contains_key(&key)
+                && !self.inherited.versions.contains_key(&key)
+                && !self.refreshed.contains(&key)
+            {
+                let source = copy.visible_linear_writeback()?.ok_or(BatchError::UnsupportedTextureMap)?;
+                self.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
+                source.copy_to(host, list, batch, &copy.texture, (0, 0))?;
+                self.refreshed.insert(key);
+                return Ok(());
+            }
+        }
         if self.authoritative(copy) {
             return Ok(());
         }
@@ -139,7 +164,7 @@ pub(crate) fn collect_compatible_source(
     copy: &Arc<HostTexture>, ranges: &mut Vec<(u64, u64)>,
 ) -> Result<(), BatchError> {
     #[cfg(feature = "paged-title")]
-    if let Some(source) = copy.compatible_texture_source() {
+    if !copy.has_pointer_exposure() && let Some(source) = copy.compatible_texture_source() {
         ranges.extend(source.rows()?);
     }
     let _ = (copy, ranges);
@@ -319,6 +344,11 @@ impl TextureCopy {
     }
 
     #[cfg(feature = "paged-title")]
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn pointer_source(&self) -> Option<&Arc<HostTexture>> {
+        self.src.has_pointer_exposure().then_some(&self.src)
+    }
+
     pub(crate) fn target(&self) -> &Arc<HostTexture> { &self.dst }
 
     pub(crate) fn capture(src: Arc<HostTexture>, dst: Arc<HostTexture>) -> Option<Self> {

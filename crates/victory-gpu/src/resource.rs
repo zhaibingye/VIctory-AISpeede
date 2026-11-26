@@ -914,10 +914,15 @@ impl HostTexture {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn visible_linear_writeback(&self) -> Result<Option<crate::page_texture::LinearTexture>, crate::page_slabs::BatchError> {
-        use victory_memory::authority::ByteExposure::*;
+    pub(crate) fn has_pointer_exposure(&self) -> bool {
+        use victory_memory::authority::ByteExposure::{GuestGpuAddress, MappedPointer};
         let flags = self.byte_exposure.load(std::sync::atomic::Ordering::Acquire);
-        if flags & ((MappedPointer as u8) | (GuestGpuAddress as u8)) == 0 {
+        flags & ((MappedPointer as u8) | (GuestGpuAddress as u8)) != 0
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn visible_linear_writeback(&self) -> Result<Option<crate::page_texture::LinearTexture>, crate::page_slabs::BatchError> {
+        if !self.has_pointer_exposure() {
             return Ok(None);
         }
         self.exact_committed_bytes().map(Some)

@@ -63,6 +63,12 @@ impl ClosedDispatch {
         !self.shader.uses_guest_uav()
     }
 
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn preserved_colors<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
+        self.shader.pointer_sources(out);
+        self.written_targets(out);
+    }
+
     pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
         self.shader.written_targets(out);
     }

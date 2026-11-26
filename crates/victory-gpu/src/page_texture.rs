@@ -98,6 +98,12 @@ impl TextureInput {
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
+        #[cfg(feature = "paged-title")]
+        if self.pointer_source().is_some() {
+            // The closed queue includes these pages under the resource
+            // owner, so its own later writeback may share those pages.
+            return Ok(());
+        }
         match self {
             Self::Linear { input, .. } => ranges.extend(input.rows()?),
             Self::Native { copy, compatible_input: Some(input), .. } => {
@@ -112,6 +118,14 @@ impl TextureInput {
             }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn pointer_source(&self) -> Option<&std::sync::Arc<crate::resource::HostTexture>> {
+        match self {
+            Self::Native { copy, .. } if copy.has_pointer_exposure() => Some(copy),
+            _ => None,
+        }
     }
 
     pub(crate) fn aliases_target(&self, target: &crate::resource::HostTexture) -> bool {
@@ -138,8 +152,12 @@ impl TextureInput {
                 {
                     return Err(BatchError::UnsupportedTextureMap);
                 }
+                #[cfg(feature = "paged-title")]
+                let pointer_backed = copy.has_pointer_exposure();
+                #[cfg(not(feature = "paged-title"))]
+                let pointer_backed = false;
                 if let Some(input) = compatible_input
-                    && !plan.authoritative(copy)
+                    && !pointer_backed && !plan.authoritative(copy)
                 {
                     return Ok((input.encode(host, list, batch)?, input.format));
                 }
