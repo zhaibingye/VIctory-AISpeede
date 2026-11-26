@@ -886,6 +886,21 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     }
 }
 
+/// Exact plane-zero 2D view whose native layout can be re-created
+/// without reinterpreting swizzles, clamp, or subresource selection.
+pub(super) fn paged_depth_srv_format(words: &[u32; 10]) -> Option<DXGI_FORMAT> {
+    let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
+        || desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+    {
+        return None;
+    }
+    // SAFETY: checked discriminator selects the Texture2D union field.
+    let view = unsafe { desc.Anonymous.Texture2D };
+    (view.MostDetailedMip == 0 && view.MipLevels == 1 && view.PlaneSlice == 0
+        && view.ResourceMinLODClamp == 0.0).then_some(desc.Format)
+}
+
 pub(crate) fn raw_uav_desc(first: u64, elements: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,

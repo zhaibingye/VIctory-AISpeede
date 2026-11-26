@@ -741,10 +741,17 @@ impl HostPipeline {
             pso,
             root,
             stages: bound,
-            closed_color_formats: ((1..=8).contains(&g.targets.NumRenderTargets)
-                && g.samples.Count == 1
-                && (!(g.depth.DepthEnable.as_bool() || g.depth.StencilEnable.as_bool())
-                    || g.depth_format != DXGI_FORMAT_UNKNOWN))
+            closed_color_formats: (g.targets.NumRenderTargets <= 8
+                && g.samples.Count == 1 && g.samples.Quality == 0
+                && if g.targets.NumRenderTargets == 0 {
+                    // A DSV-only pass must have a real output and a
+                    // shader/rasterizer state that actually uses it.
+                    g.depth_format != DXGI_FORMAT_UNKNOWN
+                        && (g.depth.DepthEnable.as_bool() || g.depth.StencilEnable.as_bool())
+                } else {
+                    !(g.depth.DepthEnable.as_bool() || g.depth.StencilEnable.as_bool())
+                        || g.depth_format != DXGI_FORMAT_UNKNOWN
+                })
                 .then(|| g.targets.RTFormats[..g.targets.NumRenderTargets as usize].to_vec()),
             closed_depth_format: (g.depth_format != DXGI_FORMAT_UNKNOWN).then_some(g.depth_format),
             name: format!("{shaders:?}"),

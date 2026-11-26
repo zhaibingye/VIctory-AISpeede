@@ -17,6 +17,7 @@ pub(crate) enum TextureInput {
     Native {
         copy: std::sync::Arc<crate::resource::HostTexture>,
         format: DXGI_FORMAT,
+        depth_plane: bool,
     },
 }
 
@@ -36,7 +37,30 @@ impl TextureInput {
         {
             return None;
         }
-        Some(Self::Native { copy, format })
+        Some(Self::Native { copy, format, depth_plane: false })
+    }
+
+    pub(crate) fn native_depth(
+        copy: std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT,
+    ) -> Option<Self> {
+        // SAFETY: retained native resource, so the description is live.
+        let desc = unsafe { copy.texture.GetDesc() };
+        if !matches!((desc.Format, format),
+            (DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM)
+            | (DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT)
+            | (DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS)
+            | (DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS))
+            || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
+            || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
+            || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+            || desc.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+            || copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
+            || copy.uses_unproven_alias_backing()
+        {
+            return None;
+        }
+        Some(Self::Native { copy, format, depth_plane: true })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -56,7 +80,12 @@ impl TextureInput {
     ) -> Result<(ID3D12Resource, DXGI_FORMAT), BatchError> {
         match self {
             Self::Linear(input) => Ok((input.encode(host, list, batch)?, input.format)),
-            Self::Native { copy, format } => {
+            Self::Native { copy, format, depth_plane } => {
+                if *depth_plane && (copy.uses_unproven_alias_backing()
+                    || copy.twin.get().is_some_and(Option::is_some))
+                {
+                    return Err(BatchError::UnsupportedTextureMap);
+                }
                 plan.require_native(host, list, batch, copy)?;
                 let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 plan.transition_texture(list, copy, state.0 as u32)?;

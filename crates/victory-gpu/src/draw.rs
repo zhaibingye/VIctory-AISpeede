@@ -370,7 +370,8 @@ impl State {
         if cfg!(feature = "paged-title") {
             // Reject the whole binding on a missing slot; never shift the
             // shader's output indices to fit the descriptors we found.
-            if (1..=8).contains(&handles.len()) && page_targets.len() == handles.len() {
+            if handles.len() <= 8 && page_targets.len() == handles.len()
+                && (!handles.is_empty() || depth != 0) {
                 self.page_targets = Some(page_targets);
             }
             if depth != 0 {

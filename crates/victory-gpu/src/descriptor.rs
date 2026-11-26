@@ -387,14 +387,18 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
-    /// Default typed single-mip SRV, sourced from linear pages or
-    /// from an authoritative native target. No format reinterpretation.
+    /// An exact single-mip SRV from linear pages or a native target.
+    /// An explicit depth SRV may select the typed depth plane only.
     #[cfg(windows)]
     pub(crate) fn paged_texture_srv(&self) -> Option<crate::page_texture::TextureInput> {
         use crate::page_texture::TextureInput;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-        let Self::Shader(resource, None) = *self else { return None };
+        let Self::Shader(resource, desc) = *self else { return None };
         let resource = resource as This;
+        if let Some(words) = desc {
+            let format = host::paged_depth_srv_format(&words)?;
+            return TextureInput::native_depth(crate::resource::host_copy(resource)?, format);
+        }
         if let Some(input) = crate::resource::paged_linear_texture(resource) {
             return Some(TextureInput::Linear(input));
         }

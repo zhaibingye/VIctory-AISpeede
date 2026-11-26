@@ -142,7 +142,8 @@ impl DepthTarget {
         let tex = unsafe { copy.texture.GetDesc() };
         if copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
             || tex.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-            || tex.SampleDesc.Count != 1 || tex.DepthOrArraySize != 1 || tex.MipLevels != 1
+            || tex.SampleDesc.Count != 1 || tex.SampleDesc.Quality != 0
+            || tex.DepthOrArraySize != 1 || tex.MipLevels != 1
             || tex.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0
         {
             return None;
@@ -313,6 +314,7 @@ impl ClosedDraw {
         }
         let formats = pipeline.closed_color_formats.as_ref().ok_or(UnloweredShader::GraphicsState)?;
         if formats.len() != targets.len()
+            || (targets.is_empty() && depth.is_none())
             || pipeline.closed_depth_format != depth.as_ref().map(|d| d.format)
         {
             return Err(UnloweredShader::GraphicsState);
@@ -441,7 +443,12 @@ impl ClosedDraw {
             cmd.RSSetScissorRects(&[self.scissor]);
             cmd.OMSetBlendFactor(Some(&self.blend_factor));
             cmd.OMSetStencilRef(self.stencil_ref);
-            cmd.OMSetRenderTargets(self.targets.len() as u32, Some(rtvs.as_ptr()), false, dsv.as_ref().map(|(h, _)| std::ptr::from_ref(h)));
+            cmd.OMSetRenderTargets(
+                self.targets.len() as u32,
+                (!self.targets.is_empty()).then_some(rtvs.as_ptr()),
+                false,
+                dsv.as_ref().map(|(h, _)| std::ptr::from_ref(h)),
+            );
             match self.call {
                 DrawCall::Direct { vertices, instances, first, first_instance } => {
                     cmd.DrawInstanced(vertices, instances, first, first_instance);
