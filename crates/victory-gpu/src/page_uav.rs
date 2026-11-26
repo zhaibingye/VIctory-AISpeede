@@ -143,6 +143,8 @@ impl ShaderTextureUav {
         &self.0.target
     }
 
+    pub(crate) fn subresource(&self) -> ColorSubresource { self.0.sub }
+
     pub(crate) fn allows(&self, x: u32, y: u32) -> bool {
         u64::from(x) < self.0.sub.width && y < self.0.sub.height
     }
@@ -153,11 +155,17 @@ impl ShaderTextureUav {
 
     pub(crate) fn prepare(
         &self, host: &Host, list: &HostList, pages: &PinnedBatch, resources: &mut ResourcePlan,
+        shared: Option<&mut crate::page_texture::ScopedShaderAccess>,
     ) -> Result<crate::page_queue::TableDescriptor, BatchError> {
         self.0.check_native(host)?;
         resources.require_color_subresource(host, list, pages, self.target(), self.0.sub)?;
-        resources.transition_texture(list, self.target(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32)?;
         let texture = &self.target().texture;
+        let wanted = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        if let Some(scope) = shared {
+            scope.insert(texture, self.0.sub, resources.state(self.target()), wanted)?;
+        } else {
+            resources.transition_texture(list, self.target(), wanted.0 as u32)?;
+        }
         list.keep(texture);
         Ok(crate::page_queue::TableDescriptor::TextureUav(texture.clone(), self.0.format, self.0.sub.index))
     }

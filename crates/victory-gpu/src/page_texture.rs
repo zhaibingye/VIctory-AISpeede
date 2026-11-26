@@ -43,32 +43,39 @@ const SHADER_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
 );
 
-/// Draw-local state for SRVs sharing an allocation with a disjoint RTV.
-/// Duplicate views of a subresource must emit just one barrier pair.
+/// Temporary per-command states for disjoint shader reads and writes.
+/// Duplicate views of a subresource share one transition pair.
 #[derive(Default)]
-pub(crate) struct ScopedShaderReads(std::collections::BTreeMap<
-    (usize, u32), (ID3D12Resource, crate::page_resource::ColorSubresource, D3D12_RESOURCE_STATES),
+pub(crate) struct ScopedShaderAccess(std::collections::BTreeMap<
+    (usize, u32), (ID3D12Resource, crate::page_resource::ColorSubresource, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES),
 >);
 
-impl ScopedShaderReads {
-    fn insert(&mut self, texture: &ID3D12Resource, sub: crate::page_resource::ColorSubresource,
-        before: D3D12_RESOURCE_STATES,
-    ) {
-        if before != SHADER_READ {
-            self.0.entry((texture.as_raw() as usize, sub.index))
-                .or_insert_with(|| (texture.clone(), sub, before));
+impl ScopedShaderAccess {
+    pub(crate) fn insert(&mut self, texture: &ID3D12Resource, sub: crate::page_resource::ColorSubresource,
+        before: D3D12_RESOURCE_STATES, wanted: D3D12_RESOURCE_STATES,
+    ) -> Result<(), BatchError> {
+        if !sub.is_scoped() || crate::host::legal_state(texture, wanted.0 as u32) != wanted.0 as u32 {
+            return Err(BatchError::UnsupportedBarrier);
         }
+        let (_, _, earlier, planned) = self.0.entry((texture.as_raw() as usize, sub.index))
+            .or_insert_with(|| (texture.clone(), sub, before, wanted));
+        if *earlier != before || *planned != wanted {
+            return Err(BatchError::UnsupportedBarrier);
+        }
+        Ok(())
     }
 
     pub(crate) fn transition(&self, list: &ID3D12GraphicsCommandList, restore: bool) {
         if self.0.is_empty() { return; }
-        let barriers = self.0.values().map(|(texture, sub, before)| {
-            let (from, to) = if restore { (SHADER_READ, *before) } else { (*before, SHADER_READ) };
-            sub.temporary_transition(texture, from, to)
+        let barriers = self.0.values().filter_map(|(texture, sub, before, wanted)| {
+            let (from, to) = if restore { (*wanted, *before) } else { (*before, *wanted) };
+            (from != to).then(|| sub.temporary_transition(texture, from, to))
         }).collect::<Vec<_>>();
-        // SAFETY: exact live subresources, disjoint from every writable
-        // attachment in this operation, returned to the same baseline.
-        unsafe { list.ResourceBarrier(&barriers) };
+        // SAFETY: each live subresource has one admitted state for the
+        // operation, and the same pair restores its baseline afterward.
+        if !barriers.is_empty() {
+            unsafe { list.ResourceBarrier(&barriers) };
+        }
     }
 }
 
@@ -265,7 +272,7 @@ impl TextureInput {
 
     pub(crate) fn encode(
         &self, host: &Host, list: &HostList, batch: &PinnedBatch,
-        plan: &mut crate::page_resource::ResourcePlan, mut shared: Option<&mut ScopedShaderReads>,
+        plan: &mut crate::page_resource::ResourcePlan, mut shared: Option<&mut ScopedShaderAccess>,
     ) -> Result<(ID3D12Resource, DXGI_FORMAT), BatchError> {
         match self {
             Self::Scoped { copy, format, selection } => {
@@ -283,12 +290,10 @@ impl TextureInput {
                         if !sub.allows(copy) { return Err(BatchError::UnsupportedTextureMap); }
                         plan.require_color_subresource(host, list, batch, copy, sub)?;
                         if let Some(reads) = shared.as_deref_mut() {
-                            if !sub.is_scoped() || copy.twin.get().is_some_and(Option::is_some)
-                                || crate::host::legal_state(&copy.texture, SHADER_READ.0 as u32) != SHADER_READ.0 as u32
-                            {
+                            if copy.twin.get().is_some_and(Option::is_some) {
                                 return Err(BatchError::UnsupportedBarrier);
                             }
-                            reads.insert(&copy.texture, sub, plan.state(copy));
+                            reads.insert(&copy.texture, sub, plan.state(copy), SHADER_READ)?;
                         }
                     }
                 }

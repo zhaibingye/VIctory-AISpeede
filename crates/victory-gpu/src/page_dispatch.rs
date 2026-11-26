@@ -85,6 +85,7 @@ impl ClosedDispatch {
             None
         };
         let words = self.shader.prepare(host, list, batch, descriptors, plan, dirty, &[])?;
+        words.shared_access.transition(list.recording(), false);
         if self.shader.uses_uav() {
             crate::page_resource::PageBarrier::Uav.encode(list, plan)?;
         }
@@ -103,6 +104,8 @@ impl ClosedDispatch {
                 DispatchCall::Indirect(_) => args.as_ref().expect("indirect args prepared").execute(cmd),
             }
         }
-        self.shader.finish_texture_writes(list, plan)
+        self.shader.finish_texture_writes(list, plan)?;
+        words.shared_access.transition(list.recording(), true);
+        Ok(())
     }
 }

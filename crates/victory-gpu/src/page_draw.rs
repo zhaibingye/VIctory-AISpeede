@@ -472,7 +472,7 @@ impl ClosedDraw {
                     cmd.ResourceBarrier(&[target.sub.temporary_transition(&target.copy.texture, before, render_target)]);
                 }
             }
-            words.shared_reads.transition(cmd, false);
+            words.shared_access.transition(cmd, false);
             cmd.SetDescriptorHeaps(&[Some(descriptors.heap.heap.clone())]);
             cmd.SetGraphicsRootSignature(&self.root);
             cmd.SetPipelineState(&self.pipeline);
@@ -500,7 +500,7 @@ impl ClosedDraw {
                 }
                 DrawCall::Indirect(_) => indirect.as_ref().expect("indirect arguments prepared").execute(cmd),
             }
-            words.shared_reads.transition(cmd, true);
+            words.shared_access.transition(cmd, true);
             for (target, before) in self.targets.iter().zip(states) {
                 if before != render_target {
                     cmd.ResourceBarrier(&[target.sub.temporary_transition(&target.copy.texture, render_target, before)]);

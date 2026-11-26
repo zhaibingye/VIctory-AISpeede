@@ -267,7 +267,7 @@ impl ConstantSpan {
 pub(crate) struct PreparedShader {
     words: Vec<(u32, Vec<u32>)>,
     cbvs: Vec<(u32, u64)>,
-    pub(crate) shared_reads: crate::page_texture::ScopedShaderReads,
+    pub(crate) shared_access: crate::page_texture::ScopedShaderAccess,
 }
 
 impl PreparedShader {
@@ -465,19 +465,19 @@ impl ShaderBindings {
                 return Err(UnloweredShader::DescriptorTable);
             }
         }
-        let mut destinations = Vec::<&crate::resource::HostTexture>::new();
+        let mut destinations = Vec::<&crate::page_uav::ShaderTextureUav>::new();
         for view in tables.values().flat_map(|table| table.values()) {
             if let ClosedView::TextureUav(uav) = view {
                 let target = uav.target().as_ref();
-                if destinations.iter().any(|other| other.texture == target.texture) {
+                if destinations.iter().any(|other| other.target().texture == target.texture) {
                     return Err(UnloweredShader::DescriptorTable);
                 }
-                destinations.push(target);
+                destinations.push(uav);
             }
         }
         for view in tables.values().flat_map(|table| table.values()) {
             if let ClosedView::Texture(source) = view
-                && destinations.iter().any(|target| source.aliases_target(target))
+                && destinations.iter().any(|output| source.conflicts_color(output.target(), output.subresource()))
             {
                 return Err(UnloweredShader::DescriptorTable);
             }
@@ -585,19 +585,30 @@ impl ShaderBindings {
         }
         let mut bases = BTreeMap::new();
         let mut shader_dirty = BTreeSet::new();
-        let mut shared_reads = crate::page_texture::ScopedShaderReads::default();
+        let mut shared_access = crate::page_texture::ScopedShaderAccess::default();
+        let texture_reads: Vec<_> = self.tables.values().flat_map(|table| table.values())
+            .filter_map(|view| match view {
+                ClosedView::Texture(input) => Some(input),
+                _ => None,
+            }).collect();
+        let shared_uavs: Vec<_> = self.texture_outputs().map(|output| output.target().as_ref())
+            .filter(|output| texture_reads.iter().any(|input| input.aliases_target(output)))
+            .collect();
         for (&root, table) in &self.tables {
             let size = table.last_key_value().expect("captured slots exist").0 + 1;
             let mut views: Vec<_> = (0..size).map(|_| None).collect();
             for (&index, view) in table {
                 views[index as usize] = Some(match view {
                     ClosedView::Texture(texture) => {
-                        let shared = color_targets.iter().any(|target| texture.aliases_target(target));
+                        let shared = color_targets.iter().chain(&shared_uavs).any(|target| texture.aliases_target(target));
                         let (resource, format) = texture.encode(host, list, batch, plan,
-                            shared.then_some(&mut shared_reads))?;
+                            shared.then_some(&mut shared_access))?;
                         TableDescriptor::Texture(resource, format, texture.selection())
                     }
-                    ClosedView::TextureUav(view) => view.prepare(host, list, batch, plan)?,
+                    ClosedView::TextureUav(view) => {
+                        let shared = shared_uavs.iter().any(|target| target.texture == view.target().texture);
+                        view.prepare(host, list, batch, plan, shared.then_some(&mut shared_access))?
+                    },
                     ClosedView::Raw(raw) if raw.unordered() => raw.prepare_uav(batch, &mut shader_dirty, 0)?,
                     ClosedView::Raw(raw) => {
                         let span = raw.range();
@@ -664,6 +675,6 @@ impl ShaderBindings {
             };
             cbvs.push((param, gpu));
         }
-        Ok(PreparedShader { words, cbvs, shared_reads })
+        Ok(PreparedShader { words, cbvs, shared_access })
     }
 }
