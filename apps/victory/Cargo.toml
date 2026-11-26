@@ -23,7 +23,7 @@ walkdir.workspace = true
 tracing.workspace = true
 
 [features]
-paged-title = ["victory-gpu/paged-title"]
+paged-title = ["victory-gpu/paged-title", "victory-hle/paged-title"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [

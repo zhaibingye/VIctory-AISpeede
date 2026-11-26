@@ -93,6 +93,64 @@ impl Drop for Reservation {
     }
 }
 
+/// 给惰性 Windows 物理节记账。键是物理节内的页号，不是某一个映射地址。
+/// 已提交的页直到物理节销毁才释放额度；取消某个别名不改变账本。
+pub struct DeferredRam {
+    lease: Reservation,
+    pages: Box<[bool]>,
+    count: u64,
+}
+
+impl DeferredRam {
+    pub fn new(budget: &HostBudget, pages: usize) -> Result<Self, NoSpace> {
+        Ok(Self { lease: budget.reserve_ram(0)?, pages: vec![false; pages].into_boxed_slice(), count: 0 })
+    }
+
+    /// 先预扣新页并执行真实宿主提交。拒绝不调用宿主，提交失败撤回预扣。
+    /// 调用方串行化物理节内各次提交，且宿主提交在失败时不新增页。
+    pub fn commit(&mut self, start: usize, count: usize, apply: impl FnOnce() -> bool)
+        -> Result<bool, NoSpace>
+    {
+        let Some(pages) = start.checked_add(count).and_then(|end| self.pages.get_mut(start..end)) else {
+            return Ok(false);
+        };
+        let fresh = pages.iter().filter(|&&committed| !committed).count() as u64;
+        if fresh == 0 { return Ok(true); }
+        let next = self.count + fresh;
+        self.lease.resize(next * PAGE_BYTES)?;
+        if !apply() {
+            self.lease.resize(self.count * PAGE_BYTES).expect("回退仅退还 RAM 额度");
+            return Ok(false);
+        }
+        pages.fill(true);
+        self.count = next;
+        Ok(true)
+    }
+}
+
+#[test]
+fn deferred_section_counts_unique_committed_pages_and_undoes_failure() {
+    let budget = HostBudget::default();
+    let mut backing = DeferredRam::new(&budget, 8).unwrap();
+    assert_eq!(budget.used(Pool::Ram), 0);
+    assert!(backing.commit(1, 3, || true).unwrap());
+    assert_eq!(budget.used(Pool::Ram), 3 * PAGE_BYTES);
+    assert!(backing.commit(2, 2, || panic!("已提交的别名无需重新提交")).unwrap());
+    assert!(!backing.commit(2, 3, || false).unwrap());
+    assert_eq!(budget.used(Pool::Ram), 3 * PAGE_BYTES);
+    assert!(backing.commit(2, 3, || true).unwrap());
+    assert_eq!(budget.used(Pool::Ram), 4 * PAGE_BYTES);
+    budget.lock().apply_host_limits(HostLimits {
+        ram: PoolLimits { soft: 3 * PAGE_BYTES, hard: 4 * PAGE_BYTES },
+        local: PoolLimits { soft: 0, hard: 0 },
+    });
+    assert!(backing.commit(1, 4, || panic!("既有页可在限额下降后继续映射")).unwrap());
+    assert!(backing.commit(5, 1, || panic!("超限不能调用宿主")).is_err());
+    assert!(!backing.commit(7, 2, || panic!("非法区间不能调用宿主")).unwrap());
+    drop(backing);
+    assert_eq!(budget.used(Pool::Ram), 0);
+}
+
 /// Stable backing identity. XMem numbers below the reserved private bit
 /// keep their title ABI encoding (21-bit index of 64 KiB pages, expressed
 /// in 4 KiB frames); private mappings use a disjoint internal namespace.
@@ -140,6 +198,9 @@ impl Default for PageNumbers {
 }
 
 impl PageNumbers {
+    /// 一个物理节最多能使用的来宾页号；预留元数据前可先拒绝不可能的规模。
+    pub const MAX_SECTION_PAGES: usize = (END - FIRST) / FRAMES;
+
     pub fn allocate(&mut self, count: usize) -> Option<PhysicalPage> {
         let span = count.checked_mul(FRAMES)?;
         let end = self.next.checked_add(span)?;

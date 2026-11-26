@@ -54,6 +54,7 @@ windows-core = { workspace = true, optional = true }
 tempfile.workspace = true
 
 [features]
+paged-title = ["victory-gpu/paged-title"]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows-core"]
 

@@ -33,7 +33,7 @@ use windows_sys::core::BOOL;
 use crate::{HleModule, hle_export};
 use victory_memory::{budget::Pool, virtual_pages::VirtualPages};
 use victory_memory::physical::{
-    Aliases, BackingPins, HostBudget, PageNumbers, PhysicalPage, Reservation,
+    Aliases, BackingPins, DeferredRam, HostBudget, PageNumbers, PhysicalPage, Reservation,
 };
 
 const MIB: usize = 1 << 20;
@@ -509,7 +509,34 @@ struct Section {
     handle: HANDLE,
     first: PhysicalPage,
     pages: usize,
-    _reservation: Reservation,
+    backing: SectionBacking,
+}
+
+enum SectionBacking {
+    Eager { _reservation: Reservation },
+    Deferred(Mutex<DeferredRam>),
+}
+
+impl Section {
+    fn commit(&self, index: usize, base: usize, len: usize) -> bool {
+        let apply = || commit_section_view(base, len);
+        match &self.backing {
+            SectionBacking::Eager { .. } => apply(),
+            SectionBacking::Deferred(state) => {
+                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                match state.commit(index, len / PAGE, apply) {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        let (used, limits) = HostBudget::process().pool_state(Pool::Ram);
+                        tracing::warn!(requested_mib = len / MIB, used_mib = used / MIB as u64,
+                            hard_mib = limits.hard / MIB as u64, shortfall = error.shortfall,
+                            "XMem 首次提交物理页超出宿主 RAM 预算");
+                        false
+                    }
+                }
+            }
+        }
+    }
 }
 
 // SAFETY: a section handle may be used from any thread.
@@ -754,14 +781,23 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n == 0 || n > PageNumbers::MAX_SECTION_PAGES {
+        // 安全：已检查 count 非空。
+        unsafe { count.write(0) };
         return 0;
-    };
+    }
+    let size = n * PAGE;
     let ram = HostBudget::process();
-    let reservation = match ram.reserve_ram(size as u64) {
-        Ok(reservation) => reservation,
+    // 原生 Windows 的 SEC_RESERVE 只预留地址后备；旧后端和 Wine 保持原有准入。
+    let backing = if cfg!(feature = "paged-title") && !on_wine() {
+        DeferredRam::new(ram, n).map(|pages| SectionBacking::Deferred(Mutex::new(pages)))
+    } else {
+        ram.reserve_ram(size as u64).map(|lease| SectionBacking::Eager { _reservation: lease })
+    };
+    let backing = match backing {
+        Ok(backing) => backing,
         Err(error) => {
-            tracing::warn!(n, reserved = ram.used(Pool::Ram), shortfall = error.shortfall, "XMem physical backing budget exhausted");
+            tracing::warn!(n, reserved = ram.used(Pool::Ram), shortfall = error.shortfall, "XMem 物理后备预留超出宿主 RAM 预算");
             // SAFETY: checked non-null; this ABI reports no pages on failure.
             unsafe { count.write(0) };
             return 0;
@@ -811,7 +847,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         handle,
         first,
         pages: n,
-        _reservation: reservation,
+        backing,
     });
     for index in 0..n {
         let number = first.offset(index).number();
@@ -868,8 +904,8 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len, section: Some(section) };
-        commit(at.Value as usize, len).then_some(view)
+        let view = View { at, len, section: Some(section.clone()) };
+        section.commit(index, at.Value as usize, len).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -1133,7 +1169,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !slice.section.commit(slice.index, base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         if unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) } == 0 {
             tracing::error!(base, len, "failed to roll back an uncommitted physical view");
@@ -1155,7 +1191,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
+fn commit_section_view(base: usize, len: usize) -> bool {
     if on_wine() {
         return true; // sections are committed whole there
     }
