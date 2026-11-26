@@ -408,22 +408,6 @@ pub(crate) enum TextureSrvReject {
     NativeOrBytes { external_alias: bool, host_format: i32 },
 }
 
-/// 地址式 SRV 的布局签名。没有地址、指针、资源内容或用户路径。
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PlacedSrvShape {
-    dimension: u32,
-    width: u64,
-    height: u32,
-    slices: u16,
-    mips: u16,
-    layout: u32,
-    flags: u32,
-    mapping: u32,
-    first_view_mip: u32,
-    view_mips: u32,
-}
-
 impl View {
     /// A canonical 2D view with exact native color or depth format.
     /// A multi-mip view requires native authority for every named mip.
@@ -516,26 +500,18 @@ impl View {
 
     /// 只记录可用于区分空、放置式、直接资源及其他类型的格式信息，省略地址和内容。
     #[cfg(windows)]
-    pub(crate) fn texture_srv_metadata(&self) -> (&'static str, Option<u32>, Option<u32>, Option<u32>, Option<PlacedSrvShape>) {
+    pub(crate) fn texture_srv_metadata(&self) -> (&'static str, Option<u32>, Option<u32>, Option<u32>, Option<crate::resource::TextureSrvShape>) {
         match self {
             Self::Shader(resource, desc) => (
                 if *resource == 0 { "null-srv" } else { "resource-srv" },
                 crate::resource::title_format(*resource as This),
                 desc.as_ref().map(|words| words[0]),
                 desc.as_ref().map(|words| words[1]),
-                None,
+                crate::resource::describe_texture_backing(*resource as This, desc.as_ref()),
             ),
             Self::Placed(false, resource, desc) => (
                 "placed-srv", Some(resource[8]), Some(desc[0]), Some(desc[1]),
-                Some(PlacedSrvShape {
-                    dimension: resource[0],
-                    width: u64::from(resource[4]) | (u64::from(resource[5]) << 32),
-                    height: resource[6],
-                    slices: resource[7] as u16,
-                    mips: (resource[7] >> 16) as u16,
-                    layout: resource[11], flags: resource[12], mapping: desc[2],
-                    first_view_mip: desc[4], view_mips: desc[5],
-                }),
+                Some(crate::resource::TextureSrvShape::address_view(resource, desc)),
             ),
             Self::Placed(true, resource, desc) => (
                 "placed-uav", Some(resource[8]), Some(desc[0]), Some(desc[1]), None,

@@ -43,7 +43,7 @@ pub(crate) enum DescriptorSlotReason {
     UnsupportedTexture {
         array: bool, kind: &'static str, title_format: Option<u32>,
         view_format: Option<u32>, view_dimension: Option<u32>,
-        placed_signature: Option<crate::descriptor::PlacedSrvShape>,
+        texture_signature: Option<crate::resource::TextureSrvShape>,
         phase: crate::descriptor::TextureSrvReject,
     },
     UnsupportedBuffer,
@@ -511,10 +511,10 @@ impl ShaderBindings {
                                     ClosedView::NullTexture(format, selection)
                                 } else {
                                     ClosedView::Texture(actual.paged_texture_srv(array).map_err(|phase| {
-                                        let (kind, title_format, view_format, view_dimension, placed_signature) =
+                                        let (kind, title_format, view_format, view_dimension, texture_signature) =
                                             actual.texture_srv_metadata();
                                         reason(DescriptorSlotReason::UnsupportedTexture {
-                                            array, kind, title_format, view_format, view_dimension, placed_signature, phase,
+                                            array, kind, title_format, view_format, view_dimension, texture_signature, phase,
                                         })
                                     })?)
                                 }

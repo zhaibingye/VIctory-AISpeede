@@ -1709,6 +1709,57 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// SRV 的布局签名。没有地址、指针、资源内容或用户路径。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TextureSrvShape {
+    backing: &'static str,
+    dimension: u32,
+    width: u64,
+    height: u32,
+    slices: u16,
+    mips: u16,
+    sample_count: u32,
+    sample_quality: u32,
+    layout: u32,
+    flags: u32,
+    // 分量映射、首 mip、mip 数；无显式描述时使用资源默认视图。
+    explicit_view: Option<(u32, u32, u32)>,
+}
+
+#[cfg(windows)]
+impl TextureSrvShape {
+    pub(crate) fn address_view(words: &[u32; 14], view: &[u32; 16]) -> Self {
+        // SAFETY: 与地址式资源创建路径相同，完整的 14 个 u32 覆盖 C 布局，读取无需对齐。
+        let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        Self::new(&desc, "address-view", view[..10].try_into().ok())
+    }
+
+    fn new(desc: &ResourceDesc, backing: &'static str, view: Option<&[u32; 10]>) -> Self {
+        Self {
+            backing, dimension: desc.dimension, width: desc.width, height: desc.height,
+            slices: desc.depth_or_array_size, mips: desc.mip_levels,
+            sample_count: desc.sample_count, sample_quality: desc.sample_quality,
+            layout: desc.layout, flags: desc.flags,
+            explicit_view: view.map(|words| (words[2], words[4], words[5])),
+        }
+    }
+}
+
+/// 只提供诊断需要的形状与后备类别，不计算地址或读取资源数据。
+#[cfg(windows)]
+pub(crate) fn describe_texture_backing(this: This, view: Option<&[u32; 10]>) -> Option<TextureSrvShape> {
+    if this.is_null() { return None; }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER { return None; }
+    let kind = match r.backing {
+        Backing::Committed(_) => "committed",
+        Backing::Placed { .. } => "heap",
+        Backing::Address(_) => "address",
+    };
+    Some(TextureSrvShape::new(&r.desc, kind, view))
+}
+
 /// Resolve only title-owned, explicitly linear, fully typed textures.
 #[cfg(windows)]
 #[allow(dead_code, reason = "used by paged descriptor admission")]
