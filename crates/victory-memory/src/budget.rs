@@ -22,6 +22,7 @@ pub struct Budget {
     ram: u64,
     local: u64,
     local_cap: u64,
+    adaptive: Option<HostLimits>,
 }
 
 #[must_use = "retain this charge with the physical allocation"]
@@ -33,8 +34,28 @@ pub struct Charge {
 
 impl Budget {
     pub fn observe_local(&mut self, dxgi: u64, outside_ledger: u64) -> u64 {
-        self.local_cap = LOCAL_LIMIT.min(dxgi).saturating_sub(outside_ledger);
+        self.local_cap = match self.adaptive {
+            Some(limits) => limits.local.hard.min(dxgi.saturating_sub(outside_ledger)),
+            None => LOCAL_LIMIT.min(dxgi).saturating_sub(outside_ledger),
+        };
         self.local.saturating_sub(self.local_cap)
+    }
+
+    pub(crate) fn apply_host_limits(&mut self, limits: HostLimits) {
+        self.local_cap = limits.local.hard;
+        self.adaptive = Some(limits);
+    }
+
+    /// 上限收紧时保留真实占用，不取消已签发的分配租约。
+    pub fn limits(&self, pool: Pool) -> PoolLimits {
+        match (self.adaptive, pool) {
+            (Some(limits), Pool::Ram) => limits.ram,
+            (Some(limits), Pool::Local) => PoolLimits {
+                soft: limits.local.soft.min(self.local_cap), hard: self.local_cap,
+            },
+            (None, Pool::Ram) => PoolLimits { soft: RAM_LIMIT, hard: RAM_LIMIT },
+            (None, Pool::Local) => PoolLimits { soft: self.local_cap, hard: self.local_cap },
+        }
     }
 
     #[cfg(windows)]
@@ -50,9 +71,10 @@ impl Budget {
     }
 
     pub fn charge(&mut self, pool: Pool, bytes: u64) -> Result<Charge, NoSpace> {
-        let (used, cap) = match pool {
-            Pool::Ram => (&mut self.ram, RAM_LIMIT),
-            Pool::Local => (&mut self.local, self.local_cap),
+        let cap = self.limits(pool).hard;
+        let used = match pool {
+            Pool::Ram => &mut self.ram,
+            Pool::Local => &mut self.local,
         };
         let free = cap.saturating_sub(*used);
         if bytes > free {
@@ -79,4 +101,24 @@ impl Budget {
         };
         *used = used.checked_sub(charge.bytes).expect("charge belongs to its ledger");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn adaptive_pressure_blocks_new_charges_without_forgetting_live_bytes() {
+    let mut budget = Budget::default();
+    let old = budget.charge(Pool::Ram, 80).unwrap();
+    budget.apply_host_limits(HostLimits {
+        ram: PoolLimits { soft: 32, hard: 64 },
+        local: PoolLimits { soft: 7 << 30, hard: 8 << 30 },
+    });
+    assert_eq!(budget.used(Pool::Ram), 80);
+    assert_eq!(budget.charge(Pool::Ram, 1).unwrap_err(), NoSpace { pool: Pool::Ram, shortfall: 1 });
+    assert_eq!(budget.observe_local(9 << 30, 0), 0);
+    let gpu = budget.charge(Pool::Local, 7 << 30).unwrap();
+    assert_eq!(budget.observe_local(6 << 30, 0), 1 << 30);
+    assert_eq!(budget.limits(Pool::Local), PoolLimits { soft: 6 << 30, hard: 6 << 30 });
+    budget.release(gpu);
+    budget.release(old);
+    assert!(budget.charge(Pool::Ram, 64).is_ok());
 }

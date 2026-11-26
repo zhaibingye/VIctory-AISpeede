@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     PAGE_BYTES,
-    budget::{Budget, Charge, NoSpace, Pool},
+    budget::{Budget, BudgetProfile, Charge, Headroom, HostLimits, HostPressure, NoSpace, Pool, PoolLimits},
 };
 
 /// Thread-safe ledger for the host's managed physical allocations. XMem and
@@ -36,6 +36,27 @@ impl HostBudget {
         budget.observe_local(dxgi_budget, outside.saturating_add(headroom));
         let charge = budget.charge(Pool::Local, bytes)?;
         Ok(self.reservation(charge))
+    }
+
+    /// 在分配锁内读取宿主压力并发布两个池的上限。不完整的采样不改旧值；
+    /// 采样回调只能读 OS 数据，不得再次访问本账本，也不能获取或释放租约。
+    pub fn refresh_pressure(
+        &self, reserve: Headroom, profile: BudgetProfile,
+        sample: impl FnOnce() -> Option<HostPressure>,
+    ) -> Option<HostLimits> {
+        let mut budget = self.lock();
+        let mut sample = sample()?;
+        sample.managed_ram = budget.used(Pool::Ram);
+        sample.managed_local = budget.used(Pool::Local);
+        let limits = HostLimits::plan(sample, reserve, profile);
+        budget.apply_host_limits(limits);
+        Some(limits)
+    }
+
+    /// 在同一时刻读取实际入账容量和软硬线；超过上限的既有资源仍须真实回收。
+    pub fn pool_state(&self, pool: Pool) -> (u64, PoolLimits) {
+        let budget = self.lock();
+        (budget.used(pool), budget.limits(pool))
     }
 
     pub fn used(&self, pool: Pool) -> u64 {
