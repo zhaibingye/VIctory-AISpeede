@@ -143,6 +143,13 @@ impl<'a> Ranges<'a> {
         r
     }
 
+    /// 只给硬件传入的 SSA 值设界。对同一寄存器的后续写入仍按指令证明。
+    pub(crate) fn bound_input(&mut self, reg: Reg, upper: u32) {
+        if let Some(&(_, value)) = self.p.inputs.iter().find(|&&(input, _)| input == reg) {
+            self.memo.insert(value, upper);
+        }
+    }
+
     /// A conservative unsigned byte bound and independent dword alignment
     /// proof. Only plain moves/phis/masks are used to infer low bits.
     pub(crate) fn dword_offset_hi(&mut self, value: Value) -> Option<u32> {
@@ -351,6 +358,15 @@ impl<'a> Ranges<'a> {
             ("v_med3_u32", &[x, y, z]) => x.max(y).min(x.max(z)).min(y.max(z)),
             // A sum that may wrap is unbounded.
             ("s_add_u32" | "s_add_i32" | "v_add_nc_u32", &[x, y]) => x.saturating_add(y),
+            ("s_mul_i32" | "v_mul_lo_u32", &[x, y]) => x.saturating_mul(y),
+            ("s_lshl_b32", &[x, shift]) | ("v_lshlrev_b32", &[shift, x]) if shift < 32 =>
+                x.saturating_mul(1u32 << shift),
+            ("v_lshl_add_u32", &[x, shift, y]) if shift < 32 =>
+                x.saturating_mul(1u32 << shift).saturating_add(y),
+            ("v_add_lshl_u32", &[x, y, shift]) if shift < 32 =>
+                x.saturating_add(y).saturating_mul(1u32 << shift),
+            ("v_mad_u32_u24", &[x, y, z]) =>
+                x.min(0xff_ffff).saturating_mul(y.min(0xff_ffff)).saturating_add(z),
             _ => u32::MAX,
         }
     }
@@ -421,6 +437,24 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn hardware_bounds_apply_only_to_the_entry_value() {
+        let p = build_words(&[
+            vop1(0x01, 1, V),           // v1 读取入口 v0
+            vop2(0x25, 0, 129, 0),     // v0 加一并覆盖寄存器
+            S_ENDPGM,
+        ]);
+        let st = structure::structure(&p).unwrap();
+        let i = &p.blocks[0].insts;
+        let value = i[0].write(Reg::V(1)).unwrap();
+        let overwritten = i[1].write(Reg::V(0)).unwrap();
+        let mut bounded = Ranges::new(&p, &st);
+        bounded.bound_input(Reg::V(0), 7);
+        assert_eq!(bounded.unsigned_upper_bound(value), Some(7));
+        assert_eq!(bounded.unsigned_upper_bound(overwritten), Some(8));
+        assert_eq!(Ranges::new(&p, &st).unsigned_upper_bound(value), None);
     }
 
     #[test]

@@ -414,6 +414,7 @@ impl ShaderBindings {
         values: impl Fn(u8, u32) -> Option<u32>,
         view: impl Fn(u8, u32) -> Option<View>,
         address: impl Fn(u8) -> Option<u64>,
+        direct_groups: Option<[u32; 3]>,
     ) -> Result<Self, UnloweredShader> {
         if pipeline.marks.is_some() {
             return Err(UnloweredShader::DescriptorHeap);
@@ -432,9 +433,25 @@ impl ShaderBindings {
             let needs_table_or_root = t.host.user_data.iter().any(|u| {
                 u.root == RootType::Table || u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_SRV_VIEW
             });
+            let direct_report;
             let slots = if needs_table_or_root {
-                stage.shader.static_view_slots()
-                    .map_err(|reason| UnloweredShader::DescriptorProof { stage: stage.shader.stage, reason })?
+                use victory_shader::emit::{StaticViewFailure, StaticViewReport};
+                let reject = |reason| UnloweredShader::DescriptorProof { stage: stage.shader.stage, reason };
+                match stage.shader.static_view_slots() {
+                    Ok(slots) => slots,
+                    Err(failure @ StaticViewFailure::UnsupportedAccess { operation: "image_store", .. })
+                        if pipeline.compute =>
+                    {
+                        let groups = direct_groups.filter(|groups| groups.iter().all(|&n| n > 0))
+                            .ok_or_else(|| reject(failure))?;
+                        direct_report = stage.shader.direct_view_report(groups);
+                        match &*direct_report {
+                            StaticViewReport::Proven(slots) => slots,
+                            StaticViewReport::Rejected(reason) => return Err(reject(*reason)),
+                        }
+                    }
+                    Err(reason) => return Err(reject(reason)),
+                }
             } else {
                 &[]
             };

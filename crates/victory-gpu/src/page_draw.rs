@@ -479,7 +479,7 @@ impl ClosedDraw {
         {
             return Err(DrawState(Reason::SampleCount { expected: samples, actual }));
         }
-        let shader = ShaderBindings::capture(pipeline, values, view, address)?;
+        let shader = ShaderBindings::capture(pipeline, values, view, address, None)?;
         if depth.as_ref().is_some_and(|d| {
             pipeline.closed_depth_tests & !d.planes != 0
                 || pipeline.closed_depth_writes & d.read_only_planes != 0

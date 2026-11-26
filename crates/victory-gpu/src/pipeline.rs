@@ -65,6 +65,8 @@ pub(crate) struct Shader {
     translated: OnceLock<Option<Translated>>,
     #[cfg(windows)]
     static_view_slots: OnceLock<victory_shader::emit::StaticViewReport>,
+    #[cfg(windows)]
+    direct_view_reports: Mutex<Vec<([u32; 3], std::sync::Arc<victory_shader::emit::StaticViewReport>)>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -97,6 +99,8 @@ impl Shader {
             translated: OnceLock::new(),
             #[cfg(windows)]
             static_view_slots: OnceLock::new(),
+            #[cfg(windows)]
+            direct_view_reports: Mutex::default(),
         }
     }
 }
@@ -121,6 +125,22 @@ impl Shader {
             StaticViewReport::Proven(slots) => Ok(slots),
             StaticViewReport::Rejected(reason) => Err(*reason),
         }
+    }
+
+    /// 同一着色器仅按完全相同的直接派发域复用动态证明，不污染常驻静态结果。
+    pub(crate) fn direct_view_report(&self, groups: [u32; 3]) -> Arc<victory_shader::emit::StaticViewReport> {
+        use victory_shader::emit::{StaticViewFailure, StaticViewReport, direct_dispatch_view_report};
+        let mut cache = self.direct_view_reports.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, report)) = cache.iter().find(|(key, _)| *key == groups) {
+            return Arc::clone(report);
+        }
+        let report = Arc::new(direct_dispatch_view_report(&self.container, groups)
+            .unwrap_or(StaticViewReport::Rejected(StaticViewFailure::ParseOrAnalysis)));
+        if cache.len() == 8 {
+            cache.remove(0);
+        }
+        cache.push((groups, Arc::clone(&report)));
+        report
     }
 
     /// The translation, made on first use (or taken from the cache); a

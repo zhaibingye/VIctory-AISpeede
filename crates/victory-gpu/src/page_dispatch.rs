@@ -42,10 +42,14 @@ impl ClosedDispatch {
         {
             return Err(UnloweredShader::GraphicsState);
         }
+        let groups = match &call {
+            DispatchCall::Direct(x, y, z) => Some([*x, *y, *z]),
+            DispatchCall::Indirect(_) => None,
+        };
         Ok(Self {
             pipeline: pipeline.pso.clone(),
             root: pipeline.root.clone(),
-            shader: ShaderBindings::capture(pipeline, constants, view, address)?,
+            shader: ShaderBindings::capture(pipeline, constants, view, address, groups)?,
             call,
         })
     }

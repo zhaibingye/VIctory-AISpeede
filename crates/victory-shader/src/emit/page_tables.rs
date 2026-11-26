@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::gfx10::{Fields, NULL, Operand};
-use crate::native::{HwStage, NativeProgram, ResourceType, RootType};
+use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo};
+use crate::ir::Reg;
 use crate::resource::{Address, Role, Source};
 use crate::{Container, FourCC, ShaderError};
 
@@ -74,6 +75,16 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
 }
 
 pub fn static_view_report(container: &[u8]) -> Result<StaticViewReport, ShaderError> {
+    view_report(container, None)
+}
+
+/// 使用当前直接派发的组数；结果不能复用于组数不同或未知的派发。
+pub fn direct_dispatch_view_report(container: &[u8], groups: [u32; 3]) -> Result<StaticViewReport, ShaderError> {
+    let direct = groups.iter().all(|&n| (1..=65535).contains(&n)).then_some(groups);
+    view_report(container, direct)
+}
+
+fn view_report(container: &[u8], direct: Option<[u32; 3]>) -> Result<StaticViewReport, ShaderError> {
     use StaticViewFailure as Reason;
     let rejected = |reason| Ok(StaticViewReport::Rejected(reason));
     let c = Container::parse(container)?;
@@ -89,6 +100,20 @@ pub fn static_view_report(container: &[u8]) -> Result<StaticViewReport, ShaderEr
     let st = st?;
     let resources = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let mut bounds = crate::range::Ranges::new(&p, &st);
+    if let (HwStage::Cs, StageIo::Cs(cs)) = (native.stage, &native.io) {
+        for (axis, threads) in cs.threads.into_iter().take(usize::from(cs.thread_id_vgprs())).enumerate() {
+            if let Some(upper) = threads.checked_sub(1) {
+                bounds.bound_input(Reg::V(axis as u8), upper);
+            }
+        }
+        if let Some(groups) = direct {
+            for (register, count) in cs.system_sgprs().0.into_iter().zip(groups) {
+                if let Some(register) = register {
+                    bounds.bound_input(Reg::S(register), count - 1);
+                }
+            }
+        }
+    }
     let addresses: BTreeMap<_, _> = resources.scalar.iter().copied().collect();
     let mut slots = BTreeSet::new();
     for descriptor in &resources.descriptors {
