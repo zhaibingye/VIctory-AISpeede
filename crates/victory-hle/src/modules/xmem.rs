@@ -1831,6 +1831,52 @@ mod tests {
         assert_eq!(backing.strong_count(), 0);
     }
 
+    #[cfg(feature = "paged-title")]
+    #[test]
+    fn deferred_native_section_charges_at_commit_and_reuses_alias() {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        if on_wine() { return; }
+        let budget = HostBudget::default();
+        // 用独立账本模拟一个页的余额，不人为制造系统内存压力。
+        let _used = budget.reserve_ram(victory_memory::budget::RAM_LIMIT - PAGE as u64).unwrap();
+        let baseline = budget.used(Pool::Ram);
+        // 安全：创建仅两页、由这个测试持有的临时映射。
+        let handle = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_RESERVE,
+                0, (2 * PAGE) as u32, std::ptr::null())
+        };
+        assert!(!handle.is_null());
+        let section = Arc::new(Section {
+            handle, first: PageNumbers::default().allocate(2).unwrap(), pages: 2,
+            backing: SectionBacking::Deferred(Mutex::new(DeferredRam::new(&budget, 2).unwrap())),
+        });
+        assert_eq!(budget.used(Pool::Ram), baseline);
+        let mut first = View::map_section(section.clone(), 0, 1).expect("首次提交第一页");
+        assert_eq!(budget.used(Pool::Ram), baseline + PAGE as u64);
+        first.bytes()[0] = 0x42;
+        let mut alias = View::map_section(section.clone(), 0, 1).expect("别名无需新增物理页");
+        assert_eq!(alias.bytes()[0], 0x42);
+        assert_eq!(budget.used(Pool::Ram), baseline + PAGE as u64);
+        // 安全：第二页的临时视图尚未提交，不读取或写入这页。
+        let at = unsafe { MapViewOfFile(handle, FILE_MAP_WRITE, 0, PAGE as u32, PAGE) };
+        assert!(!at.Value.is_null());
+        let reserved = View { at, len: PAGE, section: Some(section.clone()) };
+        assert!(!section.commit(1, reserved.at.Value as usize, PAGE));
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // 安全：只查询我们自己的第二页，不读取其内容。
+        let bytes = unsafe {
+            VirtualQueryEx(GetCurrentProcess(), reserved.at.Value, &mut info, size_of_val(&info))
+        };
+        assert_ne!(bytes, 0);
+        assert_eq!(info.State, MEM_RESERVE);
+        assert_eq!(budget.used(Pool::Ram), baseline + PAGE as u64);
+        drop((section, first, reserved));
+        assert_eq!(budget.used(Pool::Ram), baseline + PAGE as u64);
+        drop(alias);
+        assert_eq!(budget.used(Pool::Ram), baseline);
+    }
+
+    #[cfg(not(feature = "paged-title"))]
     #[test]
     fn physical_backing_refuses_requests_over_ram_cap() {
         let mut n = victory_memory::budget::RAM_LIMIT as usize / PAGE + 1;
