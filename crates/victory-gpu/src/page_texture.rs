@@ -874,3 +874,128 @@ impl PreparedSample {
         }
     }
 }
+
+/// 验证宿主 D3D12 有类型三维纹理视图的边缘写入，不依赖游戏材料或 VNME 准入规则。
+#[cfg(test)]
+#[test]
+fn native_texture3d_typed_store_preserves_every_voxel_after_edge_writes() {
+    let host = crate::host::host().expect("D3D12 宿主设备");
+    let (root, pso) = crate::memory::tests::pipeline(r#"
+#define RS "DescriptorTable(UAV(u0)), RootConstants(num32BitConstants=1, b0)"
+RWTexture3D<float4> volume : register(u0);
+cbuffer Args : register(b0) { uint phase; }
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 pos : SV_DispatchThreadID) {
+    bool inside = all(pos < 33u);
+    if (phase == 0u) {
+        if (inside) volume[pos] = float4(float3(pos + 1u), 1.0);
+    } else {
+        if (!inside) volume[pos] = float4(-1.0, -2.0, -3.0, -4.0);
+    }
+}
+"#);
+    const SIDE: u32 = 33;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+        Width: u64::from(SIDE), Height: SIDE, DepthOrArraySize: SIDE as u16, MipLevels: 1,
+        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let unordered = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    let copy_source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    let make = |kind, desc: &D3D12_RESOURCE_DESC, state| -> ID3D12Resource {
+        let mut out = None;
+        // 安全：测试创建单个有效的小型资源，持有对象直到命令队列完成。
+        unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, desc, state, None, &mut out,
+            )
+        }.unwrap();
+        out.unwrap()
+    };
+    let texture = make(D3D12_HEAP_TYPE_DEFAULT, &desc, unordered);
+    let (footprint, total) = checked_texture_footprint(host, desc).unwrap();
+    let readback = make(D3D12_HEAP_TYPE_READBACK, &D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    }, D3D12_RESOURCE_STATE_COPY_DEST);
+    let list = host.new_list().unwrap();
+    let cmd = list.recording();
+    // 安全：独占测试堆中的一个描述符，绑定一个与原格式/全深度一致的三维资源。
+    let heap: ID3D12DescriptorHeap = unsafe {
+        let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 1,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0,
+        }).unwrap();
+        let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: desc.Format, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_UAV { MipSlice: 0, FirstWSlice: 0, WSize: SIDE },
+            },
+        };
+        host.device.CreateUnorderedAccessView(&texture, None, Some(&view), heap.GetCPUDescriptorHandleForHeapStart());
+        cmd.SetDescriptorHeaps(&[Some(heap.clone())]);
+        cmd.SetComputeRootSignature(&root);
+        cmd.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+        cmd.SetPipelineState(&pso);
+        cmd.SetComputeRoot32BitConstant(1, 0, 0);
+        cmd.Dispatch(5, 5, SIDE);
+        // 两次有序派发：即使发生钳位，第一个写入的坐标值也必然被不同的标记覆盖。
+        cmd.ResourceBarrier(&[transition(&texture, unordered, copy_source)]);
+        cmd.ResourceBarrier(&[transition(&texture, copy_source, unordered)]);
+        cmd.SetComputeRoot32BitConstant(1, 1, 0);
+        cmd.Dispatch(5, 5, SIDE);
+        cmd.ResourceBarrier(&[transition(&texture, unordered, copy_source)]);
+        let src = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&texture),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&readback),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+        };
+        cmd.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        heap
+    };
+    list.close();
+    {
+        let mut signal = host.direct_queue();
+        host.run_native_group(&mut signal, &[Some(cmd.cast().unwrap())]).unwrap();
+    }
+    let half = |positive: u32| {
+        let exponent = positive.ilog2();
+        (((15 + exponent) << 10) | ((positive - (1 << exponent)) << (10 - exponent))) as u16
+    };
+    let pitch = footprint.Footprint.RowPitch as usize;
+    let mut pointer = std::ptr::null_mut();
+    // 安全：只在真实 Fence 后映射，查询过的 copy 足迹完全落在读回资源内。
+    let bytes = unsafe {
+        readback.Map(0, None, Some(&mut pointer)).unwrap();
+        std::slice::from_raw_parts(pointer.cast::<u8>(), total as usize)
+    };
+    for z in 0..SIDE {
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let at = footprint.Offset as usize + (z * SIDE + y) as usize * pitch + x as usize * 8;
+                let got = std::array::from_fn(|channel| {
+                    let i = at + 2 * channel;
+                    u16::from_le_bytes([bytes[i], bytes[i + 1]])
+                });
+                assert_eq!(got, [half(x + 1), half(y + 1), half(z + 1), half(1)],
+                    "体素 ({x},{y},{z}) 被意外覆盖");
+            }
+        }
+    }
+    // 安全：本测试结束映射，不再持有或读取映射内容。
+    unsafe { readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
+    drop(heap);
+}
