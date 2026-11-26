@@ -7,12 +7,36 @@ pub enum Representation {
     NativeGpu,
 }
 
+/// Monotonic evidence about bytes that escape the native representation.
+/// A missing observation never proves an address is private.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ByteExposure {
+    TitleAllocation = 1,
+    SharedHeap = 2,
+    ExternalAddress = 4,
+    MappedPointer = 8,
+    GuestGpuAddress = 16,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Observation {
-    /// The title can observe the bytes or that possibility is unproven.
-    PreserveCompatibleBytes,
+    /// No positive proof either way; retain byte-compatible access.
+    Unproven,
+    /// Title bytes are observable; bits record the known exposure routes.
+    GuestBytes(u8),
     /// Established by a resource contract, never by format alone.
     GpuOnly,
+}
+
+impl Observation {
+    pub fn from_exposures(bits: u8) -> Self {
+        if bits == 0 { Self::Unproven } else { Self::GuestBytes(bits) }
+    }
+
+    pub fn requires_compatible_bytes(self) -> bool {
+        !matches!(self, Self::GpuOnly)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

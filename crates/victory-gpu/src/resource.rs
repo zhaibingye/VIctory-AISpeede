@@ -838,6 +838,7 @@ pub(crate) struct HostTexture {
     /// A host copy or resolve wrote it: its contents are the host's, not
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
+    byte_exposure: std::sync::atomic::AtomicU8,
     pub(crate) native_authority: std::sync::Mutex<Option<victory_memory::authority::CompletedVersion>>,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
@@ -852,6 +853,16 @@ pub(crate) struct HostTexture {
 
 #[cfg(windows)]
 impl HostTexture {
+    fn expose_bytes(&self, route: victory_memory::authority::ByteExposure) {
+        self.byte_exposure.fetch_or(route as u8, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub(crate) fn byte_observation(&self) -> victory_memory::authority::Observation {
+        victory_memory::authority::Observation::from_exposures(
+            self.byte_exposure.load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
     /// A host texture made outside the title's resources (twins).
     pub(crate) fn new(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -885,6 +896,7 @@ impl HostTexture {
             state: state.into(),
             castable,
             host_written: false.into(),
+            byte_exposure: 0.into(),
             native_authority: std::sync::Mutex::new(None),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
@@ -1533,7 +1545,15 @@ fn hand_out_resource(
     });
     #[cfg(windows)]
     {
+        use victory_memory::authority::ByteExposure;
         resource.host = shared_texture(resource.data() as u64, &desc, state, clear, sparse_prefix);
+        if let Some(texture) = &resource.host {
+            texture.expose_bytes(match resource.backing {
+                Backing::Committed(_) => ByteExposure::TitleAllocation,
+                Backing::Placed { .. } => ByteExposure::SharedHeap,
+                Backing::Address(_) => ByteExposure::ExternalAddress,
+            });
+        }
     }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -2112,8 +2132,14 @@ extern "system" fn resource_release(this: This) -> u32 {
 /// `out` only asks for residency.
 extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
     if !out.is_null() {
+        let resource = resource(this);
+        #[cfg(windows)]
+        if let Some(texture) = &resource.host {
+            // Map hands out a pointer; Unmap does not prove it was forgotten.
+            texture.expose_bytes(victory_memory::authority::ByteExposure::MappedPointer);
+        }
         // SAFETY: checked non-null; the title passes room for a pointer.
-        unsafe { out.write(resource(this).data()) };
+        unsafe { out.write(resource.data()) };
     }
     S_OK
 }
@@ -2161,6 +2187,11 @@ pub(crate) extern "system" fn custom_heap_properties(
 
 extern "system" fn gpu_address(this: This) -> u64 {
     let r = resource(this);
+    #[cfg(windows)]
+    if let Some(texture) = &r.host {
+        // The console address here is the actual title VA, not an opaque token.
+        texture.expose_bytes(victory_memory::authority::ByteExposure::GuestGpuAddress);
+    }
     let at = r.data() as u64;
     // The console's GPU addresses fit in 40 bits; its ray-tracing builder
     // refuses others (diagnostics: which memory breaks that).

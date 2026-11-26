@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
-use victory_memory::{authority::{Observation, Representation, Version}, coherence::Fence};
+use victory_memory::{authority::{Representation, Version}, coherence::Fence};
 
 use crate::host::{HostList, legal_state, transition};
 use crate::page_slabs::BatchError;
@@ -33,7 +33,7 @@ impl ResourcePlan {
 
     pub(crate) fn record_write(&mut self, copy: &Arc<HostTexture>) -> Result<(), BatchError> {
         let version = Version::successor(
-            self.version(copy), Representation::NativeGpu, Observation::PreserveCompatibleBytes,
+            self.version(copy), Representation::NativeGpu, copy.byte_observation(),
         ).ok_or_else(|| BatchError::Native(windows::Win32::Foundation::E_FAIL.into()))?;
         self.pending.insert(Self::key(copy), (copy.clone(), version));
         Ok(())
@@ -75,7 +75,9 @@ impl ResourcePlan {
         for (copy, state) in self.state.into_values() {
             copy.state.store(state.0 as u32, Ordering::Release);
         }
-        for (copy, version) in self.pending.into_values() {
+        for (copy, mut version) in self.pending.into_values() {
+            // An alias or pointer can escape after recording the write.
+            version.observation = copy.byte_observation();
             *copy.native_authority.lock().unwrap_or_else(|e| e.into_inner()) =
                 version.complete(submitted, observed);
             // Existing consumers still use the native-content flag.
