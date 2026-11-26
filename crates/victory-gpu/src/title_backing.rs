@@ -158,7 +158,17 @@ impl SubmissionBacking {
         if before == gpu && overwrites.is_empty() {
             return true;
         }
+        // Explicit copies, clears and markers commonly account for every
+        // changed byte. Publish their spans without reading or rewriting
+        // neighboring CPU bytes, even if they changed during retirement.
+        let exact_only = !overwrites.is_empty() && changes_contained(before, gpu, overwrites);
         self.write_delta(va, PAGE, |target| {
+            if exact_only {
+                let _writing = target.original_va.then(|| crate::watch::writing(va, PAGE));
+                return overwrites.iter().all(|span| crate::host::write_mapped_exact(
+                    (target.address + span.start) as *mut u8, &gpu[span.clone()],
+                ));
+            }
             if !crate::host::read_into(target.address as *const u8, scratch) {
                 return false;
             }
@@ -215,6 +225,17 @@ impl SubmissionBacking {
     }
 }
 
+/// The planner keeps these intervals sorted, nonempty and disjoint.
+fn changes_contained(before: &[u8], gpu: &[u8], overwrites: &[std::ops::Range<usize>]) -> bool {
+    let mut cursor = 0;
+    for span in overwrites {
+        debug_assert!(span.start >= cursor && span.start < span.end && span.end <= before.len());
+        if before[cursor..span.start] != gpu[cursor..span.start] { return false; }
+        cursor = span.end;
+    }
+    before[cursor..] == gpu[cursor..]
+}
+
 fn merge_page_delta(cpu: &mut [u8], before: &[u8], gpu: &[u8]) -> bool {
     let mut changed = 0u8;
     for ((current, &original), &result) in cpu.iter_mut().zip(before).zip(gpu) {
@@ -224,6 +245,16 @@ fn merge_page_delta(cpu: &mut [u8], before: &[u8], gpu: &[u8]) -> bool {
         changed |= delta;
     }
     changed != 0
+}
+
+#[cfg(test)]
+#[test]
+fn exact_overwrites_require_all_other_bytes_to_match() {
+    let before = [1, 2, 3, 4, 5, 6];
+    let gpu = [1, 9, 3, 4, 8, 6];
+    assert!(changes_contained(&before, &gpu, &[1..2, 4..5]));
+    assert!(!changes_contained(&before, &gpu, &[1..2]));
+    assert!(!changes_contained(&before, &gpu, &[4..5]));
 }
 
 #[cfg(test)]
