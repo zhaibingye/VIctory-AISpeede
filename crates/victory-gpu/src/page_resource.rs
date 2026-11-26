@@ -34,6 +34,30 @@ impl ResourcePlan {
         )
     }
 
+    /// Convert the same logical version on demand. This copies current
+    /// pinned bytes without inventing a new content version.
+    pub(crate) fn require_native(
+        &mut self, host: &crate::host::Host, list: &HostList,
+        batch: &crate::page_slabs::PinnedBatch, copy: &Arc<HostTexture>,
+    ) -> Result<(), BatchError> {
+        if self.authoritative(copy) {
+            return Ok(());
+        }
+        #[cfg(feature = "paged-title")]
+        if let Some(mut version) = self.version(copy)
+            && version.representation == Representation::CompatibleBytes
+        {
+            let source = copy.compatible_texture_source().ok_or(BatchError::UnsupportedTextureMap)?;
+            self.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
+            source.copy_to(host, list, batch, &copy.texture, (0, 0))?;
+            version.representation = Representation::NativeGpu;
+            self.pending.insert(Self::key(copy), (copy.clone(), version));
+            return Ok(());
+        }
+        let _ = (host, list, batch);
+        Err(BatchError::TargetNotInitialized)
+    }
+
     pub(crate) fn record_write(&mut self, copy: &Arc<HostTexture>) -> Result<(), BatchError> {
         let version = Version::successor(
             self.version(copy), Representation::NativeGpu, copy.byte_observation(),
@@ -87,6 +111,19 @@ impl ResourcePlan {
             copy.host_written.store(true, Ordering::Release);
         }
     }
+}
+
+/// Include possible compatible ranges before page admission. An earlier
+/// full overwrite may supply native authority before this operation.
+pub(crate) fn collect_compatible_source(
+    copy: &Arc<HostTexture>, ranges: &mut Vec<(u64, u64)>,
+) -> Result<(), BatchError> {
+    #[cfg(feature = "paged-title")]
+    if let Some(source) = copy.compatible_texture_source() {
+        ranges.extend(source.rows()?);
+    }
+    let _ = (copy, ranges);
+    Ok(())
 }
 
 pub(crate) enum PageBarrier {
@@ -297,10 +334,16 @@ impl TextureCopy {
         Some(Self { src, dst, area })
     }
 
-    pub(crate) fn encode(&self, list: &HostList, plan: &mut ResourcePlan) -> Result<(), BatchError> {
-        if !plan.authoritative(&self.src)
-            || self.area.as_ref().is_some_and(|area| !area.fills_destination && !plan.authoritative(&self.dst))
-        {
+    pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
+        collect_compatible_source(&self.src, ranges)
+    }
+
+    pub(crate) fn encode(
+        &self, host: &crate::host::Host, list: &HostList,
+        batch: &crate::page_slabs::PinnedBatch, plan: &mut ResourcePlan,
+    ) -> Result<(), BatchError> {
+        plan.require_native(host, list, batch, &self.src)?;
+        if self.area.as_ref().is_some_and(|area| !area.fills_destination && !plan.authoritative(&self.dst)) {
             return Err(BatchError::TargetNotInitialized);
         }
         plan.transition_texture(list, &self.src, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)?;

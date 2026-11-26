@@ -103,7 +103,11 @@ impl ClosedTitleBatch {
     #[cfg(feature = "paged-title")]
     pub(crate) fn may_fold(&self, next: &Self) -> bool {
         let native_only = |batch: &Self| batch.0.iter().all(|op| match op {
-            PageOp::CopyTexture(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => true,
+            PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => true,
+            PageOp::CopyTexture(copy) => {
+                let mut ranges = Vec::new();
+                copy.ranges(&mut ranges).is_ok() && ranges.is_empty()
+            }
             PageOp::Draw(draw) => {
                 let mut ranges = Vec::new();
                 draw.ranges(&mut ranges).is_ok() && ranges.is_empty()
@@ -380,7 +384,8 @@ impl Host {
                 PageOp::Draw(draw) => draw.ranges(&mut ranges)?,
                 PageOp::ClearRaw(clear) => ranges.push(clear.range()?),
                 PageOp::Dispatch(dispatch) => dispatch.ranges(&mut ranges)?,
-                PageOp::CopyTexture(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
+                PageOp::CopyTexture(copy) => copy.ranges(&mut ranges)?,
+                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
             }
         }
         #[cfg(feature = "paged-title")]
@@ -439,7 +444,7 @@ impl Host {
                         record_copy(list, batch, scratch.as_ref().expect("copy reserved scratch"), &pieces, &mut dirty)
                             .map_err(BatchError::Native)?;
                     }
-                    PageOp::CopyTexture(copy) => copy.encode(list, targets)?,
+                    PageOp::CopyTexture(copy) => copy.encode(self, list, batch, targets)?,
                     PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty)?,
                     PageOp::UploadTexture(upload) => upload.encode(self, list, batch, targets)?,
                     PageOp::Input(input) => input.encode(self, list, batch)?,

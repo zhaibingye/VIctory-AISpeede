@@ -875,6 +875,20 @@ impl HostTexture {
     }
 
     #[cfg(feature = "paged-title")]
+    pub(crate) fn compatible_texture_source(&self) -> Option<crate::page_texture::LinearTexture> {
+        use victory_memory::authority::{ByteExposure::*, Representation};
+        let flags = self.byte_exposure.load(std::sync::atomic::Ordering::Acquire);
+        if flags & ((SharedHeap as u8) | (ExternalAddress as u8)) != 0 {
+            return None;
+        }
+        let value = self.native_authority.lock().unwrap_or_else(|e| e.into_inner());
+        if value.as_ref()?.version.representation != Representation::CompatibleBytes {
+            return None;
+        }
+        self.committed_linear.get().copied()
+    }
+
+    #[cfg(feature = "paged-title")]
     pub(crate) fn visible_linear_writeback(&self) -> Result<Option<crate::page_texture::LinearTexture>, crate::page_slabs::BatchError> {
         use victory_memory::authority::ByteExposure::*;
         let flags = self.byte_exposure.load(std::sync::atomic::Ordering::Acquire);

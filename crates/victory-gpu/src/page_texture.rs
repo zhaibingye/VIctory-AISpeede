@@ -40,10 +40,10 @@ impl TextureInput {
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
-        if let Self::Linear(input) = self {
-            ranges.extend(input.rows()?);
+        match self {
+            Self::Linear(input) => { ranges.extend(input.rows()?); Ok(()) }
+            Self::Native { copy, .. } => crate::page_resource::collect_compatible_source(copy, ranges),
         }
-        Ok(())
     }
 
     pub(crate) fn aliases_target(&self, target: &crate::resource::HostTexture) -> bool {
@@ -57,9 +57,7 @@ impl TextureInput {
         match self {
             Self::Linear(input) => Ok((input.encode(host, list, batch)?, input.format)),
             Self::Native { copy, format } => {
-                if !plan.authoritative(copy) {
-                    return Err(BatchError::TargetNotInitialized);
-                }
+                plan.require_native(host, list, batch, copy)?;
                 let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 plan.transition_texture(list, copy, state.0 as u32)?;
                 list.keep(&copy.texture);
