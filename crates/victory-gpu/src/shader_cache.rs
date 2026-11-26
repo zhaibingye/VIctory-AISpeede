@@ -6,7 +6,9 @@
 //! start of that key: older translators' folders can be deleted whole.
 //! Entries go through `victory-pipeline`'s content-addressed cache, which
 //! writes them atomically; an entry that does not read back is translated
-//! again. A container that does not translate is kept too, with the reason,
+//! again. The stored payload is checked against the exact cache input and
+//! its own checksum before it is decoded. A container that does not
+//! translate is kept too, with the reason,
 //! so it is not tried again on every run.
 //!
 //! `victory translate --cache` fills the same cache ahead of a run, through
@@ -108,6 +110,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
 /// translation where a virus scanner looks at it: 0.5-3 ms here).
 struct Translate<F> {
     translate: F,
+    identity: blake3::Hash,
     ran: AtomicBool,
     made: Mutex<Option<Result<HostShader, String>>>,
 }
@@ -123,7 +126,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
         let made = (self.translate)(&input[32..]);
-        let bytes = encode(&made);
+        let bytes = seal(&self.identity, &encode(&made));
         *self.made.lock().unwrap_or_else(|e| e.into_inner()) = Some(made);
         Ok(bytes)
     }
@@ -138,6 +141,7 @@ fn cached(
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
+        identity: blake3::hash(&input),
         ran: AtomicBool::new(false),
         made: Mutex::new(None),
     };
@@ -161,7 +165,9 @@ fn cached(
             tracing::debug!(path = %path.display(), "shader translated and cached");
             return (shader, false);
         }
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        if let Some(shader) = std::fs::read(&path).ok()
+            .and_then(|b| verified_payload(&converter.identity, &b).and_then(decode))
+        {
             let hit = !converter.ran.load(Ordering::Relaxed);
             let (counter, what) = if hit {
                 (&HITS, "from the cache")
@@ -181,6 +187,24 @@ fn cached(
         made().unwrap_or_else(|| (converter.translate)(container)),
         false,
     )
+}
+
+/// Bind serialized translations and refusals to the input. This detects
+/// stale, moved or corrupted cache files; it is not an authenticity check.
+fn entry_digest(identity: &blake3::Hash, payload: &[u8]) -> blake3::Hash {
+    let mut hash = blake3::Hasher::new_derive_key("VIctory shader cache artifact v1");
+    hash.update(identity.as_bytes());
+    hash.update(payload);
+    hash.finalize()
+}
+
+fn seal(identity: &blake3::Hash, payload: &[u8]) -> Vec<u8> {
+    [entry_digest(identity, payload).as_bytes().as_slice(), payload].concat()
+}
+
+fn verified_payload<'a>(identity: &blake3::Hash, entry: &'a [u8]) -> Option<&'a [u8]> {
+    let (digest, payload) = entry.split_at_checked(blake3::OUT_LEN)?;
+    (digest == entry_digest(identity, payload).as_bytes()).then_some(payload)
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
@@ -522,6 +546,19 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn entries_are_bound_to_the_input_and_full_payload() {
+        let original = blake3::hash(b"build followed by shader A");
+        let other = blake3::hash(b"build followed by shader B");
+        let payload = encode(&Ok(shader()));
+        let mut entry = seal(&original, &payload);
+        assert_eq!(verified_payload(&original, &entry), Some(payload.as_slice()));
+        assert_eq!(verified_payload(&other, &entry), None);
+        assert_eq!(verified_payload(&original, &entry[..entry.len() - 1]), None);
+        *entry.last_mut().unwrap() ^= 1;
+        assert_eq!(verified_payload(&original, &entry), None);
     }
 
     #[test]
