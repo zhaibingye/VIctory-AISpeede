@@ -393,11 +393,44 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
+/// 仅保留能决定如何修复的阶段，不输出资源地址。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextureSrvReject {
+    ViewKind,
+    ViewShape,
+    ViewRange,
+    AddressRange,
+    NativeAllocation,
+    WriterAlias,
+    SurrogateFormat,
+    ScopedAuthority,
+    NativeOrBytes { external_alias: bool, host_format: i32 },
+}
+
+/// 地址式 SRV 的布局签名。没有地址、指针、资源内容或用户路径。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlacedSrvShape {
+    dimension: u32,
+    width: u64,
+    height: u32,
+    slices: u16,
+    mips: u16,
+    layout: u32,
+    flags: u32,
+    mapping: u32,
+    first_view_mip: u32,
+    view_mips: u32,
+}
+
 impl View {
     /// A canonical 2D view with exact native color or depth format.
     /// A multi-mip view requires native authority for every named mip.
     #[cfg(windows)]
-    pub(crate) fn paged_texture_srv(&self, array: bool) -> Option<crate::page_texture::TextureInput> {
+    pub(crate) fn paged_texture_srv(&self, array: bool)
+        -> Result<crate::page_texture::TextureInput, TextureSrvReject> {
+        use TextureSrvReject::*;
         use crate::page_texture::{MipSelection, TextureInput, TextureSelection};
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         let (resource, desc) = match *self {
@@ -407,35 +440,35 @@ impl View {
                 let (resource, words) = host::paged_placed_texture(self, array)?;
                 (resource, Some(words))
             }
-            _ => return None,
+            _ => return Err(ViewKind),
         };
-        let copy = crate::resource::host_copy(resource)?;
+        let copy = crate::resource::host_copy(resource).ok_or(NativeAllocation)?;
         // SAFETY: the retained native texture is live.
         let actual = unsafe { copy.texture.GetDesc() };
         let (format, mut selection) = if let Some(words) = desc {
-            host::paged_2d_srv(&words)?
+            host::paged_2d_srv(&words).ok_or(ViewShape)?
         } else {
             let slices = (actual.DepthOrArraySize > 1).then_some(MipSelection {
                 first: 0, count: u32::from(actual.DepthOrArraySize),
             });
-            (DXGI_FORMAT(crate::resource::title_format(resource)? as i32), TextureSelection {
+            (DXGI_FORMAT(crate::resource::title_format(resource).ok_or(ViewKind)? as i32), TextureSelection {
                 mips: MipSelection { first: 0, count: u32::MAX }, slices,
             })
         };
-        if array != selection.slices.is_some() { return None; }
+        if array != selection.slices.is_some() { return Err(ViewShape); }
         selection.mips = MipSelection::resolve(
             selection.mips.first, selection.mips.count, u32::from(actual.MipLevels),
-        )?;
+        ).ok_or(ViewRange)?;
         if desc.is_some() && !array && selection.mips.first == 0 && selection.mips.count == 1
             && let Some(depth) = TextureInput::native_depth(copy.clone(), format)
         {
-            return Some(depth);
+            return Ok(depth);
         }
         if crate::resource::stands_in(resource) {
-            return None;
+            return Err(SurrogateFormat);
         }
         if actual.MipLevels > 1 || array {
-            return TextureInput::scoped_color(copy, format, selection);
+            return TextureInput::scoped_color(copy, format, selection).ok_or(ScopedAuthority);
         }
         let plain_linear = crate::resource::paged_linear_texture(resource).filter(|input| input.format == format);
         #[cfg(feature = "paged-title")]
@@ -444,9 +477,10 @@ impl View {
         let compatible = None;
         // Pick between the canonical native image and the original linear
         // bytes at execution, after earlier resolves/uploads are ordered.
+        let external_alias = copy.uses_unproven_alias_backing();
         TextureInput::native(copy.clone(), format, compatible.or(plain_linear)).or_else(|| {
             plain_linear.map(|input| TextureInput::Linear { copy, input })
-        })
+        }).ok_or(NativeOrBytes { external_alias, host_format: actual.Format.0 })
     }
 
     /// 仅游戏显式绑定的带类型空 SRV 才可生成宿主空视图，绝不替代真实纹理。
@@ -473,23 +507,33 @@ impl View {
 
     /// 只记录可用于区分空、放置式、直接资源及其他类型的格式信息，省略地址和内容。
     #[cfg(windows)]
-    pub(crate) fn texture_srv_metadata(&self) -> (&'static str, Option<u32>, Option<u32>, Option<u32>) {
+    pub(crate) fn texture_srv_metadata(&self) -> (&'static str, Option<u32>, Option<u32>, Option<u32>, Option<PlacedSrvShape>) {
         match self {
             Self::Shader(resource, desc) => (
                 if *resource == 0 { "null-srv" } else { "resource-srv" },
                 crate::resource::title_format(*resource as This),
                 desc.as_ref().map(|words| words[0]),
                 desc.as_ref().map(|words| words[1]),
+                None,
             ),
             Self::Placed(false, resource, desc) => (
                 "placed-srv", Some(resource[8]), Some(desc[0]), Some(desc[1]),
+                Some(PlacedSrvShape {
+                    dimension: resource[0],
+                    width: u64::from(resource[4]) | (u64::from(resource[5]) << 32),
+                    height: resource[6],
+                    slices: resource[7] as u16,
+                    mips: (resource[7] >> 16) as u16,
+                    layout: resource[11], flags: resource[12], mapping: desc[2],
+                    first_view_mip: desc[4], view_mips: desc[5],
+                }),
             ),
             Self::Placed(true, resource, desc) => (
-                "placed-uav", Some(resource[8]), Some(desc[0]), Some(desc[1]),
+                "placed-uav", Some(resource[8]), Some(desc[0]), Some(desc[1]), None,
             ),
-            Self::Unordered(_, _, _) => ("uav", None, None, None),
-            Self::Constant(..) | Self::NullConstant => ("cbv", None, None, None),
-            Self::Sampler(_) | Self::ConsoleSampler(_) => ("sampler", None, None, None),
+            Self::Unordered(_, _, _) => ("uav", None, None, None, None),
+            Self::Constant(..) | Self::NullConstant => ("cbv", None, None, None, None),
+            Self::Sampler(_) | Self::ConsoleSampler(_) => ("sampler", None, None, None, None),
         }
     }
 

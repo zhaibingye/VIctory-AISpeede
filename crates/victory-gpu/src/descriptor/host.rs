@@ -1776,23 +1776,24 @@ fn placed_pending(view: &View) -> bool {
 
 /// 将已验证的地址式 SRV 接到 VNME，不重用过时纹理或接纳写者别名。
 #[cfg(feature = "paged-title")]
-pub(super) fn paged_placed_texture(view: &View, array: bool) -> Option<(crate::object::This, [u32; 10])> {
-    let View::Placed(false, resource, desc) = view else { return None; };
-    let words: [u32; 10] = desc[..10].try_into().ok()?;
+pub(super) fn paged_placed_texture(view: &View, array: bool) -> Result<(crate::object::This, [u32; 10]), super::TextureSrvReject> {
+    use super::TextureSrvReject::*;
+    let View::Placed(false, resource, desc) = view else { return Err(ViewKind); };
+    let words: [u32; 10] = desc[..10].try_into().map_err(|_| ViewShape)?;
     // 先验证视图形状、映射和格式，不为必定拒绝的描述符分配宿主纹理。
-    let (_, selection) = paged_2d_srv(&words)?;
+    let (_, selection) = paged_2d_srv(&words).ok_or(ViewShape)?;
     if resource[0] != 3 || selection.slices.is_some() != array {
-        return None;
+        return Err(ViewShape);
     }
     let address = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
     if address == 0 || address >= victory_memory::gpu_table::ADDRESS_LIMIT {
-        return None;
+        return Err(AddressRange);
     }
-    let texture = crate::resource::current_texture_at(address, resource, &srv_desc(&words))?;
+    let texture = crate::resource::current_texture_at(address, resource, &srv_desc(&words)).ok_or(NativeAllocation)?;
     if crate::resource::alias_source(texture).is_some() {
-        return None;
+        return Err(WriterAlias);
     }
-    Some((texture, words))
+    Ok((texture, words))
 }
 
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
