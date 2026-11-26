@@ -279,7 +279,7 @@ fn system_timestamp() -> u64 {
     0
 }
 
-/// Frames presented so far.
+/// 已处理的游戏画面呈现请求数，不代表宿主已成功显示画面。
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "diagnostics")]
@@ -366,7 +366,7 @@ fn present_now(planes: u32, plane_parameters: *const Plane) -> HRESULT {
             drawn,
             dispatches,
             dispatched,
-            "已呈现一帧；计数包括自上次记录以来的全部绘制和调度，以及实际提交到宿主的数量"
+            "已处理游戏的画面呈现请求；计数包括自上次记录以来收到及提交到宿主的绘制与调度"
         );
         #[cfg(windows)]
         if frame >= 256 {
@@ -423,6 +423,8 @@ fn present_now(planes: u32, plane_parameters: *const Plane) -> HRESULT {
             blinks(frame, restore[0].0, restore[0].1, shown);
             #[cfg(not(feature = "diagnostics"))]
             let _ = shown;
+        } else {
+            tracing::debug!(frame, planes, "呈现请求没有可用的宿主纹理");
         }
     }
     #[cfg(not(windows))]

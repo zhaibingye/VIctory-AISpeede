@@ -3488,8 +3488,12 @@ impl Host {
         // SAFETY: our swap chain, list and live source textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
-            let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
-                return None;
+            let back = match p.swap_chain.GetBuffer::<ID3D12Resource>(index) {
+                Ok(back) => back,
+                Err(error) => {
+                    tracing::warn!(frame, index, %error, "无法取得交换链后台缓冲区");
+                    return None;
+                }
             };
             p.copy.reset();
             let list = p.copy.recording();
@@ -3660,7 +3664,25 @@ impl Host {
                 inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if let Err(error) = status.ok() {
+                tracing::warn!(
+                    frame,
+                    status = format_args!("{:#010x}", status.0 as u32),
+                    %error,
+                    "宿主交换链拒绝呈现"
+                );
+                return None;
+            }
+            // DXGI 的非错误状态（如窗口被遮挡）并不等于显示了一帧。
+            if status != windows::core::HRESULT(0) {
+                tracing::debug!(
+                    frame,
+                    status = format_args!("{:#010x}", status.0 as u32),
+                    "宿主交换链未确认呈现"
+                );
+                return None;
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
