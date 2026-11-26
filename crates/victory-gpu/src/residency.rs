@@ -7,8 +7,9 @@ use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, IUnknown, Interface, Result};
 
+#[cfg(not(feature = "paged-title"))]
 pub(crate) use victory_memory::budget::LOCAL_LIMIT;
-const LOCAL_RESERVE: u64 = 384 << 20;
+pub(crate) const LOCAL_RESERVE: u64 = 384 << 20;
 
 // Attached to the actual D3D resource/heap, including when the title drops
 // its object before the last descriptor or command-list reference disappears.

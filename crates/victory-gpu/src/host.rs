@@ -257,7 +257,7 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "未能检查融合乘加支持"),
         }
-        Ok(Host {
+        let host = Host {
             device,
             queue,
             fence,
@@ -277,7 +277,10 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             memory_adapter: OnceLock::new(),
             presenter: Mutex::new(Presentation::default()),
-        })
+        };
+        #[cfg(feature = "paged-title")]
+        host.sample_memory_pressure();
+        Ok(host)
     }
 }
 
@@ -1239,9 +1242,13 @@ impl Host {
         self.submitted.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    pub(crate) fn sample_memory_pressure(&self) {
+        crate::working_set::sample(self.memory_adapter());
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
-        crate::working_set::sample(self.memory_adapter());
+        self.sample_memory_pressure();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.direct_queue();

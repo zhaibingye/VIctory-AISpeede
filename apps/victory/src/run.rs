@@ -73,10 +73,12 @@ pub fn run(
 
     if execute {
         check_cpu_features()?;
+    }
+    // 游戏重启时，等待上一次进程退出后再采样 RAM。
+    victory_hle::modules::lifecycle::wait_for_previous();
+    if execute {
         victory_hle::begin_memory_observation();
     }
-    // A title that relaunched itself: the old process must be gone first.
-    victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     // Before the import registry is first used: it holds the module only
     // when the host's FidelityFX serves.
