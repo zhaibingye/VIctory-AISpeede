@@ -485,11 +485,17 @@ impl Host {
         if source.reusable_byte_mirror(&ranges) {
             return Ok(());
         }
-        let readback = std::sync::Arc::new(crate::page_resource::TextureReadback::capture(source, target)
-            .ok_or(BatchError::UnsupportedTextureMap)?);
+        let readback = crate::page_resource::TextureReadback::capture(source, target)
+            .ok_or(BatchError::UnsupportedTextureMap)?;
         let mut backing = SubmissionBacking::default();
-        self.execute_paged_ops_locked(signal, heap, &mut backing, &[PageOp::ReadbackTexture(readback.clone())])?;
-        readback.publish_mirror(&ranges, &backing);
+        let mut publication = None;
+        self.execute_paged_work_locked(signal, heap, &mut backing, &ranges, WriteSet::Declared, |list, _, batch, pins, _, plan| {
+            publication = Some(readback.prepare_mirror(&ranges, pins)?);
+            let mut dirty = BTreeSet::new();
+            readback.encode(self, list, batch, plan, &mut dirty)?;
+            Ok(dirty)
+        })?;
+        readback.publish_mirror(publication.expect("readback reserved its publication"));
         Ok(())
     }
 
@@ -546,6 +552,8 @@ impl Host {
             #[cfg(feature = "paged-title")]
             visible,
         } = footprint;
+        #[cfg(feature = "paged-title")]
+        let mut publications = Vec::with_capacity(visible.len());
         let stats = self.execute_paged_work_locked(signal, heap, backing, &ranges, WriteSet::Declared, |list, _, batch, pins, descriptors, targets| {
             #[cfg(feature = "paged-title")]
             if !visible.is_empty() || !preserved.is_empty() {
@@ -574,14 +582,15 @@ impl Host {
             }
             let mut dirty = self.encode_closed_ops(list, batch, pins, descriptors, targets, ops, max_copy)?;
             #[cfg(feature = "paged-title")]
-            for (_, readback, _) in &visible {
+            for (_, readback, span) in &visible {
+                publications.push(readback.prepare_mirror(&ranges[span.clone()], pins)?);
                 readback.encode(self, list, batch, targets, &mut dirty)?;
             }
             Ok(dirty)
         })?;
         #[cfg(feature = "paged-title")]
-        for (_, readback, span) in visible {
-            readback.publish_mirror(&ranges[span], backing);
+        for ((_, readback, _), publication) in visible.into_iter().zip(publications) {
+            readback.publish_mirror(publication);
         }
         Ok(stats)
     }

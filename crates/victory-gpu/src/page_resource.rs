@@ -264,8 +264,15 @@ impl TextureReadback {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn publish_mirror(&self, ranges: &[(u64, u64)], backing: &crate::title_backing::SubmissionBacking) {
-        self.source.publish_byte_mirror(ranges, backing.pins());
+    pub(crate) fn prepare_mirror(
+        &self, ranges: &[(u64, u64)], pins: &victory_memory::physical::BackingPins,
+    ) -> Result<crate::resource::PreparedByteMirror, BatchError> {
+        self.source.prepare_byte_mirror(ranges, pins)
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn publish_mirror(&self, prepared: crate::resource::PreparedByteMirror) {
+        self.source.publish_byte_mirror(prepared);
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {

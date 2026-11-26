@@ -817,14 +817,19 @@ struct Resource {
     host: Option<std::sync::Arc<HostTexture>>,
 }
 
-/// Recorded only after compatible bytes were merged into these identities.
+/// Charged certificate storage. A generation is recorded only after
+/// compatible bytes were merged into these exact physical identities.
 #[cfg(all(windows, feature = "paged-title"))]
 struct ByteMirror {
-    version: u64,
+    version: Option<u64>,
     ranges: Box<[(u64, u64)]>,
     pages: Box<[(usize, victory_memory::physical::PhysicalPage)]>,
     _charge: victory_memory::physical::Reservation,
 }
+
+/// None means the existing charged certificate matches these pins.
+#[cfg(all(windows, feature = "paged-title"))]
+pub(crate) struct PreparedByteMirror(Option<ByteMirror>);
 
 #[cfg(all(windows, feature = "paged-title"))]
 #[derive(Default)]
@@ -944,6 +949,17 @@ impl HostTexture {
         host.materialize_texture_bytes_locked(ordered, heap, self.clone(), layout)
     }
 
+    #[cfg(feature = "paged-title")]
+    fn prepare_pointer_bytes_locked(
+        self: &std::sync::Arc<Self>, host: &crate::host::Host, ordered: &mut u64,
+        mapped: &MapEpoch, layout: Option<crate::page_texture::LinearTexture>,
+    ) -> Result<(), crate::page_slabs::BatchError> {
+        if self.completed_native_version().is_none() && let Some(layout) = layout {
+            return self.reserve_pointer_mirror(layout);
+        }
+        self.ensure_cpu_bytes_locked(host, ordered, mapped, layout)
+    }
+
     /// A guest GPU address is also observable as a CPU pointer.
     #[cfg(feature = "paged-title")]
     fn publish_guest_address(self: &std::sync::Arc<Self>) -> bool {
@@ -952,7 +968,7 @@ impl HostTexture {
         let mapped = self.mapped_pointers.lock().unwrap_or_else(|e| e.into_inner());
         let mut ordered = host.direct_queue();
         if self.byte_exposure.load(std::sync::atomic::Ordering::Acquire) & GuestGpuAddress as u8 == 0 {
-            if let Err(error) = self.ensure_cpu_bytes_locked(host, &mut ordered, &mapped, self.exact_committed_bytes()) {
+            if let Err(error) = self.prepare_pointer_bytes_locked(host, &mut ordered, &mapped, self.exact_committed_bytes()) {
                 tracing::warn!(?error, "VNME could not materialize a title texture address");
                 return false;
             }
@@ -970,35 +986,75 @@ impl HostTexture {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn publish_byte_mirror(
+    pub(crate) fn prepare_byte_mirror(
         &self, ranges: &[(u64, u64)], pins: &victory_memory::physical::BackingPins,
-    ) {
-        let Some(version) = self.completed_native_version() else { return; };
+    ) -> Result<PreparedByteMirror, crate::page_slabs::BatchError> {
+        use crate::page_slabs::BatchError;
+        {
+            let saved = self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner());
+            if saved.as_ref().is_some_and(|m| m.ranges.as_ref() == ranges && !m.pages.is_empty()
+                && m.pages.iter().all(|&(va, id)| pins.expected(va) == Some(id)))
+            {
+                return Ok(PreparedByteMirror(None));
+            }
+        }
         let mut pages = std::collections::BTreeMap::new();
         for &(start, end) in ranges {
             let mut page = start & !(victory_memory::PAGE_BYTES - 1);
             while page < end {
                 let at = page as usize;
-                let Some(physical) = pins.expected(at) else { return; };
+                let physical = pins.expected(at).ok_or(BatchError::NotCaptured(page))?;
                 pages.insert(at, physical);
                 page += victory_memory::PAGE_BYTES;
             }
         }
-        let mut saved = self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner());
-        *saved = None;
+        if pages.is_empty() {
+            return Err(BatchError::UnsupportedTextureMap);
+        }
         let bytes = std::mem::size_of_val(ranges) as u64
             + pages.len() as u64 * std::mem::size_of::<(usize, victory_memory::physical::PhysicalPage)>() as u64;
-        let Ok(charge) = victory_memory::physical::HostBudget::process().reserve_ram(bytes) else { return; };
-        *saved = Some(ByteMirror {
-            version, ranges: ranges.into(), pages: pages.into_iter().collect(), _charge: charge,
+        let charge = victory_memory::physical::HostBudget::process().reserve_ram(bytes)
+            .map_err(|_| BatchError::Native(windows::Win32::Foundation::E_OUTOFMEMORY.into()))?;
+        Ok(PreparedByteMirror(Some(ByteMirror {
+            version: None, ranges: ranges.into(), pages: pages.into_iter().collect(), _charge: charge,
+        })))
+    }
+
+    /// Reserve before the first pointer to compatible backing escapes,
+    /// even when the first native GPU write has not happened yet.
+    #[cfg(feature = "paged-title")]
+    fn reserve_pointer_mirror(
+        &self, target: crate::page_texture::LinearTexture,
+    ) -> Result<(), crate::page_slabs::BatchError> {
+        let ranges: Vec<_> = target.rows()?.collect();
+        let mut probe = crate::title_backing::SubmissionBacking::default();
+        for &(start, end) in &ranges {
+            probe.include(start as usize, end as usize);
+        }
+        probe.flush();
+        if let PreparedByteMirror(Some(mirror)) = self.prepare_byte_mirror(&ranges, probe.pins())? {
+            *self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner()) = Some(mirror);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn publish_byte_mirror(&self, prepared: PreparedByteMirror) {
+        let version = self.completed_native_version().unwrap_or_else(|| {
+            crate::host::fail(format_args!("texture bytes published without completed native authority"))
         });
+        let mut saved = self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mirror) = prepared.0 {
+            *saved = Some(mirror);
+        }
+        saved.as_mut().expect("reserved byte mirror").version = Some(version);
     }
 
     #[cfg(feature = "paged-title")]
     pub(crate) fn reusable_byte_mirror(&self, ranges: &[(u64, u64)]) -> bool {
         let Some(version) = self.completed_native_version() else { return false; };
         let mirror = self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(mirror) = mirror.as_ref().filter(|m| m.version == version && m.ranges.as_ref() == ranges && !m.pages.is_empty())
+        let Some(mirror) = mirror.as_ref().filter(|m| m.version == Some(version) && m.ranges.as_ref() == ranges && !m.pages.is_empty())
             else { return false; };
         // Query physical identity without allocating GPU residency or
         // reading/uploading contents from guest pages.
@@ -1019,7 +1075,14 @@ impl HostTexture {
             self.byte_observation()).unwrap_or_else(|| crate::host::fail(format_args!("VNME version exhausted")));
         *completed = Some(CompletedVersion { version, fence: old.map_or(Fence(0), |v| v.fence) });
         self.host_written.store(false, std::sync::atomic::Ordering::Release);
-        self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner()).take();
+        use victory_memory::authority::ByteExposure::{GuestGpuAddress, MappedPointer};
+        let mut mirror = self.byte_mirror.lock().unwrap_or_else(|e| e.into_inner());
+        let flags = self.byte_exposure.load(std::sync::atomic::Ordering::Acquire);
+        if flags & ((MappedPointer as u8) | (GuestGpuAddress as u8)) == 0 {
+            *mirror = None;
+        } else if let Some(mirror) = mirror.as_mut() {
+            mirror.version = None;
+        }
     }
 
     /// A host texture made outside the title's resources (twins).
@@ -2337,7 +2400,7 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
                 let mut ordered = host.direct_queue();
                 let layout = texture.exact_committed_bytes();
                 let Some(next) = mapped.active.checked_add(1) else { return E_INVALIDARG; };
-                if let Err(error) = texture.ensure_cpu_bytes_locked(host, &mut ordered, &mapped, layout) {
+                if let Err(error) = texture.prepare_pointer_bytes_locked(host, &mut ordered, &mapped, layout) {
                     tracing::warn!(?error, "VNME texture Map could not materialize bytes");
                     return crate::object::E_NOTIMPL;
                 }
