@@ -359,12 +359,11 @@ fn run(
     let rendered = host
         .run_native_group(signal, &[Some(command)])
         .unwrap_or_else(|e| fail(format_args!("native paged render submission: {e}")));
-    if host.completed_fence().is_none() {
-        fail(format_args!("native paged device was removed"));
-    }
+    let observed = host.completed_fence()
+        .unwrap_or_else(|| fail(format_args!("native paged device was removed")));
 
-    // Publish authority only after the native queue really executed it.
-    targets.commit();
+    // VNME publishes the version only after observing its real fence.
+    targets.commit(rendered, observed);
 
     // SAFETY: the rendering fence completed; this bitmap is fully
     // initialized and no other submission uses it.

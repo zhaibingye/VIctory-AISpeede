@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use victory_memory::{authority::{Observation, Representation, Version}, coherence::Fence};
 
 use crate::host::{HostList, legal_state, transition};
 use crate::page_slabs::BatchError;
@@ -11,7 +12,7 @@ use crate::resource::HostTexture;
 
 #[derive(Default)]
 pub(crate) struct ResourcePlan {
-    initialized: BTreeMap<usize, Arc<HostTexture>>,
+    pending: BTreeMap<usize, (Arc<HostTexture>, Version)>,
     state: BTreeMap<usize, (Arc<HostTexture>, D3D12_RESOURCE_STATES)>,
 }
 
@@ -20,12 +21,22 @@ impl ResourcePlan {
         Arc::as_ptr(copy) as usize
     }
 
-    pub(crate) fn authoritative(&self, copy: &Arc<HostTexture>) -> bool {
-        copy.host_written.load(Ordering::Acquire) || self.initialized.contains_key(&Self::key(copy))
+    fn version(&self, copy: &Arc<HostTexture>) -> Option<Version> {
+        self.pending.get(&Self::key(copy)).map(|(_, version)| *version)
+            .or_else(|| copy.native_authority.lock().unwrap_or_else(|e| e.into_inner())
+                .as_ref().map(|complete| complete.version))
     }
 
-    pub(crate) fn initialize(&mut self, copy: &Arc<HostTexture>) {
-        self.initialized.insert(Self::key(copy), copy.clone());
+    pub(crate) fn authoritative(&self, copy: &Arc<HostTexture>) -> bool {
+        self.version(copy).is_some() || copy.host_written.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_write(&mut self, copy: &Arc<HostTexture>) -> Result<(), BatchError> {
+        let version = Version::successor(
+            self.version(copy), Representation::NativeGpu, Observation::PreserveCompatibleBytes,
+        ).ok_or_else(|| BatchError::Native(windows::Win32::Foundation::E_FAIL.into()))?;
+        self.pending.insert(Self::key(copy), (copy.clone(), version));
+        Ok(())
     }
 
     pub(crate) fn state(&self, copy: &Arc<HostTexture>) -> D3D12_RESOURCE_STATES {
@@ -59,11 +70,15 @@ impl ResourcePlan {
         Ok(())
     }
 
-    pub(crate) fn commit(self) {
+    pub(crate) fn commit(self, submitted: Fence, observed: Fence) {
+        assert!(observed.0 >= submitted.0, "resource authority requires a completed fence");
         for (copy, state) in self.state.into_values() {
             copy.state.store(state.0 as u32, Ordering::Release);
         }
-        for copy in self.initialized.into_values() {
+        for (copy, version) in self.pending.into_values() {
+            *copy.native_authority.lock().unwrap_or_else(|e| e.into_inner()) =
+                version.complete(submitted, observed);
+            // Existing consumers still use the native-content flag.
             copy.host_written.store(true, Ordering::Release);
         }
     }
@@ -151,7 +166,7 @@ impl TextureUpload {
         }
         plan.transition_texture(list, &self.target, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
         self.source.copy_to(host, list, batch, &self.target.texture, self.offset)?;
-        plan.initialize(&self.target);
+        plan.record_write(&self.target)?;
         Ok(())
     }
 }
@@ -297,7 +312,7 @@ impl TextureCopy {
                 cmd.CopyResource(&self.dst.texture, &self.src.texture);
             }
         }
-        plan.initialize(&self.dst);
+        plan.record_write(&self.dst)?;
         Ok(())
     }
 }

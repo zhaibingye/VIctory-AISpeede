@@ -1,6 +1,7 @@
 //! Portable policy for the replacement Series S memory engine.
 #![cfg_attr(not(windows), forbid(unsafe_code))]
 
+pub mod authority;
 pub mod budget;
 pub mod coherence;
 pub mod engine;

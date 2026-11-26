@@ -113,7 +113,7 @@ impl ColorClear {
                 cmd.ResourceBarrier(&[transition(texture, after, before)]);
             }
         }
-        initialized.initialize(&self.target.copy);
+        initialized.record_write(&self.target.copy)?;
         Ok(())
     }
 }
@@ -223,7 +223,7 @@ impl DepthClear {
                 self.depth, self.stencil, rects);
         }
         self.target.end(list, before);
-        initialized.initialize(&self.target.copy);
+        initialized.record_write(&self.target.copy)?;
         Ok(())
     }
 }
@@ -398,7 +398,9 @@ impl ClosedDraw {
         }
         if let (Some(depth), Some((_, before))) = (&self.depth, dsv) {
             depth.end(list, before);
+            initialized.record_write(&depth.copy)?;
         }
+        initialized.record_write(&self.target.copy)?;
         Ok(())
     }
 }
