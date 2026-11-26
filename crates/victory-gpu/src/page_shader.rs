@@ -27,9 +27,24 @@ pub(crate) enum UnloweredShader {
     DescriptorHeap,
     RootView,
     DescriptorTable,
+    DescriptorProof { stage: &'static str },
+    DescriptorDeclaration { root: u8, kind: victory_shader::ResourceType, source: RootType },
+    DescriptorSlot { stage: &'static str, root: u8, index: u32, reason: DescriptorSlotReason },
     UnknownUserData,
     MissingConstant { slot: u8, dword: u32 },
     ConstantLayout,
+}
+
+/// 区分绑定、原生视图和访问范围问题，不输出实际地址或资源字节。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DescriptorSlotReason {
+    RootWord,
+    UnboundOrStale,
+    UnsupportedTexture { array: bool, title_format: Option<u32> },
+    UnsupportedBuffer,
+    UnsupportedTextureWrite,
+    UnsupportedAccess,
+    OutsideRangeOrConflictingView,
 }
 
 /// 无法闭合的绘制状态。字段为稳定诊断键，不输出资源地址。
@@ -102,7 +117,9 @@ pub(crate) fn stage_words(
             || !(u.kind == victory_shader::ResourceType::Srv
                 || u.kind == victory_shader::ResourceType::Uav && uavs(u.slot))
         {
-            return Err(UnloweredShader::DescriptorTable);
+            return Err(UnloweredShader::DescriptorDeclaration {
+                root: u.slot, kind: u.kind, source: u.root,
+            });
         }
     }
     pack_words(&shader.user_data, shader.user_data_dwords(), block, values, tables, root_srvs)
@@ -222,7 +239,7 @@ fn closed_draw_rejects_unlowered_shader_accesses() {
     };
     assert_eq!(
         constants_only(&shader, &[used], None, |_, _| None).err(),
-        Some(UnloweredShader::DescriptorTable),
+        Some(UnloweredShader::DescriptorDeclaration { root: 0, kind: used.kind, source: used.root }),
     );
 }
 
@@ -412,7 +429,8 @@ impl ShaderBindings {
                 u.root == RootType::Table || u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_SRV_VIEW
             });
             let slots = if needs_table_or_root {
-                stage.shader.static_view_slots().ok_or(UnloweredShader::DescriptorTable)?
+                stage.shader.static_view_slots()
+                    .ok_or(UnloweredShader::DescriptorProof { stage: stage.shader.stage })?
             } else {
                 &[]
             };
@@ -440,42 +458,52 @@ impl ShaderBindings {
                             .or_insert((start, end));
                         continue;
                     }
-                    let reject = UnloweredShader::DescriptorTable;
+                    let reason = |reason| UnloweredShader::DescriptorSlot {
+                        stage: stage.shader.stage, root: slot.root, index: slot.index, reason,
+                    };
+                    let reject = reason(DescriptorSlotReason::OutsideRangeOrConflictingView);
+                    let buffer = reason(DescriptorSlotReason::UnsupportedBuffer);
                     if !words.tables.iter().any(|&(_, root)| root == slot.root) {
-                        return Err(reject);
+                        return Err(reason(DescriptorSlotReason::RootWord));
                     }
                     let table = tables.entry(slot.root).or_default();
                     if let std::collections::btree_map::Entry::Vacant(e) = table.entry(slot.index) {
-                        let actual = view(slot.root, slot.index).ok_or(UnloweredShader::DescriptorTable)?;
+                        let actual = view(slot.root, slot.index).ok_or(reason(DescriptorSlotReason::UnboundOrStale))?;
                         let bound = match proof.access {
                             StaticViewAccess::TextureRead { array } => ClosedView::Texture(
-                                actual.paged_texture_srv(array).ok_or(UnloweredShader::DescriptorTable)?),
+                                actual.paged_texture_srv(array).ok_or_else(|| reason(DescriptorSlotReason::UnsupportedTexture {
+                                    array,
+                                    title_format: match actual {
+                                        View::Shader(resource, _) => crate::resource::title_format(resource as crate::object::This),
+                                        _ => None,
+                                    },
+                                }))?),
                             StaticViewAccess::TextureWrite { .. } if pipeline.compute => {
-                                ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).ok_or(reject)?)
+                                ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).ok_or(reason(DescriptorSlotReason::UnsupportedTextureWrite))?)
                             }
                             StaticViewAccess::RawSrv { .. } => {
                                 let (start, end) = crate::descriptor::host::paged_raw_srv_range(&actual)
-                                    .ok_or(UnloweredShader::DescriptorTable)?;
+                                    .ok_or(buffer)?;
                                 ClosedView::Raw(BoundedBufferView::new(start, end, false)
-                                    .ok_or(UnloweredShader::DescriptorTable)?)
+                                    .ok_or(buffer)?)
                             }
                             StaticViewAccess::StructuredSrv { stride, .. } => {
                                 let (start, end) = crate::descriptor::host::paged_structured_srv_range(&actual, stride)
-                                    .ok_or(reject)?;
-                                ClosedView::Structured(BoundedBufferView::new(start, end, false).ok_or(reject)?, stride)
+                                    .ok_or(buffer)?;
+                                ClosedView::Structured(BoundedBufferView::new(start, end, false).ok_or(buffer)?, stride)
                             }
                             StaticViewAccess::StructuredUav { stride, .. } if pipeline.compute => {
                                 let (start, end) = crate::descriptor::host::paged_structured_uav_range(&actual, stride)
-                                    .ok_or(reject)?;
-                                ClosedView::Structured(BoundedBufferView::new(start, end, true).ok_or(reject)?, stride)
+                                    .ok_or(buffer)?;
+                                ClosedView::Structured(BoundedBufferView::new(start, end, true).ok_or(buffer)?, stride)
                             }
                             StaticViewAccess::RawUav { .. } if pipeline.compute => {
                                 let (start, end) = crate::descriptor::host::paged_raw_range(&actual)
-                                    .ok_or(UnloweredShader::DescriptorTable)?;
+                                    .ok_or(buffer)?;
                                 ClosedView::Raw(BoundedBufferView::new(start, end, true)
-                                    .ok_or(UnloweredShader::DescriptorTable)?)
+                                    .ok_or(buffer)?)
                             }
-                            _ => return Err(reject),
+                            _ => return Err(reason(DescriptorSlotReason::UnsupportedAccess)),
                         };
                         e.insert(bound);
                     }
@@ -486,7 +514,7 @@ impl ShaderBindings {
                             if !view.allows(x, y) { return Err(reject); }
                         }
                         (Some(ClosedView::Raw(raw)), StaticViewAccess::RawSrv { offset, bytes }) if !raw.unordered() => {
-                            raw.allow_access(offset, bytes, false).ok_or(UnloweredShader::DescriptorTable)?;
+                            raw.allow_access(offset, bytes, false).ok_or(reject)?;
                         }
                         (Some(ClosedView::Structured(view, actual)), StaticViewAccess::StructuredSrv { stride, elements })
                             if *actual == stride && !view.unordered() =>
@@ -499,7 +527,7 @@ impl ShaderBindings {
                             view.allow_access(0, elements.checked_mul(stride).ok_or(reject)?, write).ok_or(reject)?;
                         }
                         (Some(ClosedView::Raw(raw)), StaticViewAccess::RawUav { offset, bytes, write }) if raw.unordered() => {
-                            raw.allow_access(offset, bytes, write).ok_or(UnloweredShader::DescriptorTable)?;
+                            raw.allow_access(offset, bytes, write).ok_or(reject)?;
                         }
                         _ => return Err(reject),
                     }
