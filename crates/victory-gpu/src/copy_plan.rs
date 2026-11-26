@@ -45,9 +45,8 @@ impl GuestCopy {
         ]
     }
 
-    /// The native encoder must gather source bytes before scattering into
-    /// destinations: two disjoint VAs may be aliases of one physical page
-    /// (also two different pages may share the same native slab).
+    /// The encoder checks the bound native slabs before choosing direct
+    /// copy or staging. Disjoint VAs alone do not exclude physical aliases.
     pub(crate) fn bind(self, pins: &BackingPins) -> Result<Vec<CopyPiece>, Unbound> {
         const PAGE: usize = PAGE_BYTES as usize;
         if self.ranges().iter().any(|&(_, end)| end > ADDRESS_LIMIT) {

@@ -822,14 +822,7 @@ impl Host {
         descriptors: &mut PageDescriptors<'_>, targets: &mut crate::page_resource::ResourcePlan,
         ops: &[PageOp], max_copy: u64,
     ) -> std::result::Result<BTreeSet<PhysicalPage>, BatchError> {
-        let scratch = if max_copy > 0 {
-            let buffer = self.default_buffer(max_copy)
-                .ok_or_else(|| BatchError::Native(oom()))?;
-            list.keep(&buffer);
-            Some(buffer)
-        } else {
-            None
-        };
+        let mut scratch = None::<ID3D12Resource>;
         let mut dirty = BTreeSet::new();
         let mut indirect_budget = None;
         #[cfg(feature = "paged-title")]
@@ -842,8 +835,14 @@ impl Host {
                             Unbound::AddressWidth => BatchError::Range(copy.src as u64, copy.dst as u64),
                             Unbound::Source(va) | Unbound::Destination(va) => BatchError::NotCaptured(va as u64),
                         })?;
-                        record_copy(list, batch, scratch.as_ref().expect("copy reserved scratch"), &pieces, &mut dirty)
-                            .map_err(BatchError::Native)?;
+                        record_copy(list, batch, &pieces, &mut dirty, || {
+                            if let Some(buffer) = &scratch {
+                                return Ok(buffer.clone());
+                            }
+                            let buffer = self.default_buffer(max_copy).ok_or_else(oom)?;
+                            scratch = Some(buffer.clone());
+                            Ok(buffer)
+                        }).map_err(BatchError::Native)?;
                         for piece in &pieces {
                             targets.record_guest_overwrite(piece.dst, piece.dst_offset as usize, piece.count as usize);
                         }
@@ -1188,16 +1187,17 @@ impl SubmittedRender<'_> {
     }
 }
 
-/// Gather all source fragments into disjoint scratch before scattering.
-/// A D3D12 buffer cannot be COPY_SOURCE and COPY_DEST simultaneously,
-/// and otherwise an earlier write could corrupt a later alias read.
+/// Copy directly only when no source slab is also a destination slab.
+/// Otherwise gather into separate scratch before scattering: the same
+/// native buffer cannot hold COPY_SOURCE and COPY_DEST simultaneously.
 fn record_copy(
     list: &HostList,
     batch: &PinnedBatch,
-    scratch: &ID3D12Resource,
     pieces: &[crate::copy_plan::CopyPiece],
     dirty: &mut BTreeSet<PhysicalPage>,
+    scratch: impl FnOnce() -> Result<ID3D12Resource>,
 ) -> Result<()> {
+    if pieces.is_empty() { return Ok(()); }
     let mut source = BTreeMap::new();
     let mut dest = BTreeMap::new();
     for piece in pieces {
@@ -1209,10 +1209,32 @@ fn record_copy(
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     let copy_src = D3D12_RESOURCE_STATE_COPY_SOURCE;
     let copy_dst = D3D12_RESOURCE_STATE_COPY_DEST;
+    let cmd = list.recording();
+    if !source.keys().any(|slab| dest.contains_key(slab)) {
+        let begin = source.values().map(|s| transition(s, uav, copy_src))
+            .chain(dest.values().map(|d| transition(d, uav, copy_dst))).collect::<Vec<_>>();
+        let end = source.values().map(|s| transition(s, copy_src, uav))
+            .chain(dest.values().map(|d| transition(d, copy_dst, uav))).collect::<Vec<_>>();
+        // SAFETY: capture bounds every piece, retains its slab, and the
+        // complete source and destination native slab sets are disjoint.
+        unsafe {
+            cmd.ResourceBarrier(&begin);
+            for piece in pieces {
+                let src = batch.pinned(piece.src).expect("validated source");
+                let dst = batch.pinned(piece.dst).expect("validated destination");
+                cmd.CopyBufferRegion(dst.buffer(), dst.offset() + u64::from(piece.dst_offset),
+                    src.buffer(), src.offset() + u64::from(piece.src_offset), u64::from(piece.count));
+                dirty.insert(piece.dst);
+            }
+            cmd.ResourceBarrier(&end);
+        }
+        return Ok(());
+    }
+    let scratch = scratch()?;
+    list.keep(&scratch);
     // SAFETY: native buffers are owned by the same captured batch; all
     // byte spans are bounded by its guest copy plan.
     unsafe {
-        let cmd = list.recording();
         cmd.ResourceBarrier(
             &source
                 .values()
@@ -1223,7 +1245,7 @@ fn record_copy(
         for piece in pieces {
             let s = batch.pinned(piece.src).expect("validated source");
             cmd.CopyBufferRegion(
-                scratch,
+                &scratch,
                 offset,
                 s.buffer(),
                 s.offset() + u64::from(piece.src_offset),
@@ -1239,7 +1261,7 @@ fn record_copy(
         let scatter: Vec<_> = dest
             .values()
             .map(|d| transition(d, uav, copy_dst))
-            .chain([transition(scratch, copy_dst, copy_src)])
+            .chain([transition(&scratch, copy_dst, copy_src)])
             .collect();
         cmd.ResourceBarrier(&scatter);
         offset = 0;
@@ -1248,7 +1270,7 @@ fn record_copy(
             cmd.CopyBufferRegion(
                 d.buffer(),
                 d.offset() + u64::from(piece.dst_offset),
-                scratch,
+                &scratch,
                 offset,
                 u64::from(piece.count),
             );
@@ -1259,7 +1281,7 @@ fn record_copy(
             &dest
                 .values()
                 .map(|d| transition(d, copy_dst, uav))
-                .chain([transition(scratch, copy_src, copy_dst)])
+                .chain([transition(&scratch, copy_src, copy_dst)])
                 .collect::<Vec<_>>(),
         );
     }
@@ -1517,7 +1539,7 @@ fn paged_input_views_gather_cross_page_gpu_writes() {
         let scratch = host.default_buffer(copy.len as u64).unwrap();
         list.keep(&scratch);
         let mut dirty = BTreeSet::new();
-        record_copy(list, batch, &scratch, &copy.bind(pins).unwrap(), &mut dirty)
+        record_copy(list, batch, &copy.bind(pins).unwrap(), &mut dirty, || Ok(scratch.clone()))
             .map_err(BatchError::Native)?;
         let gathered = view.gather(host, list, batch)?;
         let indexed = indexed.gather(host, list, batch)?;
@@ -1570,7 +1592,7 @@ fn paged_linear_texture_uses_ordered_gpu_writes_and_pitched_rows() {
         let scratch = host.default_buffer(copy.len as u64).unwrap();
         list.keep(&scratch);
         let mut dirty = BTreeSet::new();
-        record_copy(list, batch, &scratch, &copy.bind(pins).unwrap(), &mut dirty)
+        record_copy(list, batch, &copy.bind(pins).unwrap(), &mut dirty, || Ok(scratch.clone()))
             .map_err(BatchError::Native)?;
         let texture = texture.encode(host, list, batch)?;
         let (readback, footprint) = crate::capture::read_back(&host.device, list.recording(), &texture)
