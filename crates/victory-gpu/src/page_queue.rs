@@ -47,6 +47,42 @@ pub(crate) enum PageOp {
     ClearRaw(std::sync::Arc<crate::page_uav::RawClear>),
 }
 
+#[derive(Clone, Copy)]
+enum WriteSet {
+    /// The closed title recorder proves every GPU-written physical page.
+    Declared,
+    /// Low-level page shader work learns its writes from the GPU bitmap.
+    ShaderBitmap,
+}
+
+struct PageDownload {
+    buffer: ID3D12Resource,
+    bytes: NonNull<u8>,
+}
+
+impl PageDownload {
+    fn record(host: &Host, list: &HostList, batch: &PinnedBatch, dirty: &BTreeSet<PhysicalPage>) -> Result<Self> {
+        let (buffer, ptr) = host.shared_buffer(dirty.len() as u64 * PAGE_BYTES).ok_or_else(oom)?;
+        let bytes = NonNull::new(ptr).ok_or_else(oom)?;
+        let entries: Vec<_> = batch.pages().filter(|(id, _, _)| dirty.contains(id))
+            .enumerate().map(|(i, (_, _, page))| Transfer {
+                page, staging: &buffer, offset: i as u64 * PAGE_BYTES,
+            }).collect();
+        if entries.len() != dirty.len() {
+            return Err(E_FAIL.into());
+        }
+        download(list, &entries);
+        Ok(Self { buffer, bytes })
+    }
+
+    fn bytes(&self, i: usize) -> &[u8] {
+        // SAFETY: this is used only after the corresponding native fence
+        // completed. Allocation and entry count match the captured set.
+        let _keep_alive = &self.buffer;
+        unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().add(i * PAGE_BYTES as usize), PAGE_BYTES as usize) }
+    }
+}
+
 struct Completion {
     fence: Fence,
     stats: PageStats,
@@ -197,7 +233,7 @@ impl Host {
         ranges: &[(u64, u64)],
         record: impl FnOnce(&HostList, PageRoots) -> Result<()>,
     ) -> std::result::Result<PageStats, BatchError> {
-        self.execute_paged_work(heap, backing, ranges, |list, roots, _, _, _, _| {
+        self.execute_paged_work(heap, backing, ranges, WriteSet::ShaderBitmap, |list, roots, _, _, _, _| {
             record(list, roots).map_err(BatchError::Native)?;
             Ok(BTreeSet::new())
         })
@@ -259,7 +295,7 @@ impl Host {
                 PageOp::CopyTexture(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => {},
             }
         }
-        self.execute_paged_work(heap, backing, &ranges, |list, _, batch, pins, descriptors, targets| {
+        self.execute_paged_work(heap, backing, &ranges, WriteSet::Declared, |list, _, batch, pins, descriptors, targets| {
             let scratch = if max_copy > 0 {
                 let buffer = self.default_buffer(max_copy as u64)
                     .ok_or_else(|| BatchError::Native(oom()))?;
@@ -301,6 +337,7 @@ impl Host {
         heap: &HostHeap,
         backing: &mut SubmissionBacking,
         ranges: &[(u64, u64)],
+        writes: WriteSet,
         record: impl FnOnce(
             &HostList,
             PageRoots,
@@ -313,7 +350,7 @@ impl Host {
         let mut signal = self.direct_queue();
         let mut slabs = self.paged.lock().unwrap_or_else(|e| e.into_inner());
         let batch = PinnedBatch::capture(self, &mut slabs, backing, ranges)?;
-        let result = run(self, &mut signal, heap, backing, &batch, record);
+        let result = run(self, &mut signal, heap, backing, &batch, writes, record);
         match result {
             Ok(completed) => {
                 // The readback was merged before the pins are relinquished.
@@ -336,6 +373,7 @@ fn run(
     heap: &HostHeap,
     backing: &SubmissionBacking,
     batch: &PinnedBatch,
+    writes: WriteSet,
     record: impl FnOnce(
         &HostList,
         PageRoots,
@@ -394,6 +432,15 @@ fn run(
     let mut targets = crate::page_resource::ResourcePlan::default();
     let declared_dirty = record(&list, roots, batch, backing.pins(), &mut pairs, &mut targets)?;
     barrier(&list, slabs.values().copied(), true);
+    // Closed work knows every page it may write before native enqueue.
+    // Append its copies here, after all dispatches and slab transitions,
+    // instead of waiting on the CPU and driving a second submission.
+    let planned = match writes {
+        WriteSet::Declared if !declared_dirty.is_empty() => {
+            Some(PageDownload::record(host, &list, batch, &declared_dirty).map_err(native)?)
+        }
+        _ => None,
+    };
     list.close();
     let command = list.recording().cast().map_err(native)?;
     let rendered = host
@@ -412,6 +459,9 @@ fn run(
             "paged dispatch accessed unbound page-table leaf {leaf}"
         ))
     });
+    if matches!(writes, WriteSet::Declared) && !dirty.is_subset(&declared_dirty) {
+        fail(format_args!("closed title submission produced an undeclared page write"));
+    }
     dirty.extend(declared_dirty);
     let mut digests = uploads
         .as_ref()
@@ -428,32 +478,19 @@ fn run(
         });
     }
 
-    let readback = (|| -> Result<_> {
-        let data = host
-            .shared_buffer(dirty.len() as u64 * PAGE_BYTES)
-            .ok_or_else(oom)?;
-        let mapped = NonNull::new(data.1).ok_or_else(oom)?;
-        let transfer = host.new_list()?;
-        let entries: Vec<_> = batch
-            .pages()
-            .filter(|(id, _, _)| dirty.contains(id))
-            .enumerate()
-            .map(|(i, (_, _, page))| Transfer {
-                page,
-                staging: &data.0,
-                offset: i as u64 * PAGE_BYTES,
-            })
-            .collect();
-        download(&transfer, &entries);
-        transfer.close();
-        let completed = host.run_native_group(signal, &[Some(transfer.recording().cast()?)])?;
-        if host.completed_fence().is_none() {
-            return Err(E_FAIL.into());
-        }
-        Ok((data.0, mapped, completed))
-    })()
-    .unwrap_or_else(|e| fail(format_args!("native paged dirty readback: {e}")));
-    let (_keep_readback, mapped, completed) = readback;
+    let (readback, completed) = if let Some(planned) = planned {
+        (planned, rendered)
+    } else {
+        // The low-level bitmap shader API cannot plan GPU-selected
+        // writes ahead of execution. It does not serve the title queue.
+        (|| -> Result<_> {
+            let transfer = host.new_list()?;
+            let readback = PageDownload::record(host, &transfer, batch, &dirty)?;
+            transfer.close();
+            let completed = host.run_native_group(signal, &[Some(transfer.recording().cast()?)])?;
+            Ok((readback, completed))
+        })().unwrap_or_else(|e| fail(format_args!("native paged dirty readback: {e}")))
+    };
     let snapshots = uploads.expect("dirty leaf requires an uploaded page");
     let _scratch_charge = HostBudget::process()
         .reserve_ram(PAGE_BYTES)
@@ -464,13 +501,7 @@ fn run(
         .filter(|(id, _, _)| dirty.contains(id))
         .enumerate()
     {
-        // SAFETY: one initialized dirty page in the completed readback.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                mapped.as_ptr().add(i * PAGE_BYTES as usize),
-                PAGE_BYTES as usize,
-            )
-        };
+        let bytes = readback.bytes(i);
         if !snapshots.merge(backing, page, bytes, &mut scratch) {
             fail(format_args!(
                 "paged writeback failed for physical page {}",
@@ -810,7 +841,7 @@ fn paged_input_views_gather_cross_page_gpu_writes() {
     assert_eq!(view.range().unwrap(), indexed.range().unwrap());
     let [src, dst] = copy.ranges();
     let ranges = [src, dst, view.range().unwrap()];
-    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins, _, _| {
+    let stats = host.execute_paged_work(heap, &mut backing, &ranges, WriteSet::ShaderBitmap, |list, _, batch, pins, _, _| {
         let scratch = host.default_buffer(copy.len as u64).unwrap();
         list.keep(&scratch);
         let mut dirty = BTreeSet::new();
@@ -863,7 +894,7 @@ fn paged_linear_texture_uses_ordered_gpu_writes_and_pitched_rows() {
     };
     let ranges: Vec<_> = copy.ranges().into_iter().chain(texture.rows().unwrap()).collect();
     let mut output = None;
-    let stats = host.execute_paged_work(heap, &mut backing, &ranges, |list, _, batch, pins, _, _| {
+    let stats = host.execute_paged_work(heap, &mut backing, &ranges, WriteSet::ShaderBitmap, |list, _, batch, pins, _, _| {
         let scratch = host.default_buffer(copy.len as u64).unwrap();
         list.keep(&scratch);
         let mut dirty = BTreeSet::new();
