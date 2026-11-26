@@ -973,7 +973,7 @@ impl HostTexture {
             return Ok(None);
         }
         self.exact_committed_bytes().map(Some)
-            .ok_or(crate::page_slabs::BatchError::UnsupportedTextureMap)
+            .ok_or(crate::page_slabs::BatchError::unsupported_texture_map("无法确认纹理映射"))
     }
 
     /// Called under ordered ownership of both the CPU epoch and the
@@ -993,18 +993,18 @@ impl HostTexture {
         if self.native_authority.lock().unwrap_or_else(|e| e.into_inner())
             .keys().any(Option::is_some)
         {
-            return Err(BatchError::UnsupportedTextureMap);
+            return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
         }
         if self.completed_native_version().is_none() {
             return Ok(());
         }
-        let layout = layout.ok_or(BatchError::UnsupportedTextureMap)?;
+        let layout = layout.ok_or(BatchError::unsupported_texture_map("无法确认纹理映射"))?;
         if mapped.active != 0 {
             let rows: Vec<_> = layout.rows()?.collect();
             return self.reusable_byte_mirror(&rows).then_some(())
-                .ok_or(BatchError::UnsupportedTextureMap);
+                .ok_or(BatchError::unsupported_texture_map("无法确认纹理映射"));
         }
-        let heap = crate::memory::heap().ok_or(BatchError::UnsupportedTextureMap)?;
+        let heap = crate::memory::heap().ok_or(BatchError::unsupported_texture_map("无法确认纹理映射"))?;
         host.materialize_texture_bytes_locked(ordered, heap, self.clone(), layout)
     }
 
@@ -1068,7 +1068,7 @@ impl HostTexture {
             }
         }
         if pages.is_empty() {
-            return Err(BatchError::UnsupportedTextureMap);
+            return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
         }
         let bytes = std::mem::size_of_val(ranges) as u64
             + pages.len() as u64 * std::mem::size_of::<MirrorPage>() as u64;

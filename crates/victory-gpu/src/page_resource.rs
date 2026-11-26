@@ -189,7 +189,7 @@ impl ResourcePlan {
                 && !self.inherited.versions.contains_key(&(key, None))
                 && !self.refreshed.contains_key(&key)
             {
-                let source = copy.visible_linear_writeback()?.ok_or(BatchError::UnsupportedTextureMap)?;
+                let source = copy.visible_linear_writeback()?.ok_or(BatchError::unsupported_texture_map("无法确认纹理映射"))?;
                 let unchanged = self.snapshot.as_ref().is_some_and(|snapshot| {
                     copy.native_matches_snapshot(batch, snapshot)
                 });
@@ -208,7 +208,7 @@ impl ResourcePlan {
         if let Some(mut version) = self.version(copy)
             && version.representation == Representation::CompatibleBytes
         {
-            let source = copy.compatible_texture_source().ok_or(BatchError::UnsupportedTextureMap)?;
+            let source = copy.compatible_texture_source().ok_or(BatchError::unsupported_texture_map("无法确认纹理映射"))?;
             self.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
             source.copy_to(host, list, batch, &copy.texture, (0, 0))?;
             version.representation = Representation::NativeGpu;
@@ -609,12 +609,12 @@ impl TextureResolve {
     pub(crate) fn encode(&self, host: &crate::host::Host, list: &HostList, plan: &mut ResourcePlan)
         -> Result<(), BatchError>
     {
-        if !self.exact_backing() { return Err(BatchError::UnsupportedTextureMap); }
+        if !self.exact_backing() { return Err(BatchError::unsupported_texture_map("无法确认纹理映射")); }
         if !plan.authoritative(&self.src) { return Err(BatchError::TargetNotInitialized); }
         // Resource allocation alone does not establish resolve support for
         // a format. Verify the adapter's flag before issuing the command.
         if !crate::page_texture::resolve_support(host, self.format) {
-            return Err(BatchError::UnsupportedTextureMap);
+            return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
         }
         plan.transition_texture(list, &self.src, D3D12_RESOURCE_STATE_RESOLVE_SOURCE.0 as u32)?;
         plan.transition_texture(list, &self.dst, D3D12_RESOURCE_STATE_RESOLVE_DEST.0 as u32)?;
@@ -680,7 +680,7 @@ impl TextureUpload {
         batch: &crate::page_slabs::PinnedBatch, plan: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
         if !self.sub.allows(&self.target) || self.exact_backing && self.target.uses_unproven_alias_backing() {
-            return Err(BatchError::UnsupportedTextureMap);
+            return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
         }
         if !self.fills_target {
             plan.require_color_subresource(host, list, batch, &self.target, self.sub)?;
@@ -761,7 +761,7 @@ impl TextureReadback {
         guest_copy: bool,
     ) -> Result<(), BatchError> {
         if !self.sub.allows(&self.source) || self.plain && self.source.uses_unproven_alias_backing() {
-            return Err(BatchError::UnsupportedTextureMap);
+            return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
         }
         // An explicit guest command consumes the latest ordered resource,
         // including certified escaped CPU bytes if no native write superseded
@@ -918,7 +918,7 @@ impl TextureCopy {
     ) -> Result<(), BatchError> {
         if !self.source.allows(&self.src) || !self.destination.allows(&self.dst)
             || self.exact_backing && (self.src.uses_unproven_alias_backing() || self.dst.uses_unproven_alias_backing()) {
-            return Err(BatchError::UnsupportedTextureMap);
+            return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
         }
         for authority in self.authorities(self.source) {
             plan.require_texture_authority(host, list, batch, &self.src, authority)?;

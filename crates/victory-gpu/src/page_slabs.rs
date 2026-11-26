@@ -283,7 +283,7 @@ pub(crate) enum BatchError {
     TargetNotInitialized,
     UnsupportedDepth,
     UnsupportedBarrier,
-    UnsupportedTextureMap,
+    UnsupportedTextureMap { reason: &'static str, location: &'static std::panic::Location<'static> },
     #[cfg(feature = "paged-title")]
     UnclassifiedSharedTextureWriter { previous_submission: bool, current_submission: bool },
     Range(u64, u64),
@@ -292,8 +292,14 @@ pub(crate) enum BatchError {
     Table(BindError),
 }
 
-#[cfg(feature = "paged-title")]
 impl BatchError {
+    /// 保留拒绝的位置和原因，不记录来宾地址或纹理内容。
+    #[track_caller]
+    pub(crate) fn unsupported_texture_map(reason: &'static str) -> Self {
+        Self::UnsupportedTextureMap { reason, location: std::panic::Location::caller() }
+    }
+
+    #[cfg(feature = "paged-title")]
     pub(crate) fn is_out_of_memory(&self) -> bool {
         match self {
             Self::Native(error) => error.code() == windows::Win32::Foundation::E_OUTOFMEMORY,

@@ -116,7 +116,7 @@ impl ColorTarget {
         {
             Ok(())
         } else {
-            Err(BatchError::UnsupportedTextureMap)
+            Err(BatchError::unsupported_texture_map("无法确认纹理映射"))
         }
     }
 
@@ -157,7 +157,7 @@ impl ColorClear {
             rect.left < 0 || rect.top < 0 || rect.right <= rect.left || rect.bottom <= rect.top
                 || rect.right as u64 > width || rect.bottom as u32 > height
         }) {
-            return Err(BatchError::UnsupportedTextureMap);
+            return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
         }
         if !self.replaces_all() {
             initialized.require_color_subresource(host, list, batch, &self.target.copy, self.target.sub)?;
@@ -564,7 +564,7 @@ impl ClosedDraw {
             && (self.targets.iter().any(|t| t.copy.uses_unproven_alias_backing())
                 || self.depth.as_ref().is_some_and(|d| d.copy.uses_unproven_alias_backing()))
         {
-            return Err(BatchError::UnsupportedTextureMap);
+            return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
         }
         for target in &self.targets {
             target.validate_native()?;

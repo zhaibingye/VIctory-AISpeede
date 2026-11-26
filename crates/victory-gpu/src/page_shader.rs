@@ -676,12 +676,16 @@ impl ShaderBindings {
         let mut outputs = self.texture_outputs();
         let Some(volume) = outputs.find_map(|uav| uav.byte_backing()) else { return Ok(()); };
         // 暂只接纳单一体纹理写者和能证明字节跨度的读取。间接参数另有别名语义。
-        if indirect || self.texture_outputs().count() != 1
-            || self.tables.values().flat_map(|table| table.values()).any(|view| {
-                matches!(view, ClosedView::Texture(t) if !t.has_exact_guest_bytes())
-            })
-        {
-            return Err(BatchError::UnsupportedTextureMap);
+        if indirect {
+            return Err(BatchError::unsupported_texture_map("共享体纹理不支持间接派发"));
+        }
+        if self.texture_outputs().count() != 1 {
+            return Err(BatchError::unsupported_texture_map("共享体纹理派发不止一个纹理输出"));
+        }
+        if self.tables.values().flat_map(|table| table.values()).any(|view| {
+            matches!(view, ClosedView::Texture(t) if !t.has_exact_guest_bytes())
+        }) {
+            return Err(BatchError::unsupported_texture_map("共享体纹理派发有读取视图无法证明来宾字节范围"));
         }
         let mut pages = BTreeSet::new();
         for span in volume.ranges() {

@@ -333,7 +333,7 @@ impl TextureInput {
         match self {
             Self::Scoped { copy, format, selection } => {
                 if !extended_color_support(host, *format) {
-                    return Err(BatchError::UnsupportedTextureMap);
+                    return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
                 }
                 // SAFETY: live resource retained by this view.
                 let desc = unsafe { copy.texture.GetDesc() };
@@ -342,8 +342,8 @@ impl TextureInput {
                 for slice in slices.first..slices.first + slices.count {
                     for mip in mips.first..mips.first + mips.count {
                         let sub = crate::page_resource::ColorSubresource::from_mip_slice(desc, mip, slice)
-                            .ok_or(BatchError::UnsupportedTextureMap)?;
-                        if !sub.allows(copy) { return Err(BatchError::UnsupportedTextureMap); }
+                            .ok_or(BatchError::unsupported_texture_map("无法确认纹理映射"))?;
+                        if !sub.allows(copy) { return Err(BatchError::unsupported_texture_map("无法确认纹理映射")); }
                         plan.require_color_subresource(host, list, batch, copy, sub)?;
                         if let Some(reads) = shared.as_deref_mut() {
                             if copy.twin.get().is_some_and(Option::is_some) {
@@ -361,15 +361,25 @@ impl TextureInput {
             }
             #[cfg(feature = "paged-title")]
             Self::Section2d { copy, input } => {
-                if shared.is_some() || plan.authoritative(copy) || !section_2d_sampling_supported(host)
-                    || copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
+                let rejection = if shared.is_some() {
+                    Some("共享二维纹理在同一指令中绑定为输入与输出")
+                } else if plan.authoritative(copy) {
+                    Some("共享二维纹理的原生副本仍是权威来源")
+                } else if !section_2d_sampling_supported(host) {
+                    Some("设备不支持共享二维纹理所需的采样格式能力")
+                } else if copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
                     || copy.has_pointer_exposure()
                 {
-                    return Err(BatchError::UnsupportedTextureMap);
+                    Some("共享二维纹理存在稀疏映射、双生资源或已暴露指针")
+                } else {
+                    None
+                };
+                if let Some(reason) = rejection {
+                    return Err(BatchError::unsupported_texture_map(reason));
                 }
                 for span in input.ranges() {
                     batch.for_each_physical_span(span, |page, _| {
-                        if page.is_private() { return Err(BatchError::UnsupportedTextureMap); }
+                        if page.is_private() { return Err(BatchError::unsupported_texture_map("共享二维纹理的来宾范围包含私有页")); }
                         Ok(())
                     })?;
                 }
@@ -382,10 +392,10 @@ impl TextureInput {
             }
             Self::Linear { copy, input } => {
                 if shared.is_some() || plan.authoritative(copy) {
-                    return Err(BatchError::UnsupportedTextureMap);
+                    return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
                 }
                 if !extended_color_support(host, input.format) {
-                    return Err(BatchError::UnsupportedTextureMap);
+                    return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
                 }
                 Ok((input.encode(host, list, batch)?, input.format))
             }
@@ -393,10 +403,10 @@ impl TextureInput {
                 if shared.is_some() || *exact_backing && (copy.uses_unproven_alias_backing()
                     || copy.twin.get().is_some_and(Option::is_some))
                 {
-                    return Err(BatchError::UnsupportedTextureMap);
+                    return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
                 }
                 if !extended_color_support(host, *format) {
-                    return Err(BatchError::UnsupportedTextureMap);
+                    return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
                 }
                 #[cfg(feature = "paged-title")]
                 let pointer_backed = copy.has_pointer_exposure();
@@ -408,7 +418,7 @@ impl TextureInput {
                     return Ok((input.encode(host, list, batch)?, input.format));
                 }
                 if *depth_plane {
-                    if pointer_backed { return Err(BatchError::UnsupportedTextureMap); }
+                    if pointer_backed { return Err(BatchError::unsupported_texture_map("无法确认纹理映射")); }
                     plan.require_depth_planes(copy, 1)?;
                 } else {
                     plan.require_native(host, list, batch, copy)?;
@@ -445,8 +455,8 @@ fn checked_texture_footprint(host: &Host, desc: D3D12_RESOURCE_DESC)
     } else {
         1
     };
-    let texel = copy_texel_bytes(desc.Format).ok_or(BatchError::UnsupportedTextureMap)?;
-    let width = desc.Width.checked_mul(u64::from(texel)).ok_or(BatchError::UnsupportedTextureMap)?;
+    let texel = copy_texel_bytes(desc.Format).ok_or(BatchError::unsupported_texture_map("无法确认纹理映射"))?;
+    let width = desc.Width.checked_mul(u64::from(texel)).ok_or(BatchError::unsupported_texture_map("无法确认纹理映射"))?;
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let (mut rows, mut row_bytes, mut total) = (0, 0, 0);
     // 安全：两种调用方都已验证要复制的 subresource 0 与尺寸。
@@ -463,7 +473,7 @@ fn checked_texture_footprint(host: &Host, desc: D3D12_RESOURCE_DESC)
     if rows != desc.Height || row_bytes != width || width > pitch || total == u64::MAX || total == 0
         || footprint.Footprint.Depth != depth || last.is_none_or(|end| end > total)
     {
-        return Err(BatchError::UnsupportedTextureMap);
+        return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
     }
     Ok((footprint, total))
 }
@@ -633,7 +643,7 @@ impl SharedTextureBytes {
             || desc.DepthOrArraySize != self.depth || desc.Format != self.format
             || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0
         {
-            return Err(BatchError::UnsupportedTextureMap);
+            return Err(BatchError::unsupported_texture_map("宿主纹理形状或格式与已固定的共享字节不一致"));
         }
         checked_texture_footprint(host, desc)
     }

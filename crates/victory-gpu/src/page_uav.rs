@@ -177,7 +177,7 @@ impl NativeTextureUav {
             || self.target.twin.get().is_some_and(Option::is_some)
             || self.selection.volume.is_some() && self.target.has_pointer_exposure()
         {
-            return Err(BatchError::UnsupportedTextureMap);
+            return Err(BatchError::unsupported_texture_map("原生 UAV 不满足子资源或别名约束"));
         }
         let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: self.format, ..Default::default() };
         // SAFETY: the feature query writes this exact structure.
@@ -190,7 +190,7 @@ impl NativeTextureUav {
             || self.selection.volume.is_some() && !support.Support1.contains(D3D12_FORMAT_SUPPORT1_TEXTURE3D)
             || !support.Support2.contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)
         {
-            return Err(BatchError::UnsupportedTextureMap);
+            return Err(BatchError::unsupported_texture_map("设备不支持原生纹理 UAV 的有类型写入"));
         }
         Ok(())
     }
@@ -320,7 +320,7 @@ impl ShaderTextureUav {
         #[cfg(feature = "paged-title")]
         if let Some(backing) = backing {
             if shared.is_some() || resources.authoritative(self.target()) {
-                return Err(BatchError::UnsupportedTextureMap);
+                return Err(BatchError::unsupported_texture_map("共享体纹理存在同一指令的别名绑定或原生权威副本"));
             }
             resources.transition_texture(list, self.target(), D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
             backing.transfer(host, list, pages, &self.target().texture, None)?;

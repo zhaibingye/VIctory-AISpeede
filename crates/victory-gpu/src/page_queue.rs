@@ -444,7 +444,7 @@ impl ClosedFootprint {
                     && let Some(layout) = texture.visible_linear_writeback()?
                 {
                     let readback = crate::page_resource::TextureReadback::capture(texture.clone(), layout)
-                        .ok_or(BatchError::UnsupportedTextureMap)?;
+                        .ok_or(BatchError::unsupported_texture_map("无法确认纹理映射"))?;
                     let start = ranges.len();
                     readback.ranges(&mut ranges)?;
                     visible.push((std::sync::Arc::as_ptr(texture) as usize, readback, start..ranges.len()));
@@ -735,7 +735,7 @@ impl Host {
             return Ok(());
         }
         let readback = crate::page_resource::TextureReadback::capture(source, target)
-            .ok_or(BatchError::UnsupportedTextureMap)?;
+            .ok_or(BatchError::unsupported_texture_map("无法确认纹理映射"))?;
         let mut backing = SubmissionBacking::default();
         let mut publication = None;
         self.execute_paged_work_locked(signal, heap, &mut backing, &ranges, WriteSet::Declared, |list, _, batch, pins, _, plan| {
@@ -815,7 +815,7 @@ impl Host {
                     let pages = physical_footprint(pins, &ranges[span.clone()])?;
                     for page in pages {
                         if ordinary.contains(&page) || assigned.insert(page, resource).is_some() {
-                            return Err(BatchError::UnsupportedTextureMap);
+                            return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
                         }
                     }
                 }
@@ -825,7 +825,7 @@ impl Host {
                         if ordinary.contains(&page)
                             || assigned.insert(page, *resource).is_some_and(|old| old != *resource)
                         {
-                            return Err(BatchError::UnsupportedTextureMap);
+                            return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
                         }
                     }
                 }
@@ -974,7 +974,7 @@ impl Host {
             |list, _, batch, pins, descriptors, targets| {
                 let dirty = self.encode_closed_ops(list, batch, pins, descriptors, targets, ops, 0)?;
                 if !dirty.is_empty() {
-                    return Err(BatchError::UnsupportedTextureMap);
+                    return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
                 }
                 Ok(dirty)
             },
