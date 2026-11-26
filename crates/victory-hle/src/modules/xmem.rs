@@ -212,6 +212,15 @@ pub(crate) fn private_virtual_free(base: *mut c_void, size: usize, kind: u32) ->
     free_private(&mut virtual_pages(), base, size, kind)
 }
 
+pub(crate) fn allocate_list_upload(bytes: usize) -> usize {
+    if activate_private_ram_budget().is_err() { return 0; }
+    XMemVirtualAlloc(std::ptr::null_mut(), bytes, MEM_RESERVE | MEM_COMMIT, GRAPHICS, PAGE_READWRITE) as usize
+}
+
+pub(crate) fn free_list_upload(base: usize) {
+    private_virtual_free(base as *mut c_void, 0, MEM_RELEASE);
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,

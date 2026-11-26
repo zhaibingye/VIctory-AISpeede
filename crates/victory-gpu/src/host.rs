@@ -2209,6 +2209,11 @@ impl HostList {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::ClearRaw(std::sync::Arc::new(clear))));
     }
 
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn record_upload_lease(&self, upload: std::sync::Arc<crate::list::Upload>) {
+        self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::UploadLease(upload)));
+    }
+
     pub(crate) fn record_page_input(&self, view: crate::page_view::InputView) {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Input(view)));
     }

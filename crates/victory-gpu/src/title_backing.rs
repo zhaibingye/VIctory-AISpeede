@@ -29,6 +29,22 @@ pub type ReadRuns =
 type BackingApi = (BackingPinner, WritebackPage, ReadRuns);
 static BACKING: OnceLock<BackingApi> = OnceLock::new();
 
+type UploadApi = (fn(usize) -> usize, fn(usize));
+static UPLOAD: OnceLock<UploadApi> = OnceLock::new();
+
+/// List-owned upload allocations use the same RAM ledger and page IDs
+/// as the runtime's private XMem backing.
+pub fn use_upload_backing(alloc: fn(usize) -> usize, free: fn(usize)) {
+    let _ = UPLOAD.set((alloc, free));
+}
+
+#[cfg(feature = "paged-title")]
+pub(crate) fn allocate_upload(bytes: usize) -> Option<(usize, fn(usize))> {
+    let &(alloc, free) = UPLOAD.get()?;
+    let at = alloc(bytes);
+    (at != 0).then_some((at, free))
+}
+
 /// Installed by the runtime before the title creates its D3D12 device.
 pub fn use_backing(pinner: BackingPinner, writeback: WritebackPage, read: ReadRuns) {
     let _ = BACKING.set((pinner, writeback, read));

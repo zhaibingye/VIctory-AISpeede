@@ -50,6 +50,10 @@ pub(crate) enum PageOp {
     Timestamp(std::sync::Arc<TimestampOp>),
     #[cfg(feature = "paged-title")]
     PipeWrite(PipeWrite),
+    /// Holds private XMem stable through this submission even if the guest
+    /// reuses or releases the source command list.
+    #[cfg(feature = "paged-title")]
+    UploadLease(std::sync::Arc<crate::list::Upload>),
 }
 
 #[cfg(feature = "paged-title")]
@@ -190,6 +194,8 @@ impl PageOp {
             #[cfg(feature = "paged-title")]
             Self::PipeWrite(_) => "bottom-of-pipe write",
             #[cfg(feature = "paged-title")]
+            Self::UploadLease(_) => "list upload backing",
+            #[cfg(feature = "paged-title")]
             Self::Timestamp(op) => match op.as_ref() {
                 TimestampOp::End { .. } => "timestamp end",
                 TimestampOp::Resolve { .. } => "timestamp resolve",
@@ -328,7 +334,7 @@ impl ClosedFootprint {
             PageOp::Draw(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
             | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::Input(_) | PageOp::UploadTexture(_) => true,
             PageOp::Dispatch(dispatch) => dispatch.reads_guest_only(),
-            PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) | PageOp::Timestamp(_) | PageOp::PipeWrite(_) => false,
+            PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) | PageOp::Timestamp(_) | PageOp::PipeWrite(_) | PageOp::UploadLease(_) => false,
         })
     }
 
@@ -344,6 +350,8 @@ impl ClosedFootprint {
                     }
                     #[cfg(feature = "paged-title")]
                     PageOp::PipeWrite(op) => ranges.push(op.span),
+                    #[cfg(feature = "paged-title")]
+                    PageOp::UploadLease(_) => {},
                     #[cfg(feature = "paged-title")]
                     PageOp::Timestamp(op) => {
                         if let TimestampOp::Resolve { span, .. } = op.as_ref() { ranges.push(*span); }
@@ -813,6 +821,8 @@ impl Host {
                     PageOp::Timestamp(op) => op.encode(self, list, batch, targets, &mut dirty)?,
                     #[cfg(feature = "paged-title")]
                     PageOp::PipeWrite(op) => op.encode(self, list, batch, &mut pipe_timestamp, &mut dirty)?,
+                    #[cfg(feature = "paged-title")]
+                    PageOp::UploadLease(lease) => { let _ = lease; },
                 }
                 Ok(())
             })().map_err(|error| op.failure("encode", index, error))?;

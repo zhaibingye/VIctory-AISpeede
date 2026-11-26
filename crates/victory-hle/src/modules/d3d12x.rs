@@ -24,6 +24,9 @@ extern "system" fn create_device(
         victory_gpu::title_backing::use_backing(
             super::xmem::pin_backing, super::xmem::with_writeback_page, super::xmem::read_backing_runs,
         );
+        victory_gpu::title_backing::use_upload_backing(
+            super::xmem::allocate_list_upload, super::xmem::free_list_upload,
+        );
         victory_gpu::on_failure(host_gpu_failed);
     }
     device::create(adapter, parameters, iid, out)

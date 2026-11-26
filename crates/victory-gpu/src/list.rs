@@ -115,7 +115,7 @@ struct List {
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
-    uploads: std::sync::Mutex<Vec<Upload>>,
+    uploads: std::sync::Mutex<Vec<std::sync::Arc<Upload>>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -1153,11 +1153,16 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     let Some(block) = Upload::new(len) else {
         return std::ptr::null_mut();
     };
+    let block = std::sync::Arc::new(block);
     let start = block.start();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
+    #[cfg(all(windows, feature = "paged-title"))]
+    if let Some(list) = host_list(this) {
+        list.record_upload_lease(block.clone());
+    }
     uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
     at
 }
@@ -1167,17 +1172,26 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// find title memory by address (`crate::memory`; the console's GPU
 /// addresses have 40 bits), and is a buffer of its own to the host copies
 /// (`crate::shadow`), so its copy is exactly it.
-struct Upload {
+pub(crate) struct Upload {
     #[cfg(windows)]
     at: usize,
     #[cfg(windows)]
     len: usize,
+    #[cfg(all(windows, feature = "paged-title"))]
+    free: fn(usize),
     #[cfg(not(windows))]
     block: Vec<u8>,
 }
 
 impl Upload {
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "paged-title"))]
+    fn new(len: usize) -> Option<Upload> {
+        let len = len.checked_next_multiple_of(victory_memory::PAGE_BYTES as usize)?;
+        let (at, free) = crate::title_backing::allocate_upload(len)?;
+        Some(Upload { at, len, free })
+    }
+
+    #[cfg(all(windows, not(feature = "paged-title")))]
     fn new(len: usize) -> Option<Upload> {
         use windows_sys::Win32::System::Memory::{
             MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE,
@@ -1228,7 +1242,15 @@ impl Upload {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "paged-title"))]
+impl Drop for Upload {
+    fn drop(&mut self) {
+        crate::watch::title_memory_remapped(self.at, self.len);
+        (self.free)(self.at);
+    }
+}
+
+#[cfg(all(windows, not(feature = "paged-title")))]
 impl Drop for Upload {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
@@ -1959,12 +1981,15 @@ mod tests {
         );
         // List-owned upload memory: aligned, writable, below 2^40 (where
         // shaders find title memory), gone at reset.
-        let p = allocate_upload(list, 40, 0x100);
-        assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
-        #[cfg(windows)]
-        assert!((1 << 32..1 << 40).contains(&(p as usize)), "{p:p}");
-        // SAFETY: 40 bytes were handed out.
-        unsafe { p.write_bytes(0xab, 40) };
+        #[cfg(not(all(windows, feature = "paged-title")))]
+        {
+            let p = allocate_upload(list, 40, 0x100);
+            assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
+            #[cfg(windows)]
+            assert!((1 << 32..1 << 40).contains(&(p as usize)), "{p:p}");
+            // SAFETY: 40 bytes were handed out.
+            unsafe { p.write_bytes(0xab, 40) };
+        }
         assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
