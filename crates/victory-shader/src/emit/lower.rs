@@ -207,6 +207,25 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     None
 }
 
+/// Footprint of the actual raw operation, not the number of returned
+/// channels. A packed byte/half is obtained from its containing dword.
+pub(super) struct TypedLoadFootprint {
+    pub(super) element_bits: u32,
+    pub(super) dwords: u32,
+}
+
+impl TypedLoadFootprint {
+    fn for_channels(bits: &[u32]) -> Self {
+        let element_bits = bits.iter().sum::<u32>();
+        Self { element_bits, dwords: (element_bits / 32).max(1) }
+    }
+}
+
+pub(super) fn typed_load_footprint(format: u8) -> Option<TypedLoadFootprint> {
+    let (bits, _) = buffer_format(format)?;
+    Some(TypedLoadFootprint::for_channels(bits))
+}
+
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
@@ -4822,7 +4841,7 @@ impl<'a> Lower<'a> {
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
-        let total: u32 = bits.iter().sum();
+        let footprint = TypedLoadFootprint::for_channels(bits);
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
             let mask = l.s.m.i8((1u8 << n) - 1);
@@ -4841,7 +4860,7 @@ impl<'a> Lower<'a> {
                 })
                 .collect()
         };
-        let words = if total < 32 {
+        let words = if footprint.element_bits < 32 {
             // A byte or half inside the dword that holds it. A constant
             // offset is aligned here: vkd3d-proton turns a load at a
             // constant offset into the same access as the buffer's other
@@ -4860,10 +4879,10 @@ impl<'a> Lower<'a> {
                     (at, self.s.m.bin(c, Bin::Shl, byte, three))
                 }
             };
-            let w = load(self, at, 1)[0];
+            let w = load(self, at, footprint.dwords)[0];
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
-            load(self, off, total / 32)
+            load(self, off, footprint.dwords)
         };
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();

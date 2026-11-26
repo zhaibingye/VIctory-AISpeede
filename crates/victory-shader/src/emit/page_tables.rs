@@ -78,6 +78,8 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
             && (name.starts_with("image_sample") || matches!(name, "image_load" | "image_load_mip"))
         {
             AccessProof::Native(StaticViewAccess::TextureRead)
+        } else if let Some(access) = bounded_typed_load(inst, &mut bounds) {
+            access
         } else if let Some(access) = bounded_structured_read(inst, &mut bounds) {
             access
         } else if let Some(access) = bounded_raw_access(inst, &mut bounds) {
@@ -194,7 +196,37 @@ fn bounded_texture_write(
 
 enum AccessProof {
     Native(StaticViewAccess),
+    TypedRead { immediate: u32, vector_hi: u32, footprint: super::lower::TypedLoadFootprint },
     StructuredRead { elements: u32, last_byte: u32 },
+}
+
+fn bounded_typed_load(
+    inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>,
+) -> Option<AccessProof> {
+    let name = inst.name();
+    if !name.starts_with("tbuffer_load_format_") {
+        return None;
+    }
+    let Fields::Buffer { addr, offset, soffset, offen, idxen: false,
+        format: Some(format), lds: false, tfe: false, .. } = &inst.fields else { return None; };
+    let footprint = super::lower::typed_load_footprint(*format)?;
+    let scalar = match *soffset {
+        Operand::Scalar { code: NULL, .. } => 0,
+        Operand::Const(n @ 128..=192) => u32::from(n - 128),
+        _ => return None,
+    };
+    let vector_hi = if *offen {
+        let Operand::Vector { reg, .. } = *addr else { return None; };
+        // Low bits must be known, since packed elements cannot cross
+        // the containing dword the host converter actually loads.
+        bounds.dword_offset_hi(inst.read(crate::ir::Reg::V(reg))?)?
+    } else {
+        0
+    };
+    Some(AccessProof::TypedRead {
+        immediate: u32::from(*offset).checked_add(scalar)?,
+        vector_hi, footprint,
+    })
 }
 
 fn bounded_structured_read(
@@ -238,14 +270,31 @@ fn table_slot(address: Address, first: u8) -> Option<u32> {
 fn proven_root_srv(
     native: &NativeProgram, address: Address, bits: u32, words: [u32; 2], proof: AccessProof,
 ) -> Option<StaticViewSlot> {
-    let AccessProof::Native(StaticViewAccess::RawUav { offset, bytes, write: false }) = proof else {
-        return None;
-    };
-    if address.dynamic.is_some() || bits >> 30 != 0 || words[0] != u32::MAX
-        || !address.offset.is_multiple_of(4)
-    {
+    if address.dynamic.is_some() || bits >> 30 != 0 || words[0] != u32::MAX {
         return None;
     }
+    let bytes = match proof {
+        AccessProof::Native(StaticViewAccess::RawUav { offset, bytes, write: false })
+            if address.offset.is_multiple_of(4) =>
+        {
+            address.offset.checked_add(offset)?.checked_add(bytes)?
+        }
+        AccessProof::TypedRead { immediate, vector_hi, footprint } => {
+            let start = address.offset.checked_add(immediate)?;
+            let end = start.checked_add(vector_hi)?;
+            let raw_start = if footprint.element_bits < 32 {
+                if (start & 3) * 8 + footprint.element_bits > 32 {
+                    return None;
+                }
+                end & !3
+            } else {
+                if !start.is_multiple_of(4) { return None; }
+                end
+            };
+            raw_start.checked_add(footprint.dwords.checked_mul(4)?)?
+        }
+        _ => return None,
+    };
     let root = native.layout.get(address.param)?;
     if root.root != RootType::Descriptor { return None; }
     // Match the translator's used-kind selection without assuming a later
@@ -257,7 +306,6 @@ fn proven_root_srv(
     {
         return None;
     }
-    let bytes = address.offset.checked_add(offset)?.checked_add(bytes)?;
     (bytes <= 65536).then_some(StaticViewSlot {
         slot: StaticTextureSlot { root: root.slot, index: 0 },
         access: StaticViewAccess::RootSrv { bytes },
