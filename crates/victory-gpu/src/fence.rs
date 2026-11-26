@@ -63,6 +63,34 @@ pub(crate) extern "system" fn create(
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
 
+/// A guest fence kept alive while its signal or dependency is queued.
+#[cfg(all(windows, feature = "paged-title"))]
+pub(crate) struct GuestFenceRef {
+    object: usize,
+    value: u64,
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+impl GuestFenceRef {
+    pub(crate) fn new(this: This, value: u64) -> Self {
+        object::add_ref(this);
+        Self { object: this as usize, value }
+    }
+
+    pub(crate) fn reached(&self) -> bool {
+        completed(self.object as This) >= self.value
+    }
+
+    pub(crate) fn publish(self) {
+        signal(self.object as This, self.value);
+    }
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+impl Drop for GuestFenceRef {
+    fn drop(&mut self) { release(self.object as This); }
+}
+
 fn set_event(event: usize) {
     #[cfg(windows)]
     // SAFETY: the title passed an event handle.
@@ -125,6 +153,8 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
         !reached
     });
     fence.published.notify_all();
+    #[cfg(all(windows, feature = "paged-title"))]
+    crate::title_timeline::fence_published();
     S_OK
 }
 

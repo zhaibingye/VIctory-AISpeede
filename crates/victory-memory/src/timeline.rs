@@ -35,6 +35,10 @@ impl<D, W> Timeline<D, W> {
         Self { lane, limit, next: 0, pending: VecDeque::new(), issued: None }
     }
 
+    pub fn is_idle(&self) -> bool {
+        self.issued.is_none() && self.pending.is_empty()
+    }
+
     /// Return ownership to the caller on backpressure, without advancing
     /// the sequence or throwing out existing work.
     pub fn enqueue(&mut self, item: Item<D, W>) -> Result<Ticket, Item<D, W>> {

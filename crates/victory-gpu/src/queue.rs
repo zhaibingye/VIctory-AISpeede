@@ -1,5 +1,5 @@
-//! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! Command queues. VNME publishes guest operations in logical FIFO order;
+//! its ready work uses the shared native GPU queue.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,6 +34,8 @@ struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
+    #[cfg(all(windows, feature = "paged-title"))]
+    lane: std::sync::Arc<crate::title_timeline::Lane>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -61,6 +63,8 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
+        #[cfg(all(windows, feature = "paged-title"))]
+        lane: crate::title_timeline::Lane::new(),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -110,8 +114,8 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+/// Snapshots closed VNME lists; legacy lists still execute inline.
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -123,22 +127,30 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        if cfg!(feature = "paged-title") {
+        #[cfg(feature = "paged-title")]
+        {
             if host_lists.len() != lists.len() {
                 crate::host::fail(format_args!("paged title submission has a list without a host recorder"));
             }
+            let batch = crate::page_queue::ClosedTitleBatch::capture(&host_lists)
+                .unwrap_or_else(|e| crate::host::fail(format_args!("paged title submission rejected: {e:?}")));
             let heap = crate::memory::heap().unwrap_or_else(|| {
-                crate::host::fail(format_args!("paged title submission has no descriptor heap"));
+                crate::host::fail(format_args!("paged title submission has no descriptor heap"))
             });
-            let mut backing = crate::title_backing::SubmissionBacking::default();
-            if let Err(error) = host.execute_paged_title(heap, &mut backing, &host_lists) {
-                crate::host::fail(format_args!("paged title submission rejected: {error:?}"));
+            if !crate::title_timeline::Lane::work(&queue(this).lane, move || {
+                let mut backing = crate::title_backing::SubmissionBacking::default();
+                if let Err(error) = batch.execute(host, heap, &mut backing) {
+                    crate::host::fail(format_args!("paged title submission rejected: {error:?}"));
+                }
+            }) {
+                crate::host::fail(format_args!("VNME title queue exceeded its in-flight bound"));
             }
-        } else {
-            host.execute(&host_lists);
         }
+        #[cfg(not(feature = "paged-title"))]
+        host.execute(&host_lists);
         return;
     }
+    let _ = this;
     static ONCE: AtomicBool = AtomicBool::new(false);
     if !ONCE.swap(true, Ordering::Relaxed) {
         tracing::warn!(count, "command lists submitted; no host GPU runs them");
@@ -160,8 +172,8 @@ const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
     execute(this, count, lists);
 }
-/// Signal with sync settings for the top and bottom of the pipe; our
-/// submissions are complete when they return, so it signals at once.
+/// Sync settings for the top and bottom of the pipe are not distinguished
+/// yet. VNME conservatively publishes the completed bottom-of-pipe value.
 extern "system" fn signal2_x(
     this: This,
     fence: This,
@@ -173,15 +185,39 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    crate::fence::signal(fence, value)
+    #[cfg(all(windows, feature = "paged-title"))]
+    {
+        let signal = crate::fence::GuestFenceRef::new(fence, value);
+        if crate::title_timeline::Lane::work(&queue(this).lane, move || signal.publish()) {
+            return S_OK;
+        }
+        return crate::object::E_OUTOFMEMORY;
+    }
+    #[cfg(not(all(windows, feature = "paged-title")))]
+    {
+        let _ = this;
+        crate::fence::signal(fence, value)
+    }
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+
+extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    #[cfg(all(windows, feature = "paged-title"))]
+    {
+        let fence = crate::fence::GuestFenceRef::new(fence, value);
+        if !crate::title_timeline::Lane::wait(&queue(this).lane, fence) {
+            return crate::object::E_OUTOFMEMORY;
+        }
+    }
+    #[cfg(not(all(windows, feature = "paged-title")))]
+    let _ = (this, value);
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -253,11 +289,59 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(all(windows, feature = "paged-title"))]
+    {
+        let sources: Vec<_> = if planes == 0 || plane_parameters.is_null() {
+            Vec::new()
+        } else {
+            // SAFETY: snapshot the supported leading plane/resource pairs
+            // while the caller's arrays and resources are live.
+            unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) }
+                .iter().filter(|p| p.count != 0 && !p.resources.is_null())
+                .filter_map(|p| OwnedResource::retain(unsafe { *p.resources })).collect()
+        };
+        if !crate::title_timeline::Lane::work(&queue(this).lane, move || {
+            let handles: Vec<_> = sources.iter().map(|resource| resource.0 as This).collect();
+            let planes: Vec<_> = handles.iter().map(|resource| Plane {
+                token: 0, count: 1, resources: resource, _rest: [0; 6],
+            }).collect();
+            present_now(planes.len() as u32, planes.as_ptr());
+        }) {
+            return crate::object::E_OUTOFMEMORY;
+        }
+        S_OK
+    }
+    #[cfg(not(all(windows, feature = "paged-title")))]
+    {
+        let _ = this;
+        present_now(planes, plane_parameters)
+    }
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+struct OwnedResource(usize);
+#[cfg(all(windows, feature = "paged-title"))]
+impl OwnedResource {
+    fn retain(this: This) -> Option<Self> {
+        if this.is_null() { return None; }
+        object::add_ref(this);
+        Some(Self(this as usize))
+    }
+}
+#[cfg(all(windows, feature = "paged-title"))]
+impl Drop for OwnedResource {
+    fn drop(&mut self) {
+        let this = self.0 as This;
+        crate::resource::resource_release(this);
+    }
+}
+
+fn present_now(planes: u32, plane_parameters: *const Plane) -> HRESULT {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -380,6 +464,7 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
 /// `start` on, 1 pool page `start` each, 2 unmapped, 3 left as they are)
 /// and how many.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct PageRange {
     kind: u32,
     start: u32,
@@ -397,19 +482,57 @@ pub(crate) struct PageBatch {
 /// Bytes per mapped page.
 const PAGE: u64 = 64 << 10;
 
-/// `CopyPageMappingsBatchX(count, batches, pool, pool pages, flags)`: maps
-/// pages of a pool (memory the title mapped physical pages into) at the
-/// batches' addresses. Grand Theft Auto VI streams textures into pool pages
-/// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// Map title pool pages in the same logical order as Execute and fences.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
     pool_pages: u32,
     _flags: u32,
+) -> HRESULT {
+    #[cfg(all(windows, feature = "paged-title"))]
+    {
+        if count > 65536 || (count > 0 && batches.is_null()) || crate::resource::page_mapper().is_none() {
+            return E_INVALIDARG;
+        }
+        let input = if count == 0 { &[][..] } else {
+            // SAFETY: the caller passes count live batch records.
+            unsafe { std::slice::from_raw_parts(batches, count as usize) }
+        };
+        let mut left = 65536usize;
+        let mut owned = Vec::with_capacity(input.len());
+        for batch in input {
+            if batch.ranges.is_null() || batch.count == 0 {
+                continue;
+            }
+            let Some(remainder) = left.checked_sub(batch.count as usize) else { return E_INVALIDARG };
+            left = remainder;
+            // SAFETY: a checked live range array, copied before returning.
+            let ranges = unsafe { std::slice::from_raw_parts(batch.ranges, batch.count as usize) };
+            owned.push((batch.destination, ranges.to_vec()));
+        }
+        if !crate::title_timeline::Lane::work(&queue(this).lane, move || {
+            let batches: Vec<_> = owned.iter().map(|(destination, ranges)| PageBatch {
+                destination: *destination, count: ranges.len() as u32, ranges: ranges.as_ptr(),
+            }).collect();
+            if copy_page_mappings_now(batches.len() as u32, batches.as_ptr(), pool, pool_pages) != S_OK {
+                crate::host::fail(format_args!("VNME title page mapping failed before queue completion"));
+            }
+        }) {
+            return crate::object::E_OUTOFMEMORY;
+        }
+        S_OK
+    }
+    #[cfg(not(all(windows, feature = "paged-title")))]
+    {
+        let _ = this;
+        copy_page_mappings_now(count, batches, pool, pool_pages)
+    }
+}
+
+fn copy_page_mappings_now(
+    count: u32, batches: *const PageBatch, pool: u64, pool_pages: u32,
 ) -> HRESULT {
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
@@ -446,6 +569,9 @@ extern "system" fn copy_page_mappings(
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        if cfg!(feature = "paged-title") {
+            return E_INVALIDARG;
+        }
     }
     S_OK
 }
@@ -522,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_signals_complete_at_once() {
+    fn queue_signals_publish_a_guest_fence() {
         let null = std::ptr::null();
         let desc = QueueDesc {
             kind: 0,
@@ -542,6 +668,9 @@ mod tests {
         );
         let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
         assert_eq!(signal(q, fence, 7), S_OK);
+        #[cfg(all(windows, feature = "paged-title"))]
+        assert_eq!(slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> HRESULT>
+            (fence, 0x48)(fence, 7, std::ptr::null_mut()), S_OK);
         assert_eq!(
             slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
             7

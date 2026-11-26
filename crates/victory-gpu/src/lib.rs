@@ -119,3 +119,6 @@ mod bc1_detile_experiment;
 
 #[cfg(windows)]
 mod upscale;
+
+#[cfg(all(windows, feature = "paged-title"))]
+mod title_timeline;

@@ -2125,7 +2125,7 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
         out,
     )
 }
-extern "system" fn resource_release(this: This) -> u32 {
+pub(crate) extern "system" fn resource_release(this: This) -> u32 {
     object::release_boxed::<Resource>(this)
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
