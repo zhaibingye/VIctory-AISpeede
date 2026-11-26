@@ -40,7 +40,10 @@ pub(crate) enum UnloweredShader {
 pub(crate) enum DescriptorSlotReason {
     RootWord,
     UnboundOrStale,
-    UnsupportedTexture { array: bool, title_format: Option<u32> },
+    UnsupportedTexture {
+        array: bool, kind: &'static str, title_format: Option<u32>,
+        view_format: Option<u32>, view_dimension: Option<u32>,
+    },
     UnsupportedBuffer,
     UnsupportedTextureWrite { title_format: Option<u32>, view_format: Option<i32>, view_dimension: Option<i32> },
     TextureWriteRange { host_format: i32, xyz_max: (u32, u32, Option<u32>) },
@@ -493,13 +496,12 @@ impl ShaderBindings {
                         let actual = view(slot.root, slot.index).ok_or(reason(DescriptorSlotReason::UnboundOrStale))?;
                         let bound = match proof.access {
                             StaticViewAccess::TextureRead { array } => ClosedView::Texture(
-                                actual.paged_texture_srv(array).ok_or_else(|| reason(DescriptorSlotReason::UnsupportedTexture {
-                                    array,
-                                    title_format: match actual {
-                                        View::Shader(resource, _) => crate::resource::title_format(resource as crate::object::This),
-                                        _ => None,
-                                    },
-                                }))?),
+                                actual.paged_texture_srv(array).ok_or_else(|| {
+                                    let (kind, title_format, view_format, view_dimension) = actual.texture_srv_metadata();
+                                    reason(DescriptorSlotReason::UnsupportedTexture {
+                                        array, kind, title_format, view_format, view_dimension,
+                                    })
+                                })?),
                             StaticViewAccess::TextureWrite { .. } if pipeline.compute => {
                                 ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).ok_or_else(|| {
                                     let (title_format, view_format, view_dimension) = crate::descriptor::host::paged_uav_format(&actual);

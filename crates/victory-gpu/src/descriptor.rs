@@ -400,8 +400,15 @@ impl View {
     pub(crate) fn paged_texture_srv(&self, array: bool) -> Option<crate::page_texture::TextureInput> {
         use crate::page_texture::{MipSelection, TextureInput, TextureSelection};
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-        let Self::Shader(resource, desc) = *self else { return None };
-        let resource = resource as This;
+        let (resource, desc) = match *self {
+            Self::Shader(resource, desc) => (resource as This, desc),
+            #[cfg(feature = "paged-title")]
+            Self::Placed(false, _, _) => {
+                let (resource, words) = host::paged_placed_texture(self, array)?;
+                (resource, Some(words))
+            }
+            _ => return None,
+        };
         let copy = crate::resource::host_copy(resource)?;
         // SAFETY: the retained native texture is live.
         let actual = unsafe { copy.texture.GetDesc() };
@@ -440,6 +447,28 @@ impl View {
         TextureInput::native(copy.clone(), format, compatible.or(plain_linear)).or_else(|| {
             plain_linear.map(|input| TextureInput::Linear { copy, input })
         })
+    }
+
+    /// 只记录可用于区分空、放置式、直接资源及其他类型的格式信息，省略地址和内容。
+    #[cfg(windows)]
+    pub(crate) fn texture_srv_metadata(&self) -> (&'static str, Option<u32>, Option<u32>, Option<u32>) {
+        match self {
+            Self::Shader(resource, desc) => (
+                if *resource == 0 { "null-srv" } else { "resource-srv" },
+                crate::resource::title_format(*resource as This),
+                desc.as_ref().map(|words| words[0]),
+                desc.as_ref().map(|words| words[1]),
+            ),
+            Self::Placed(false, resource, desc) => (
+                "placed-srv", Some(resource[8]), Some(desc[0]), Some(desc[1]),
+            ),
+            Self::Placed(true, resource, desc) => (
+                "placed-uav", Some(resource[8]), Some(desc[0]), Some(desc[1]),
+            ),
+            Self::Unordered(_, _, _) => ("uav", None, None, None),
+            Self::Constant(..) | Self::NullConstant => ("cbv", None, None, None),
+            Self::Sampler(_) | Self::ConsoleSampler(_) => ("sampler", None, None, None),
+        }
     }
 
     /// The resource objects the view names.

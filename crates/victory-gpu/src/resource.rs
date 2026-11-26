@@ -2314,17 +2314,40 @@ pub(crate) fn texture_at(
     desc: &[u32; 14],
     view: &windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC,
 ) -> Option<This> {
+    texture_at_inner(address, desc, view, false)
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+pub(crate) fn current_texture_at(
+    address: u64,
+    desc: &[u32; 14],
+    view: &windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC,
+) -> Option<This> {
+    texture_at_inner(address, desc, view, true)
+}
+
+#[cfg(windows)]
+fn texture_at_inner(
+    address: u64,
+    desc: &[u32; 14],
+    view: &windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC,
+    require_current: bool,
+) -> Option<This> {
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let key = placed_key(address, desc);
     let slot = map.get(&key).copied().unwrap_or_default();
     let old = slot.ready.map(|r| r as This);
     // A failed allocation yields without retaining an empty host object.
     // A still-live generation (including sparse backing) never waits for it.
-    if old.is_some_and(current) {
+    if old.is_some_and(|r| current(r)
+        && (!require_current || resource(r).host.as_ref().is_some_and(|host| host.sparse.is_none())))
+    {
         return old;
     }
+    // VNME 不从已被替换的宿主资源读取，也不以尚未驻留的稀疏副本为权威。
+    let fallback = if require_current { None } else { old };
     if slot.retry.is_some() && slot.waiting(std::time::Instant::now()) {
-        return old;
+        return fallback;
     }
     if under_texture_pressure() {
         // Mark the view pending even if the global wait expires before
@@ -2332,16 +2355,16 @@ pub(crate) fn texture_at(
         if old.is_none() {
             map.entry(key).or_default().retry.get_or_insert((std::time::Instant::now(), 0));
         }
-        return old;
+        return fallback;
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { key.1.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER {
+    if d.dimension == BUFFER || require_current && d.dimension != 3 {
         return None;
     }
     // Never select sparse backing where an existing title texture can
     // already have written this memory, or when replacing a generation.
-    let sparse_prefix = if crate::sparse::enabled()
+    let sparse_prefix = if !require_current && crate::sparse::enabled()
         && old.is_none()
         && !TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&address)
     {
@@ -2354,15 +2377,17 @@ pub(crate) fn texture_at(
         address, d, 0, std::ptr::null(), &RESOURCE_IIDS[0], &mut out, sparse_prefix,
     );
     if made != S_OK {
-        return old;
+        return fallback;
     }
-    if resource(out).host.is_none() {
+    if resource(out).host.as_ref().is_none_or(|host| require_current && host.sparse.is_some())
+        || require_current && !current(out)
+    {
         map.entry(key).or_default().defer(std::time::Instant::now());
         // No descriptor ever saw this failed object. Do not keep it (and
         // don't enter the bindless cleanup while holding the placed map).
         drop(map);
         resource_release(out);
-        return old;
+        return fallback;
     }
     map.insert(key, PlacedSlot { ready: Some(out as usize), retry: None });
     Some(out)

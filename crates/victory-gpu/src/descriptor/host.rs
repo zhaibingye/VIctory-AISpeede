@@ -1774,8 +1774,27 @@ fn placed_pending(view: &View) -> bool {
     crate::resource::placement_pending(address, resource)
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// 将已验证的地址式 SRV 接到 VNME，不重用过时纹理或接纳写者别名。
+#[cfg(feature = "paged-title")]
+pub(super) fn paged_placed_texture(view: &View, array: bool) -> Option<(crate::object::This, [u32; 10])> {
+    let View::Placed(false, resource, desc) = view else { return None; };
+    let words: [u32; 10] = desc[..10].try_into().ok()?;
+    // 先验证视图形状、映射和格式，不为必定拒绝的描述符分配宿主纹理。
+    let (_, selection) = paged_2d_srv(&words)?;
+    if resource[0] != 3 || selection.slices.is_some() != array {
+        return None;
+    }
+    let address = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
+    if address == 0 || address >= victory_memory::gpu_table::ADDRESS_LIMIT {
+        return None;
+    }
+    let texture = crate::resource::current_texture_at(address, resource, &srv_desc(&words))?;
+    if crate::resource::alias_source(texture).is_some() {
+        return None;
+    }
+    Some((texture, words))
+}
+
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {
