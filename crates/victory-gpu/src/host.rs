@@ -38,6 +38,8 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
+/// At most one idle command list per batch in the native window.
+const IDLE_PAGED_LISTS: usize = 4;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -46,6 +48,7 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     pub(crate) paged: Mutex<crate::page_slabs::PageSlabs>,
+    idle_paged_lists: Mutex<Vec<HostList>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -260,6 +263,7 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             paged: Mutex::default(),
+            idle_paged_lists: Mutex::default(),
             event,
             rtvs,
             rtv_size,
@@ -1121,6 +1125,29 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
+        }
+    }
+
+    /// Internal VNME lists never escape to the title's recording API.
+    pub(crate) fn acquire_paged_list(&self) -> windows::core::Result<HostList> {
+        let idle = self.idle_paged_lists.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        match idle {
+            Some(list) => Ok(list),
+            None => self.new_list(),
+        }
+    }
+
+    pub(crate) fn recycle_paged_list(
+        &self, list: HostList, submitted: victory_memory::coherence::Fence,
+        observed: victory_memory::coherence::Fence,
+    ) {
+        assert!(observed.0 >= submitted.0, "GPU still owns the VNME allocator");
+        let mut idle = self.idle_paged_lists.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.len() < IDLE_PAGED_LISTS {
+            // This releases external resources and staging references
+            // before parking the same native allocator/list for reuse.
+            list.reset();
+            idle.push(list);
         }
     }
 

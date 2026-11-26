@@ -317,14 +317,15 @@ impl InFlightPages<'_> {
 #[must_use]
 struct SubmittedRender<'a> {
     fence: Fence,
-    _list: HostList,
-    _descriptors: PageDescriptors<'a>,
+    list: HostList,
+    descriptors: PageDescriptors<'a>,
     targets: crate::page_resource::ResourcePlan,
     tracking: Option<BitmapTracking>,
     declared_dirty: BTreeSet<PhysicalPage>,
     planned: Option<PageDownload>,
     uploads: Option<CapturedUploads>,
     uploaded: usize,
+    reusable: bool,
 }
 
 struct BitmapTracking {
@@ -729,7 +730,8 @@ fn submit_work<'a>(
         textures: Vec::new(),
         raw_views: Vec::new(),
     };
-    let list = host.new_list().map_err(native)?;
+    let reusable = matches!(writes, WriteSet::Declared);
+    let list = if reusable { host.acquire_paged_list() } else { host.new_list() }.map_err(native)?;
     // Only the low-level page shader API uses a shader-visible virtual
     // page table. Closed title ops bind physical resources directly and
     // provide exact or conservative write sets, including translated UAVs.
@@ -789,8 +791,8 @@ fn submit_work<'a>(
         .submit_native_group(signal, &[Some(command)])
         .unwrap_or_else(|e| fail(format_args!("native paged render submission: {e}")));
     Ok(SubmittedRender {
-        fence: rendered, _list: list, _descriptors: pairs, targets, tracking,
-        declared_dirty, planned, uploads, uploaded,
+        fence: rendered, list, descriptors: pairs, targets, tracking,
+        declared_dirty, planned, uploads, uploaded, reusable,
     })
 }
 
@@ -846,6 +848,10 @@ impl SubmittedRender<'_> {
         // Native readiness is not guest byte visibility. Publish the
         // completed plan only after the required CPU merge succeeded.
         self.targets.commit(self.fence, observed);
+        drop(self.descriptors);
+        if self.reusable {
+            host.recycle_paged_list(self.list, self.fence, observed);
+        }
         Completion { fence: completed, stats, digests }
     }
 }
