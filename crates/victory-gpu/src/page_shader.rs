@@ -10,7 +10,7 @@ use crate::page_texture::TextureInput;
 use crate::page_uav::BoundedBufferView;
 use crate::page_queue::TableDescriptor;
 use victory_shader::emit::StaticViewAccess;
-use victory_memory::{PAGE_BYTES, physical::PhysicalPage};
+use victory_memory::physical::PhysicalPage;
 use crate::pipeline::host::HostPipeline;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -684,26 +684,19 @@ impl ShaderBindings {
             return Err(BatchError::UnsupportedTextureMap);
         }
         let mut pages = BTreeSet::new();
-        let mut add_range = |start, end| -> Result<(), BatchError> {
-            let mut at = start & !(PAGE_BYTES - 1);
-            while at < end {
-                let page = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?;
-                pages.insert(page.physical());
-                at += PAGE_BYTES;
-            }
-            Ok(())
-        };
-        for (start, end) in volume.ranges() { add_range(start, end)?; }
+        for span in volume.ranges() {
+            batch.for_each_physical_span(span, |page, _| {
+                pages.insert(page);
+                Ok(())
+            })?;
+        }
         let mut ordinary = Vec::new();
         self.ordinary_ranges(&mut ordinary)?;
-        for (start, end) in ordinary {
-            if start == end { continue; }
-            let mut at = start & !(PAGE_BYTES - 1);
-            while at < end {
-                let id = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?.physical();
-                if pages.contains(&id) { return Err(BatchError::Range(start, end)); }
-                at += PAGE_BYTES;
-            }
+        for span in ordinary {
+            batch.for_each_physical_span(span, |page, _| {
+                if pages.contains(&page) { return Err(BatchError::Range(span.0, span.1)); }
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -837,15 +830,11 @@ impl ShaderBindings {
                     _ => {},
                 }
             }
-            for (start, end) in reads {
-                let mut at = start & !(PAGE_BYTES - 1);
-                while at < end {
-                    let page = batch.pinned_at(at).ok_or(BatchError::NotCaptured(at))?;
-                    if shader_dirty.contains(&page.physical()) {
-                        return Err(BatchError::Range(start, end));
-                    }
-                    at += PAGE_BYTES;
-                }
+            for span in reads {
+                batch.for_each_physical_span(span, |page, _| {
+                    if shader_dirty.contains(&page) { return Err(BatchError::Range(span.0, span.1)); }
+                    Ok(())
+                })?;
             }
             dirty.extend(shader_dirty);
         }

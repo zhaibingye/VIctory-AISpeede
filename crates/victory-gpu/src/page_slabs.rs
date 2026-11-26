@@ -407,6 +407,25 @@ impl PinnedBatch {
         self.pinned(*self.aliases.get(&(va & !(PAGE_BYTES - 1)))?)
     }
 
+    /// 只使用本次提交固定的物理身份；跨页时分别保留每页内的有效区间。
+    pub(crate) fn for_each_physical_span(
+        &self, (start, end): (u64, u64),
+        mut visit: impl FnMut(PhysicalPage, std::ops::Range<usize>) -> std::result::Result<(), BatchError>,
+    ) -> std::result::Result<(), BatchError> {
+        if start > end || end > victory_memory::gpu_table::ADDRESS_LIMIT {
+            return Err(BatchError::Range(start, end));
+        }
+        let mut at = start;
+        while at < end {
+            let offset = at & (PAGE_BYTES - 1);
+            let bytes = (end - at).min(PAGE_BYTES - offset);
+            let page = self.pinned_at(at).ok_or(BatchError::NotCaptured(at - offset))?;
+            visit(page.physical(), offset as usize..(offset + bytes) as usize)?;
+            at += bytes;
+        }
+        Ok(())
+    }
+
     pub(crate) fn pinned(&self, page: PhysicalPage) -> Option<&PinnedPage> {
         self.pages.get(&page).map(|(_, pin)| pin)
     }
@@ -703,6 +722,20 @@ fn renderer_page_slab_roundtrip_uses_direct_queue_fence() {
         ],
     )
     .unwrap();
+    let mut spans = Vec::new();
+    batch.for_each_physical_span(((low * 2 - 4) as u64, (low * 2 + 8) as u64), |page, range| {
+        spans.push((page, range));
+        Ok(())
+    }).unwrap();
+    assert_eq!(spans, [(id, low - 4..low), (id.offset(1), 0..8)]);
+    let mut alias = None;
+    batch.for_each_physical_span((high as u64 + 4, high as u64 + 8), |page, range| {
+        alias = Some((page, range));
+        Ok(())
+    }).unwrap();
+    assert_eq!(alias, Some((id.offset(1), 4..8)));
+    assert!(matches!(batch.for_each_physical_span((1, 2), |_, _| Ok(())),
+        Err(BatchError::NotCaptured(0))));
     let pages: Vec<_> = batch.pages().collect();
     let [(first, first_va, a), (second, second_va, b)] = pages.as_slice() else {
         panic!("dedup by physical page")
