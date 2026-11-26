@@ -57,7 +57,7 @@ pub fn counts() -> (u64, u64) {
 /// translation settings (the loop limit, which a diagnostics build can
 /// change at run time, and the view-heap size shaders clamp their indices
 /// below, which a host that caps its heaps lowers).
-fn build() -> &'static [u8; 32] {
+pub(crate) fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();

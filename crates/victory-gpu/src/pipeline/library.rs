@@ -42,9 +42,19 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Keeps the pipeline library and early/prebuilt lists together.
+/// VNME and the legacy renderer translate the same guest programs into
+/// different native shaders. Their guest pipeline keys can be identical,
+/// so they cannot share hints that a pipeline has already been built.
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(dir);
+    let _ = DIR.get_or_init(|| {
+        if cfg!(feature = "paged-title") {
+            let fingerprint = blake3::Hash::from(*crate::shader_cache::build()).to_hex();
+            dir.join("vnme").join(fingerprint.as_str())
+        } else {
+            dir
+        }
+    });
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -211,6 +221,9 @@ fn tag(blob: &[u8]) -> String {
     ] {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
+    }
+    if cfg!(feature = "paged-title") {
+        h.update(crate::shader_cache::build());
     }
     h.finalize().to_hex().to_string()
 }
