@@ -1,3 +1,6 @@
+mod adaptive;
+pub use adaptive::{BudgetProfile, Headroom, HostLimits, HostPressure, PoolLimits};
+
 pub const RAM_LIMIT: u64 = 10 << 30;
 pub const LOCAL_LIMIT: u64 = 5 << 30;
 
