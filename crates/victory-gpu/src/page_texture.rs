@@ -100,15 +100,18 @@ pub(crate) enum TextureInput {
     },
 }
 
-const EXTENDED_COLOR: [DXGI_FORMAT; 6] = [
+const EXTENDED_COLOR: [DXGI_FORMAT; 8] = [
     DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT,
     DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
 ];
 
-/// Exact byte-compatible, single-plane texels. Do not infer this from
-/// rounded size: compressed, planar and typeless layouts are excluded.
+/// 只接受字节布局确切的单平面格式，不从大小推测格式。
+/// R8/RG8 是独立纹理；不将 NV12 等多平面资源当作这些格式。
 pub(crate) fn linear_texel_bytes(format: DXGI_FORMAT) -> Option<u32> {
     Some(match format {
+        DXGI_FORMAT_R8_UNORM => 1,
+        DXGI_FORMAT_R8G8_UNORM => 2,
         DXGI_FORMAT_R16G16B16A16_FLOAT => 8,
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM
         | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
@@ -556,6 +559,19 @@ impl LinearTexture {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn paged_linear_video_plane_rows_keep_padding_outside_the_copy() {
+    let span = LinearTexture {
+        address: 0x10000, row_pitch: 256, width: 5, height: 2, format: DXGI_FORMAT_R8_UNORM,
+    };
+    assert_eq!(span.rows().unwrap().collect::<Vec<_>>(), [(0x10000, 0x10005), (0x10100, 0x10105)]);
+    let chroma = LinearTexture { format: DXGI_FORMAT_R8G8_UNORM, ..span };
+    assert_eq!(chroma.rows().unwrap().collect::<Vec<_>>(), [(0x10000, 0x1000a), (0x10100, 0x1010a)]);
+    let crop = chroma.crop(Some([1, 1, 0, 4, 2, 1])).unwrap();
+    assert_eq!(crop.rows().unwrap().collect::<Vec<_>>(), [(0x10102, 0x10108)]);
 }
 
 #[cfg(test)]
