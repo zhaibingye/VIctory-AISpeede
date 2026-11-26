@@ -19,7 +19,7 @@ pub struct StaticTextureSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StaticViewAccess {
     TextureRead,
-    /// An immediate aligned byte window on a raw UAV, as used by DXIL.
+    /// A statically bounded aligned byte window on a raw UAV, as used by DXIL.
     RawUav { offset: u32, bytes: u32, write: bool },
     RawSrv { offset: u32, bytes: u32 },
 }
@@ -52,7 +52,9 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
         return Ok(None);
     };
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    let resources = crate::resource::track(&p, &native.layout, native.stage, Some(&st?))?;
+    let st = st?;
+    let resources = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let mut bounds = crate::range::Ranges::new(&p, &st);
     let addresses: BTreeMap<_, _> = resources.scalar.iter().copied().collect();
     let mut slots = BTreeSet::new();
     for descriptor in &resources.descriptors {
@@ -71,7 +73,7 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
             && (name.starts_with("image_sample") || matches!(name, "image_load" | "image_load_mip"))
         {
             StaticViewAccess::TextureRead
-        } else if let Some(access) = immediate_raw_access(name, &inst.fields) {
+        } else if let Some(access) = bounded_raw_access(inst, &mut bounds) {
             access
         } else {
             return Ok(None);
@@ -90,8 +92,8 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
     Ok(Some(slots.into_iter().collect()))
 }
 
-fn immediate_raw_access(name: &str, fields: &Fields) -> Option<StaticViewAccess> {
-    let (operation, width) = name.strip_prefix("buffer_")?.split_once('_')?;
+fn bounded_raw_access(inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>) -> Option<StaticViewAccess> {
+    let (operation, width) = inst.name().strip_prefix("buffer_")?.split_once('_')?;
     let write = match operation {
         "store" => true,
         "load" => false,
@@ -105,14 +107,25 @@ fn immediate_raw_access(name: &str, fields: &Fields) -> Option<StaticViewAccess>
         _ => return None,
     };
     let Fields::Buffer {
-        offset, soffset, offen: false, idxen: false, format: None, lds: false, tfe: false, ..
-    } = fields else { return None };
+        addr, offset, soffset, offen, idxen: false, format: None, lds: false, tfe: false, ..
+    } = &inst.fields else { return None };
     if !matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128))
         || !offset.is_multiple_of(4)
     {
         return None;
     }
-    Some(StaticViewAccess::RawUav { offset: u32::from(*offset), bytes, write })
+    let offset = u32::from(*offset);
+    let dynamic = if *offen {
+        let Operand::Vector { reg, .. } = *addr else { return None; };
+        bounds.dword_offset_hi(inst.read(crate::ir::Reg::V(reg))?)?
+    } else {
+        0
+    };
+    let span = dynamic.checked_add(bytes)?;
+    // The renderer may treat this entire conservative interval as
+    // dirty, but never bind outside the proven descriptor footprint.
+    (offset.checked_add(span)? <= 65536)
+        .then_some(StaticViewAccess::RawUav { offset, bytes: span, write })
 }
 
 fn table_slot(address: Address, first: u8) -> Option<u32> {

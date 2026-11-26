@@ -90,23 +90,7 @@ fn relative(inst: &Inst) -> bool {
 /// The largest M0 each relative move can see, by instruction offset
 /// (`u32::MAX`: unbounded).
 fn relative_bounds(p: &Program, st: &Structured) -> HashMap<usize, u32> {
-    let mut r = Ranges {
-        p,
-        st,
-        defs: HashMap::new(),
-        memo: HashMap::new(),
-        busy: HashSet::new(),
-    };
-    for (b, block) in p.blocks.iter().enumerate() {
-        for (i, phi) in block.phis.iter().enumerate() {
-            r.defs.insert(phi.value, Def::Phi(b, i));
-        }
-        for (i, inst) in block.insts.iter().enumerate() {
-            for w in &inst.writes {
-                r.defs.insert(w.1, Def::Inst(b, i));
-            }
-        }
-    }
+    let mut r = Ranges::new(p, st);
     // Copies of a block (irreducible loops) share offsets: the largest wins.
     let mut out: HashMap<usize, u32> = HashMap::new();
     for inst in p
@@ -128,7 +112,7 @@ enum Def {
     Inst(usize, usize),
 }
 
-struct Ranges<'a> {
+pub(crate) struct Ranges<'a> {
     p: &'a Program,
     st: &'a Structured,
     defs: HashMap<Value, Def>,
@@ -137,7 +121,86 @@ struct Ranges<'a> {
     busy: HashSet<Value>,
 }
 
-impl Ranges<'_> {
+impl<'a> Ranges<'a> {
+    pub(crate) fn new(p: &'a Program, st: &'a Structured) -> Self {
+        let mut r = Self {
+            p,
+            st,
+            defs: HashMap::new(),
+            memo: HashMap::new(),
+            busy: HashSet::new(),
+        };
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, phi) in block.phis.iter().enumerate() {
+                r.defs.insert(phi.value, Def::Phi(b, i));
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for w in &inst.writes {
+                    r.defs.insert(w.1, Def::Inst(b, i));
+                }
+            }
+        }
+        r
+    }
+
+    /// A conservative unsigned byte bound and independent dword alignment
+    /// proof. Only plain moves/phis/masks are used to infer low bits.
+    pub(crate) fn dword_offset_hi(&mut self, value: Value) -> Option<u32> {
+        if !self.dword_aligned(value, &mut HashSet::new(), 64) {
+            return None;
+        }
+        let hi = self.hi(value);
+        (hi != u32::MAX).then_some(hi & !3)
+    }
+
+    fn dword_aligned(&self, v: Value, active: &mut HashSet<Value>, depth: usize) -> bool {
+        if depth == 0 || !active.insert(v) {
+            return false;
+        }
+        let result = match self.defs.get(&v).copied() {
+            Some(Def::Phi(b, i)) => {
+                let args = &self.p.blocks[b].phis[i].args;
+                !args.is_empty() && args.iter().all(|&a| self.dword_aligned(a, active, depth - 1))
+            }
+            Some(Def::Inst(b, i)) => {
+                let inst = &self.p.blocks[b].insts[i];
+                let reg = inst.writes.iter().find_map(|&(r, x)| (x == v).then_some(r));
+                let next = reg.is_some() && reg == dst(inst)
+                    && self.aligned_result(inst, active, depth - 1);
+                next && !(matches!(reg, Some(Reg::V(_))) && self.st.guards[b][i].is_some()
+                    && !reg.and_then(|r| inst.read(r)).is_some_and(|old| {
+                        self.dword_aligned(old, active, depth - 1)
+                    }))
+            }
+            None => false,
+        };
+        active.remove(&v);
+        result
+    }
+
+    fn aligned_result(&self, inst: &Inst, active: &mut HashSet<Value>, depth: usize) -> bool {
+        let operands = match &inst.fields {
+            Fields::Valu(v) if v.sdwa.is_none() && v.dpp.is_none()
+                && !v.clamp && v.omod == 0 && v.neg | v.abs | v.opsel == 0 => &v.src,
+            Fields::Sop { src, .. } => src,
+            _ => return false,
+        };
+        let constant = |op: &Operand| match *op {
+            Operand::Const(c @ 128..=192) => Some(u32::from(c - 128)),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        match (inst.name(), operands.as_slice()) {
+            ("v_and_b32" | "s_and_b32", [a, b]) => constant(a).or_else(|| constant(b))
+                .is_some_and(|mask| mask & 3 == 0),
+            ("v_mov_b32" | "s_mov_b32", [a]) => constant(a).map_or_else(
+                || value(inst, a).is_some_and(|v| self.dword_aligned(v, active, depth)),
+                |n| n & 3 == 0,
+            ),
+            _ => false,
+        }
+    }
+
     /// The largest unsigned value `v` takes in any lane that defines it.
     fn hi(&mut self, v: Value) -> u32 {
         if let Some(&h) = self.memo.get(&v) {
