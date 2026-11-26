@@ -23,6 +23,7 @@ pub enum StaticViewAccess {
     /// A statically bounded aligned byte window on a raw UAV, as used by DXIL.
     RawUav { offset: u32, bytes: u32, write: bool },
     RawSrv { offset: u32, bytes: u32 },
+    RootSrv { bytes: u32 },
     StructuredSrv { stride: u32, elements: u32 },
 }
 
@@ -84,6 +85,13 @@ pub fn static_view_slots(container: &[u8]) -> Result<Option<Vec<StaticViewSlot>>
         } else {
             return Ok(None);
         };
+        if let Source::Built { address, bits, words } = descriptor.source {
+            let Some(root) = proven_root_srv(&native, address, bits, words, access) else {
+                return Ok(None);
+            };
+            slots.insert(root);
+            continue;
+        }
         let Source::Loaded { load, first } = descriptor.source else {
             return Ok(None);
         };
@@ -225,6 +233,35 @@ fn table_slot(address: Address, first: u8) -> Option<u32> {
     // A proof for explicitly bounded small table runs. A later encoder
     // must populate exactly these slots, not read outside captured views.
     (slot < 256).then_some(slot)
+}
+
+fn proven_root_srv(
+    native: &NativeProgram, address: Address, bits: u32, words: [u32; 2], proof: AccessProof,
+) -> Option<StaticViewSlot> {
+    let AccessProof::Native(StaticViewAccess::RawUav { offset, bytes, write: false }) = proof else {
+        return None;
+    };
+    if address.dynamic.is_some() || bits >> 30 != 0 || words[0] != u32::MAX
+        || !address.offset.is_multiple_of(4)
+    {
+        return None;
+    }
+    let root = native.layout.get(address.param)?;
+    if root.root != RootType::Descriptor { return None; }
+    // Match the translator's used-kind selection without assuming a later
+    // matching declaration is the one the DXIL actually binds.
+    let mut declarations = native.used.iter().filter(|u| u.user_data == root.user_data);
+    let used = declarations.next()?;
+    if declarations.next().is_some() || used.root != RootType::Descriptor
+        || used.kind != ResourceType::Srv || used.slot != root.slot
+    {
+        return None;
+    }
+    let bytes = address.offset.checked_add(offset)?.checked_add(bytes)?;
+    (bytes <= 65536).then_some(StaticViewSlot {
+        slot: StaticTextureSlot { root: root.slot, index: 0 },
+        access: StaticViewAccess::RootSrv { bytes },
+    })
 }
 
 fn proven_slot(
