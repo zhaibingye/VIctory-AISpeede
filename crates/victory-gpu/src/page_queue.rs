@@ -64,6 +64,16 @@ fn physical_footprint(
 
 #[cfg(feature = "paged-title")]
 impl PageOp {
+    fn preserves_color(&self) -> Option<&std::sync::Arc<crate::resource::HostTexture>> {
+        match self {
+            Self::CopyTexture(copy) => copy.preserves_color(),
+            Self::UploadTexture(upload) => upload.preserves_color(),
+            Self::Draw(draw) => Some(draw.preserves_color()),
+            Self::Clear(clear) => clear.preserves_color(),
+            _ => None,
+        }
+    }
+
     fn writes_native<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
         match self {
             Self::CopyTexture(copy) => out.push(copy.target()),
@@ -102,17 +112,24 @@ impl ClosedTitleBatch {
     /// larger resident set, or suppress any CPU-visible byte updates.
     #[cfg(feature = "paged-title")]
     pub(crate) fn may_fold(&self, next: &Self) -> bool {
-        let native_only = |batch: &Self| batch.0.iter().all(|op| match op {
-            PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => true,
-            PageOp::CopyTexture(copy) => {
-                let mut ranges = Vec::new();
-                copy.ranges(&mut ranges).is_ok() && ranges.is_empty()
+        let native_only = |batch: &Self| batch.0.iter().all(|op| {
+            let mut outputs = Vec::new();
+            op.writes_native(&mut outputs);
+            if outputs.iter().any(|target| target.may_require_byte_publication()) {
+                return false;
             }
-            PageOp::Draw(draw) => {
-                let mut ranges = Vec::new();
-                draw.ranges(&mut ranges).is_ok() && ranges.is_empty()
+            match op {
+                PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::Barrier(_) => true,
+                PageOp::CopyTexture(copy) => {
+                    let mut ranges = Vec::new();
+                    copy.ranges(&mut ranges).is_ok() && ranges.is_empty()
+                }
+                PageOp::Draw(draw) => {
+                    let mut ranges = Vec::new();
+                    draw.ranges(&mut ranges).is_ok() && ranges.is_empty()
+                }
+                _ => false,
             }
-            _ => false,
         });
         self.0.len().saturating_add(next.0.len()) <= 64
             && native_only(self) && native_only(next)
@@ -405,8 +422,21 @@ impl Host {
             }
         }
         #[cfg(feature = "paged-title")]
-        let (ordinary_count, visible) = {
+        let (ordinary_count, preserved, visible) = {
             let ordinary_count = ranges.len();
+            let mut preserved = BTreeMap::new();
+            for op in ops {
+                if let Some(target) = op.preserves_color()
+                    && let Some(layout) = target.compatible_texture_source()
+                {
+                    let key = std::sync::Arc::as_ptr(target) as usize;
+                    if let std::collections::btree_map::Entry::Vacant(entry) = preserved.entry(key) {
+                        let start = ranges.len();
+                        ranges.extend(layout.rows()?);
+                        entry.insert(start..ranges.len());
+                    }
+                }
+            }
             let mut targets = Vec::new();
             for op in ops {
                 op.writes_native(&mut targets);
@@ -421,23 +451,35 @@ impl Host {
                         .ok_or(BatchError::UnsupportedTextureMap)?;
                     let start = ranges.len();
                     readback.ranges(&mut ranges)?;
-                    visible.push((readback, start..ranges.len()));
+                    visible.push((std::sync::Arc::as_ptr(texture) as usize, readback, start..ranges.len()));
                 }
             }
-            (ordinary_count, visible)
+            (ordinary_count, preserved, visible)
         };
         let stats = self.execute_paged_work_locked(signal, heap, backing, &ranges, WriteSet::Declared, |list, _, batch, pins, descriptors, targets| {
             #[cfg(feature = "paged-title")]
-            if !visible.is_empty() {
-                let mut existing = physical_footprint(pins, &ranges[..ordinary_count])?;
-                for (_, span) in &visible {
-                    let mirrors = physical_footprint(pins, &ranges[span.clone()])?;
-                    if !existing.is_disjoint(&mirrors) {
-                        // A native write and a page operation could share
-                        // physical identity; a tail copy cannot resolve it.
-                        return Err(BatchError::UnsupportedTextureMap);
+            if !visible.is_empty() || !preserved.is_empty() {
+                // Own preservation and own tail publication are an
+                // ordered pair. Any other overlap still needs alias lowering.
+                let ordinary = physical_footprint(pins, &ranges[..ordinary_count])?;
+                let mut assigned = BTreeMap::<PhysicalPage, usize>::new();
+                for (&resource, span) in &preserved {
+                    let pages = physical_footprint(pins, &ranges[span.clone()])?;
+                    for page in pages {
+                        if ordinary.contains(&page) || assigned.insert(page, resource).is_some() {
+                            return Err(BatchError::UnsupportedTextureMap);
+                        }
                     }
-                    existing.extend(mirrors);
+                }
+                for (resource, _, span) in &visible {
+                    let pages = physical_footprint(pins, &ranges[span.clone()])?;
+                    for page in pages {
+                        if ordinary.contains(&page)
+                            || assigned.insert(page, *resource).is_some_and(|old| old != *resource)
+                        {
+                            return Err(BatchError::UnsupportedTextureMap);
+                        }
+                    }
                 }
             }
             let scratch = if max_copy > 0 {
@@ -466,20 +508,20 @@ impl Host {
                     PageOp::Input(input) => input.encode(self, list, batch)?,
                     PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
                     PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
-                    PageOp::Clear(clear) => clear.encode(self, list, targets)?,
+                    PageOp::Clear(clear) => clear.encode(self, list, batch, targets)?,
                     PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,
                     PageOp::Barrier(barrier) => barrier.encode(list, targets)?,
                     PageOp::ClearRaw(clear) => clear.encode(self, list, batch, descriptors, targets, &mut dirty)?,
                 }
             }
             #[cfg(feature = "paged-title")]
-            for (readback, _) in &visible {
+            for (_, readback, _) in &visible {
                 readback.encode(self, list, batch, targets, &mut dirty)?;
             }
             Ok(dirty)
         })?;
         #[cfg(feature = "paged-title")]
-        for (readback, span) in visible {
+        for (_, readback, span) in visible {
             readback.publish_mirror(&ranges[span], backing);
         }
         Ok(stats)

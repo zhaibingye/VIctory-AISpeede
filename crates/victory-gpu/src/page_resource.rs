@@ -176,6 +176,11 @@ pub(crate) struct TextureUpload {
 
 impl TextureUpload {
     #[cfg(feature = "paged-title")]
+    pub(crate) fn preserves_color(&self) -> Option<&Arc<HostTexture>> {
+        (!self.fills_target).then_some(&self.target)
+    }
+
+    #[cfg(feature = "paged-title")]
     pub(crate) fn target(&self) -> &Arc<HostTexture> { &self.target }
 
     pub(crate) fn capture(
@@ -206,8 +211,8 @@ impl TextureUpload {
     pub(crate) fn encode(&self, host: &crate::host::Host, list: &HostList,
         batch: &crate::page_slabs::PinnedBatch, plan: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
-        if !self.fills_target && !plan.authoritative(&self.target) {
-            return Err(BatchError::TargetNotInitialized);
+        if !self.fills_target {
+            plan.require_native(host, list, batch, &self.target)?;
         }
         plan.transition_texture(list, &self.target, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
         self.source.copy_to(host, list, batch, &self.target.texture, self.offset)?;
@@ -276,6 +281,11 @@ struct CopyArea {
 }
 
 impl TextureCopy {
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn preserves_color(&self) -> Option<&Arc<HostTexture>> {
+        self.area.as_ref().filter(|area| !area.fills_destination).map(|_| &self.dst)
+    }
+
     #[cfg(feature = "paged-title")]
     pub(crate) fn target(&self) -> &Arc<HostTexture> { &self.dst }
 
@@ -348,8 +358,8 @@ impl TextureCopy {
         batch: &crate::page_slabs::PinnedBatch, plan: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
         plan.require_native(host, list, batch, &self.src)?;
-        if self.area.as_ref().is_some_and(|area| !area.fills_destination && !plan.authoritative(&self.dst)) {
-            return Err(BatchError::TargetNotInitialized);
+        if self.area.as_ref().is_some_and(|area| !area.fills_destination) {
+            plan.require_native(host, list, batch, &self.dst)?;
         }
         plan.transition_texture(list, &self.src, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)?;
         plan.transition_texture(list, &self.dst, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;

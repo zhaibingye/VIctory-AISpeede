@@ -77,9 +77,6 @@ impl ColorTarget {
         Some(Self { copy, desc })
     }
 
-    fn authoritative(&self, plan: &ResourcePlan) -> bool {
-        plan.authoritative(&self.copy)
-    }
 }
 
 pub(crate) struct ColorClear {
@@ -90,15 +87,20 @@ pub(crate) struct ColorClear {
 
 impl ColorClear {
     #[cfg(feature = "paged-title")]
+    pub(crate) fn preserves_color(&self) -> Option<&Arc<HostTexture>> {
+        (!self.rects.is_empty()).then_some(&self.target.copy)
+    }
+
+    #[cfg(feature = "paged-title")]
     pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
         out.push(&self.target.copy);
     }
 
     pub(crate) fn encode(
-        &self, host: &Host, list: &HostList, initialized: &mut ResourcePlan,
+        &self, host: &Host, list: &HostList, batch: &PinnedBatch, initialized: &mut ResourcePlan,
     ) -> Result<(), BatchError> {
-        if !self.rects.is_empty() && !self.target.authoritative(initialized) {
-            return Err(BatchError::TargetNotInitialized);
+        if !self.rects.is_empty() {
+            initialized.require_native(host, list, batch, &self.target.copy)?;
         }
         let texture = &self.target.copy.texture;
         let before = initialized.state(&self.target.copy);
@@ -256,6 +258,9 @@ pub(crate) struct ClosedDraw {
 
 impl ClosedDraw {
     #[cfg(feature = "paged-title")]
+    pub(crate) fn preserves_color(&self) -> &Arc<HostTexture> { &self.target.copy }
+
+    #[cfg(feature = "paged-title")]
     pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
         out.push(&self.target.copy);
         if let Some(depth) = &self.depth { out.push(&depth.copy); }
@@ -353,11 +358,10 @@ impl ClosedDraw {
         initialized: &mut ResourcePlan,
         dirty: &mut std::collections::BTreeSet<victory_memory::physical::PhysicalPage>,
     ) -> Result<(), BatchError> {
-        if !self.target.authoritative(initialized)
-            || self.depth.as_ref().is_some_and(|d| !d.authoritative(initialized))
-        {
+        if self.depth.as_ref().is_some_and(|d| !d.authoritative(initialized)) {
             return Err(BatchError::TargetNotInitialized);
         }
+        initialized.require_native(host, list, batch, &self.target.copy)?;
         let indirect = match self.call {
             DrawCall::Indirect(draw) => Some(draw.prepare(host, list, batch, budget)?),
             _ => None,
