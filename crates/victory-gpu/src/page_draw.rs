@@ -128,6 +128,57 @@ pub(crate) struct ColorClear {
     pub(crate) rects: Vec<RECT>,
 }
 
+/// 证明一次清除的矩形并集覆盖整张视图。依据实际 API 写入，不推测绘制覆盖率。
+fn color_clear_covers(width: u64, height: u32, rects: &[RECT]) -> bool {
+    if width == 0 || height == 0 { return false; }
+    if rects.is_empty() { return true; }
+    let (Ok(width), Ok(height)) = (i32::try_from(width), i32::try_from(height)) else { return false; };
+    // 不依赖宿主对无效矩形的裁剪行为。
+    if rects.iter().any(|r| {
+        r.left < 0 || r.top < 0 || r.right <= r.left || r.bottom <= r.top
+            || r.right > width || r.bottom > height
+    }) {
+        return false;
+    }
+    if rects.iter().any(|r| r.left == 0 && r.top == 0 && r.right == width && r.bottom == height) {
+        return true;
+    }
+    // 大批量矩形保持保守路径，限制并集验证成本。
+    if rects.len() > 32 { return false; }
+    let mut rows = Vec::with_capacity(rects.len() * 2 + 2);
+    rows.extend([0, height]);
+    for r in rects { rows.extend([r.top, r.bottom]); }
+    rows.sort_unstable();
+    rows.dedup();
+    let mut spans = Vec::with_capacity(rects.len());
+    for band in rows.windows(2) {
+        spans.clear();
+        spans.extend(rects.iter()
+            .filter(|r| r.top <= band[0] && r.bottom >= band[1])
+            .map(|r| (r.left, r.right)));
+        spans.sort_unstable();
+        let mut right = 0;
+        for &(start, end) in &spans {
+            if start > right { break; }
+            right = right.max(end);
+        }
+        if right != width { return false; }
+    }
+    true
+}
+
+#[test]
+fn color_clear_coverage_requires_no_horizontal_or_vertical_gaps() {
+    let r = |left, top, right, bottom| RECT { left, top, right, bottom };
+    assert!(color_clear_covers(10, 10, &[r(4, 0, 10, 10), r(0, 5, 5, 10), r(0, 0, 5, 5)]));
+    assert!(!color_clear_covers(10, 10, &[r(4, 0, 10, 10), r(0, 6, 5, 10), r(0, 0, 5, 5)]));
+    assert!(!color_clear_covers(10, 10, &[r(0, 0, 4, 10), r(5, 0, 10, 10)]));
+    assert!(!color_clear_covers(10, 10, &[r(-1, 0, 5, 10), r(5, 0, 10, 10)]));
+    assert!(!color_clear_covers(10, 10, &[r(0, 0, 10, 10), r(-1, 0, 5, 10)]));
+    assert!(!color_clear_covers(0, 10, &[]));
+    assert!(color_clear_covers(10, 10, &[]));
+}
+
 impl ColorClear {
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     pub(crate) fn color_write_mentions(&self, copy: &Arc<HostTexture>, subresource: u32) -> Option<&'static str> {
@@ -153,11 +204,7 @@ impl ColorClear {
 
     fn replaces_all(&self) -> bool {
         let (width, height) = self.target.extent();
-        self.rects.is_empty() || self.rects.iter().any(|rect| {
-            rect.left == 0 && rect.top == 0
-                && u64::try_from(rect.right).ok() == Some(width)
-                && u32::try_from(rect.bottom).ok() == Some(height)
-        })
+        color_clear_covers(width, height, &self.rects)
     }
 
     pub(crate) fn encode(
@@ -1100,7 +1147,11 @@ float4 pixel() : SV_Target0 {
     if discard {
         title.record_page_clear(ColorClear {
             target: ColorTarget::capture_candidate(target_state.clone(), None).unwrap(),
-            color: [0., 0., 1., 1.], rects: Vec::new(),
+            color: [0., 0., 1., 1.],
+            rects: vec![
+                RECT { left: 2, top: 0, right: 4, bottom: 4 },
+                RECT { left: 0, top: 0, right: 2, bottom: 4 },
+            ],
         });
         title.record_page_barrier(crate::page_resource::PageBarrier::Texture(
             target_state.clone(), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
@@ -1126,6 +1177,14 @@ float4 pixel() : SV_Target0 {
         let row = ptr.cast::<u8>().add(footprint.Offset as usize + 2 * footprint.Footprint.RowPitch as usize);
         let expected = if discard { [0, 0, 255, 255] } else if writes_color { [0, 255, 0, 255] } else { [255, 0, 0, 255] };
         assert_eq!(std::slice::from_raw_parts(row.add(8), 4), &expected);
+        if discard {
+            for y in 0..4 {
+                let row = ptr.cast::<u8>().add(footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize);
+                for x in 0..4 {
+                    assert_eq!(std::slice::from_raw_parts(row.add(x * 4), 4), &expected);
+                }
+            }
+        }
         readback.Unmap(0, None);
     }
 }
