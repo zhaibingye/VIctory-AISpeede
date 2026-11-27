@@ -887,8 +887,14 @@ impl Host {
                     PageOp::ReadbackTexture(readback) => readback.encode(self, list, batch, targets, &mut dirty, true)?,
                     PageOp::UploadTexture(upload) => upload.encode(self, list, batch, targets)?,
                     PageOp::Input(input) => input.encode(self, list, batch)?,
-                    PageOp::Dispatch(dispatch) => dispatch.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
-                    PageOp::Draw(draw) => draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?,
+                    PageOp::Dispatch(dispatch) => {
+                        dispatch.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?;
+                        targets.encoded_dispatches += 1;
+                    }
+                    PageOp::Draw(draw) => {
+                        draw.encode(self, list, batch, &mut indirect_budget, descriptors, targets, &mut dirty)?;
+                        targets.encoded_draws += 1;
+                    }
                     PageOp::Clear(clear) => clear.encode(self, list, batch, targets)?,
                     PageOp::ClearDepth(clear) => clear.encode(self, list, targets)?,
                     PageOp::Barrier(barrier) => barrier.encode(list, targets)?,
@@ -1172,6 +1178,7 @@ fn submit_work<'a>(
     let rendered = host
         .submit_native_group(signal, &[Some(command)])
         .unwrap_or_else(|e| fail(format_args!("VNME 原生渲染提交失败：{e}")));
+    crate::draw::note_paged_submission(targets.encoded_draws, targets.encoded_dispatches);
     #[cfg(feature = "paged-title")]
     if targets.unclassified_native_write {
         host.unclassified_native_writes.store(true, std::sync::atomic::Ordering::Relaxed);

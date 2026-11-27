@@ -190,6 +190,12 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// 仅在分页列表确已入队且信号提交成功后调用，不代表绘制已完成。
+pub(crate) fn note_paged_submission(draws: u64, dispatches: u64) {
+    if draws != 0 { DRAWN.fetch_add(draws, Ordering::Relaxed); }
+    if dispatches != 0 { DISPATCHED.fetch_add(dispatches, Ordering::Relaxed); }
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory. What shaders write through a root UAV goes back

@@ -990,8 +990,10 @@ float4 pixel() : SV_Target0 {
     }
     title.record_page_draw(draw);
     title.close();
+    let previously_submitted = crate::draw::drawn();
     let stats = host.execute_paged_title(heap, &mut backing, &[&title]).unwrap();
     assert_eq!((stats.uploaded, stats.downloaded), (1, 1));
+    assert!(crate::draw::drawn() > previously_submitted, "分页绘制入队后应更新计数");
     assert_eq!(target_state.state.load(Ordering::Acquire), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
 
     // The completed draw must have restored the recorded copy-source state.

@@ -122,6 +122,9 @@ pub(crate) struct ResourcePlan {
     pending: BTreeMap<(usize, Option<u32>), (Arc<HostTexture>, Version)>,
     #[cfg(feature = "paged-title")]
     pub(crate) section_texture_read: bool,
+    // 已编码而未提交的批次计数；提交成功前不得发布。
+    pub(crate) encoded_draws: u64,
+    pub(crate) encoded_dispatches: u64,
     #[cfg(feature = "paged-title")]
     pub(crate) unclassified_native_write: bool,
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
