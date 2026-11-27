@@ -2117,6 +2117,9 @@ fn barrier<'a>(
 }
 
 #[cfg(all(test, feature = "paged-title"))]
+mod linear_read_tests;
+
+#[cfg(all(test, feature = "paged-title"))]
 #[test]
 fn discarded_partial_color_clear_blocks_shared_texture_read() {
     use crate::page_draw::{ColorClear, ColorTarget};

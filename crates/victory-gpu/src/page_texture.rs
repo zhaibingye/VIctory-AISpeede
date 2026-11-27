@@ -526,6 +526,11 @@ impl TextureInput {
                 if !extended_color_support(host, input.format) {
                     return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
                 }
+                #[cfg(feature = "paged-title")]
+                if copy.uses_unproven_alias_backing() {
+                    let texture = read_shared_texture(batch, plan, input.rows()?, |_| input.encode(host, list, batch))?;
+                    return Ok((texture, input.format));
+                }
                 Ok((input.encode(host, list, batch)?, input.format))
             }
             Self::Native { copy, format, exact_backing, depth_plane, compatible_input } => {
@@ -605,6 +610,21 @@ fn checked_texture_footprint(host: &Host, desc: D3D12_RESOURCE_DESC)
         return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
     }
     Ok((footprint, total))
+}
+
+/// 先逐段核实本次提交固定的物理后备；编码成功才登记读取，供提交前的写者门禁检查。
+#[cfg(feature = "paged-title")]
+fn read_shared_texture<T>(
+    batch: &PinnedBatch, plan: &mut crate::page_resource::ResourcePlan,
+    spans: impl Iterator<Item = (u64, u64)>,
+    encode: impl FnOnce(&mut crate::page_resource::ResourcePlan) -> Result<T, BatchError>,
+) -> Result<T, BatchError> {
+    for span in spans {
+        batch.verify_independent_texture_backing(span)?;
+    }
+    let result = encode(plan)?;
+    plan.section_texture_read = true;
+    Ok(result)
 }
 
 /// 精确描述共享纹理的有效字节，不判断哪份数据更新，也不授予读写权威。
@@ -782,13 +802,10 @@ impl SharedTextureBytes {
         &self, host: &Host, list: &HostList, batch: &PinnedBatch,
         plan: &mut crate::page_resource::ResourcePlan, copy: &std::sync::Arc<crate::resource::HostTexture>,
     ) -> Result<(), BatchError> {
-        for span in self.ranges() {
-            batch.verify_independent_texture_backing(span)?;
-        }
-        plan.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
-        self.transfer(host, list, batch, &copy.texture, None)?;
-        plan.section_texture_read = true;
-        Ok(())
+        read_shared_texture(batch, plan, self.ranges(), |plan| {
+            plan.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
+            self.transfer(host, list, batch, &copy.texture, None)
+        })
     }
 
     /// 调用方保证上传/读回所需状态；只交换有效行，不覆盖来宾填充字节。

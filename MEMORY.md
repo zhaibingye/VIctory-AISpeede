@@ -8,7 +8,7 @@
 
 ## 当前实机阻塞
 
-- `13eee34` 在 6 GB 显存 Windows 机上触发 `draw` 索引 15 的 `MissingTextureContent`：slot 0 / subresource 0，格式 29，3840×2160×1，1 mip，`reads_old_color=true`。新证据是未记录同键前代、没有已识别的兼容字节来源；失败前缀无同对象或虚拟范围重叠的原生写入。索引 14 增强纹理屏障未声明弃旧。这不排除更早的提交、不同 VA 的物理别名或字节来源。
+- 最近实机包 `94861f1` 通过开场 XMem 准入，按 A 后仍在 draw 15 编码时首次拒绝；不是新的可玩基线。`13eee34` 在 6 GB 显存 Windows 机上触发 `draw` 索引 15 的 `MissingTextureContent`：slot 0 / subresource 0，格式 29，3840×2160×1，1 mip，`reads_old_color=true`。新证据是未记录同键前代、没有已识别的兼容字节来源；失败前缀无同对象或虚拟范围重叠的原生写入。索引 14 增强纹理屏障未声明弃旧。这不排除更早的提交、不同 VA 的物理别名或字节来源。
 - `b40a245` 手动按 A 复现同一首错。`[VNME_PREFIX_COPY_INVENTORY]` 中来宾字节复制、显式纹理上传和纹理复制均为零；只涵盖**失败且未提交**批次的已编码前缀。`[VNME_NATIVE_WRITE_HISTORY]` 在拒绝点识别到目标 510 个物理页；保留的 128 个 Fence 内，256 个原生写入候选均归类为默认私有堆，未发现同对象、VA 重叠或共页；另有 600 个 Fence 的候选已淘汰。两次定时模拟 A 未触发首错，不能算通过；复现以可见继续提示时的手动输入为准。
 - `3a63016` 手动复现同一首错。目标 510 页均为 XMem section，布局线索为 `SW_64KB_R_X`（27）；2,248 个原生写入 Fence 压缩为两组，未淘汰，成员均是默认私有堆候选；`[VNME_BYTE_WRITE_HISTORY]` 保留 10 个已完成的分页 GPU 写回页，目标命中为零，无跳过或淘汰。未观测的写入路径仍可能存在。
 - `[VNME_DSTORAGE_WRITE_HISTORY]` 新增 CPU 侧证据：物理分段的身份取自写侧保活的 `Slice`，成功只记实际写入长度，原地失败仅记可能写过，裸 VA 只计未归属次数。与原生、GPU 字节历史共用一份目标快照；不回查历史 VA，不读取游戏内容。其他 CPU 写入、布局和当前权威仍须独立证明。`R_X` 已有分配尺寸计算，但生产路径没有适用于该目标的逐 texel 寻址证明，不能当作线性数据。
@@ -33,9 +33,13 @@
 
 - 共享体纹理 UAV 虽是输出，`ShaderTextureUav::prepare` 仍要从固定页预填充整面，以保留着色器未写的 texel。它与共享 SRV 同走 `SharedTextureBytes::gather_into`：逐有效区间验证独立后备，登记共享读取，交给提交门禁检查未分类原生写者。`verify_shared_volume` 只检查本条派发的视图与范围，不能代替这两项。`page_uav::prefill_tests` 有同页双 VA 不同宿主对象、后续 W 分片来源未证的反例。这条规则不为 R_X 颜色目标提供旧色。
 
+- `TextureInput::Linear` 也可由地址式资源的 SRV 选中，不能从 `Linear` 推断后备私有。带外部别名的线性采样逐行验证有效字节（不含 pitch 填充），与分块 SRV/UAV 共用读取登记。`page_queue::linear_read_tests` 走描述符选择和实际提交门禁：不同宿主对象、不同 VA 的清除与读取可以指向同一固定页；仅查读者自身原生版本会漏冲突。无写者且无历史冲突时仍可读取。
+
 - 已完成 Fence 的物理页写回也不能按整页认领：`title_backing::merge_page` 只写提交前像与 GPU 回读的差异及显式覆盖的并集，即使两者分成很多段。整页读改写会回写未归 GPU 的间隙，既可能丢失并行 CPU 更新，也可能因间隙不可写而失败。`title_backing::writeback_tests` 用夹在可写片段之间的只读宿主页区分两条路径。只保证不触及间隙，不裁决 CPU/GPU 对同一字节的冲突。
 
 ## 已有的受限字节转换
+
+- HLE `modules/xg.rs::layout` 输出的是 `victory_formats::texture::Texture::new` 建模的 data/depth/stencil plane；该模型没有 DCC 等元数据平面。GPU `resource::texture_layout` 使用同一构造器。因此默认 RTV 的 XG 单 plane、offset 0、与 GPU 计算大小相符，不是主平面无需元数据解释的独立证据。
 
 - `victory_formats::texture::copy_uniform_rx_rgba8_blocks` 只处理独立证明为无压缩主平面的 2D `SW_64KB_R_X`、单层单 mip、单采样、4 字节 texel。按 GFX10 addrlib 的块索引，128×128 个 texel 占一块，块内 XOR 不改变块号。逐块验证全部四字节字相同（含填充）即可恢复紧密行；不同块不必同色。`uniform_rx` 集成测试有六个异色块及末块单字节反例。这不是通用逐像素寻址，未接入生产；510 页的 CPU 零观测不能替代平面描述、提交时的权威快照或同步证明。
 
