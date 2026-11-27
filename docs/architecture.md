@@ -36,6 +36,7 @@
 | `victory-loader` | 准备、映射、绑定并启动游戏程序 |
 | `victory-hle` | 实现主机 API，管理允许直通的宿主 API |
 | `victory-gpu` | 将 D3D12.X 对象、命令列表和 GPU 内存操作映射到宿主 D3D12 |
+| `victory-memory` | 来宾页与物理身份、内存预算、驻留、一致性及队列时间线 |
 | `victory-shader` | 将 Xbox 着色器容器里的程序翻译为宿主着色器 |
 | `victory-formats` | GPU 纹理布局（大小、分块和解块）、BCPack 和音频编解码 |
 | `victory-pipeline` | 通用转换接口与按内容寻址的缓存 |
@@ -70,7 +71,8 @@
 
 ## GPU 内存与提交
 
-[统一内存引擎](unified-memory-engine.md)记录了物理页、别名、资源驻留、提交和同步的设计与验收边界。
+[VNME 第三代架构与开发路线](vnme.md)记录物理页、别名、资源驻留、提交和同步的现行设计与验收边界。
+[旧统一内存文档](unified-memory-engine.md)仅供回查演进历史。
 开发中的 `paged-title` 路径只接收能按明确语义交给宿主 GPU 的命令。未覆盖的命令会报告拒绝原因，不会跳过绘制或伪造同步完成。静态编译通过不等于游戏已能进入主菜单。
 
 ## 着色器翻译
