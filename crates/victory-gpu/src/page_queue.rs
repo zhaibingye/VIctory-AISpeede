@@ -695,46 +695,6 @@ fn prefix_operations_keep_order_and_bound_output() {
     assert_eq!(recent[PREFIX_OP_LIMIT - 1], (PREFIX_OP_LIMIT + 1, "enhanced global UAV barrier"));
 }
 
-#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-fn is_draw_15_alpha_probe_target(index: usize, error: &BatchError) -> bool {
-    use crate::page_slabs::TextureContentUse;
-    // Zero-based PageOp index, not an ordinal among draws.
-    index == 15 && matches!(error, BatchError::MissingTextureContent {
-        usage: TextureContentUse::ColorTarget { slot: 0, subresource: 0 },
-        format: 29,
-        extent: (3840, 2160, 1),
-        mip_levels: 1,
-    })
-}
-
-#[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
-#[test]
-fn draw_15_alpha_probe_matches_only_the_color_content_rejection() {
-    use crate::page_slabs::TextureContentUse;
-    let missing = |slot, subresource, format, extent, mip_levels| BatchError::MissingTextureContent {
-        usage: TextureContentUse::ColorTarget { slot, subresource }, format, extent, mip_levels,
-    };
-    let extent = (3840, 2160, 1);
-    let exact = missing(0, 0, 29, extent, 1);
-    assert!(is_draw_15_alpha_probe_target(15, &exact));
-    assert!(!is_draw_15_alpha_probe_target(14, &exact));
-    for other in [
-        BatchError::TargetNotInitialized,
-        BatchError::MissingTextureContent {
-            usage: TextureContentUse::ShaderRead { root: 0, index: 0 },
-            format: 29, extent, mip_levels: 1,
-        },
-        missing(1, 0, 29, extent, 1),
-        missing(0, 1, 29, extent, 1),
-        missing(0, 0, 28, extent, 1),
-        missing(0, 0, 29, (3840, 1080, 1), 1),
-        missing(0, 0, 29, (3840, 2160, 2), 1),
-        missing(0, 0, 29, extent, 2),
-    ] {
-        assert!(!is_draw_15_alpha_probe_target(15, &other));
-    }
-}
-
 /// 只在颜色目标缺少内容的失败路径上回查，不把候选写入当作权威。
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 fn trace_missing_color(
@@ -749,15 +709,6 @@ fn trace_missing_color(
     let PageOp::Draw(draw) = &ops[index] else { return; };
     let Some((target, bound_subresource)) = draw.color_binding(slot) else { return; };
     if subresource != bound_subresource { return; }
-    static DRAW_15_ALPHA_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if is_draw_15_alpha_probe_target(index, error)
-        && crate::page_inventory::enabled() && tracing::enabled!(tracing::Level::INFO)
-        && !DRAW_15_ALPHA_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        let result = draw.probe_pixel_alpha();
-        tracing::info!(index, slot, subresource, ?result,
-            "[VNME_PIXEL_ALPHA] 仅分析与实际宿主 PS 字节一致的重译 DXIL；结论只约束执行后存活的 SV_Target0.a 导出，不证明有样本写入、覆盖率或目标依赖");
-    }
     draw.trace_color_coverage_inputs(slot);
     let capture = crate::page_resource::ResourcePlan::trace_color_native_history(target, subresource);
     if let Some(capture) = &capture {

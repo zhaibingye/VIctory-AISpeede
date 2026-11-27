@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use super::{PixelAlphaProbe, UserData};
+use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_STRIDES, flags};
@@ -105,22 +105,10 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_page_access(parts, false)
 }
 
-#[cfg(any(test, all(windows, feature = "host")))]
-pub(crate) fn lower_page_access(
-    parts: &Parts,
-    raw_page_uav_reads: bool,
-) -> Result<Lowered, ShaderError> {
-    lower_page_access_impl(parts, raw_page_uav_reads, None)
-}
-
 /// Uses the writable member of each page pair for loads as well as stores
 /// when the renderer owns pages in native UAV slabs.
-pub(super) fn lower_page_access_impl(
-    parts: &Parts,
-    raw_page_uav_reads: bool,
-    mut probe: Option<&mut PixelAlphaProbe>,
-) -> Result<Lowered, ShaderError> {
-    let result = lower_mode(parts, false, raw_page_uav_reads, probe.as_deref_mut());
+pub(crate) fn lower_page_access(parts: &Parts, raw_page_uav_reads: bool) -> Result<Lowered, ShaderError> {
+    let result = lower_mode(parts, false, raw_page_uav_reads);
     if let Err(ShaderError::Unsupported { what, .. }) = &result
         && matches!(
             *what,
@@ -141,21 +129,15 @@ pub(super) fn lower_page_access_impl(
             },
             true,
             raw_page_uav_reads,
-            probe,
         );
     }
     result
 }
 
-fn lower_mode(
-    parts: &Parts,
-    whole_wave: bool,
-    raw_page_uav_reads: bool,
-    mut probe: Option<&mut PixelAlphaProbe>,
-) -> Result<Lowered, ShaderError> {
+fn lower_mode(parts: &Parts, whole_wave: bool, raw_page_uav_reads: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, whole_wave, raw_page_uav_reads).run(probe.as_deref_mut()) {
+        match Lower::new(parts, &bad, whole_wave, raw_page_uav_reads).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -1344,7 +1326,7 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
-    fn run(mut self, probe: Option<&mut PixelAlphaProbe>) -> Result<Lowered, Stop> {
+    fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1436,14 +1418,6 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
-        // Successful attempts alone reach the finished CFG. Inspect it
-        // before finish adds container metadata and consumes the module.
-        #[cfg(feature = "diagnostics")]
-        if let Some(result) = probe {
-            *result = self.probe_pixel_alpha();
-        }
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = probe;
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -1476,38 +1450,6 @@ impl<'a> Lower<'a> {
             user_data,
             samplers: self.samplers,
         })
-    }
-
-    #[cfg(feature = "diagnostics")]
-    fn probe_pixel_alpha(&self) -> PixelAlphaProbe {
-        if !self.s.pixel {
-            return PixelAlphaProbe::Unknown;
-        }
-        let outputs = &self.s.outputs;
-        let mut targets = outputs
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.kind == 16 && e.index == 0);
-        let Some((id, target)) = targets.next() else {
-            return PixelAlphaProbe::Unknown;
-        };
-        // Only accept the ordinary float4 MRT0 signature. The semantic
-        // index, register row, and DXIL element id need not be the same.
-        // In this layout the DXIL column for alpha is 3, in element row 0.
-        if targets.next().is_some()
-            || !target.name.eq_ignore_ascii_case("SV_Target")
-            || target.row != Some(0)
-            || target.comp != 9
-            || target.half
-            || (target.col, target.cols) != (0, 4)
-            || outputs
-                .iter()
-                .enumerate()
-                .any(|(i, e)| i != id && e.row == Some(0))
-        {
-            return PixelAlphaProbe::Unknown;
-        }
-        self.s.m.probe_pixel_alpha(id as u32, 3)
     }
 
     fn exported_out(&self, b: usize) -> bool {

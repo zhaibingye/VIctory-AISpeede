@@ -447,8 +447,6 @@ pub(crate) struct ClosedDraw {
     targets: Vec<ColorTarget>,
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     diagnostic_color_blend: Option<Arc<D3D12_BLEND_DESC>>,
-    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-    diagnostic_pixel_shader: Option<Arc<crate::pipeline::Shader>>,
     color_writes: u8,
     #[cfg(feature = "paged-title")]
     color_destination_reads: u8,
@@ -510,14 +508,6 @@ impl ClosedDraw {
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     pub(crate) fn color_binding(&self, slot: usize) -> Option<(&Arc<HostTexture>, u32)> {
         self.targets.get(slot).map(|t| (&t.copy, t.sub.index))
-    }
-
-    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-    pub(crate) fn probe_pixel_alpha(&self) -> victory_shader::emit::PixelAlphaProbe {
-        self.diagnostic_pixel_shader.as_ref().map_or(
-            victory_shader::emit::PixelAlphaProbe::UnverifiedDxil,
-            |shader| shader.probe_pixel_alpha(),
-        )
     }
 
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
@@ -619,8 +609,6 @@ impl ClosedDraw {
             pipeline, root, targets: vec![target], color_writes: 1, depth: None, depth_tests: 0, depth_writes: 0, stencil_ref: 0, topology, viewport, scissor, inputs, call,
             #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
             diagnostic_color_blend: None,
-            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-            diagnostic_pixel_shader: None,
             shader: ShaderBindings::default(),
             #[cfg(feature = "paged-title")]
             color_destination_reads: 0,
@@ -715,14 +703,6 @@ impl ClosedDraw {
             targets, color_writes: pipeline.closed_color_writes,
             #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
             diagnostic_color_blend: pipeline.diagnostic_color_blend.clone(),
-            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-            diagnostic_pixel_shader: if crate::page_inventory::enabled() {
-                // The graphics PSO's PS bytecode is code(1) of these same stages.
-                pipeline.stages.get(1).filter(|stage| stage.shader.stage == "pixel")
-                    .map(|stage| Arc::clone(&stage.shader))
-            } else {
-                None
-            },
             #[cfg(feature = "paged-title")]
             color_destination_reads: pipeline.closed_color_destination_reads,
             #[cfg(all(feature = "paged-title", feature = "diagnostics"))]

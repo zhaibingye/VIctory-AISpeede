@@ -7,9 +7,6 @@
 
 use std::collections::HashMap;
 
-#[cfg(feature = "diagnostics")]
-mod pixel_alpha;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
 

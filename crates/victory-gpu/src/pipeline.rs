@@ -114,22 +114,6 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
-    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-    pub(crate) fn probe_pixel_alpha(&self) -> victory_shader::emit::PixelAlphaProbe {
-        use victory_shader::emit::{Options, PixelAlphaProbe, probe_pixel_alpha};
-        // Only use a translation already present when the host PSO was created.
-        let Some(translated) = self.translated.get().and_then(Option::as_ref) else {
-            return PixelAlphaProbe::UnverifiedDxil;
-        };
-        // Match shader_cache::host_shader's paged-title options; the probe
-        // itself checks the regenerated DXIL against these bound bytes.
-        probe_pixel_alpha(
-            &self.container,
-            Options { view_marks: false, ..Default::default() },
-            &translated.host.dxil,
-        )
-    }
-
     pub(crate) fn static_view_slots(
         &self,
     ) -> Result<&[victory_shader::emit::StaticViewSlot], victory_shader::emit::StaticViewFailure> {
