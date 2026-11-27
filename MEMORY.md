@@ -11,7 +11,7 @@
 - `13eee34` 在 6 GB 显存 Windows 机上触发 `draw` 索引 15 的 `MissingTextureContent`：slot 0 / subresource 0，格式 29，3840×2160×1，1 mip，`reads_old_color=true`。新证据是未记录同键前代、没有已识别的兼容字节来源；失败前缀无同对象或虚拟范围重叠的原生写入。索引 14 增强纹理屏障未声明弃旧。这不排除更早的提交、不同 VA 的物理别名或字节来源。
 - `b40a245` 手动按 A 复现同一首错。`[VNME_PREFIX_COPY_INVENTORY]` 中来宾字节复制、显式纹理上传和纹理复制均为零；只涵盖**失败且未提交**批次的已编码前缀。`[VNME_NATIVE_WRITE_HISTORY]` 在拒绝点识别到目标 510 个物理页；保留的 128 个 Fence 内，256 个原生写入候选均归类为默认私有堆，未发现同对象、VA 重叠或共页；另有 600 个 Fence 的候选已淘汰。两次定时模拟 A 未触发首错，不能算通过；复现以可见继续提示时的手动输入为准。
 - `3a63016` 手动复现同一首错。目标 510 页均为 XMem section，布局线索为 `SW_64KB_R_X`（27）；2,248 个原生写入 Fence 压缩为两组，未淘汰，成员均是默认私有堆候选；`[VNME_BYTE_WRITE_HISTORY]` 保留 10 个已完成的分页 GPU 写回页，目标命中为零，无跳过或淘汰。未观测的写入路径仍可能存在。
-- `[VNME_DSTORAGE_WRITE_HISTORY]` 新增 CPU 侧证据：物理分段的身份取自写侧保活的 `Slice`，成功只记实际写入长度，原地失败仅记可能写过，裸 VA 只计未归属次数。与原生、GPU 字节历史共用一份目标快照；不回查历史 VA，不读取游戏内容。其他 CPU 写入、布局和当前权威仍须独立证明。`R_X` 已有分配尺寸计算，现有代码无逐 texel 寻址，不能当作线性数据。
+- `[VNME_DSTORAGE_WRITE_HISTORY]` 新增 CPU 侧证据：物理分段的身份取自写侧保活的 `Slice`，成功只记实际写入长度，原地失败仅记可能写过，裸 VA 只计未归属次数。与原生、GPU 字节历史共用一份目标快照；不回查历史 VA，不读取游戏内容。其他 CPU 写入、布局和当前权威仍须独立证明。`R_X` 已有分配尺寸计算，但生产路径没有适用于该目标的逐 texel 寻址证明，不能当作线性数据。
 
 - `267f353` 仍复现同一首错；DirectStorage 未记录直接物理页写入，却观测到 9,896 次未归属的裸 VA 写入。这不是排除 DirectStorage 的证据。后续 `[VNME_DSTORAGE_VA_WRITE_HISTORY]` 将写前/写后目标页身份与 VA 范围独立比较：映射快照有采样限额，相同端点不证明中途未重绑。`[VNME_PREFIX_BYTE_INVENTORY]` 对照首错前已编码的 GPU 字节写入计划，不把未提交的命令说成已写入。
 
@@ -31,6 +31,8 @@
 ## 已有的受限字节转换
 
 - `victory_formats::texture::copy_uniform_rx_rgba8_blocks` 只处理独立证明为无压缩主平面的 2D `SW_64KB_R_X`、单层单 mip、单采样、4 字节 texel。按 GFX10 addrlib 的块索引，128×128 个 texel 占一块，块内 XOR 不改变块号。逐块验证全部四字节字相同（含填充）即可恢复紧密行；不同块不必同色。`uniform_rx` 集成测试有六个异色块及末块单字节反例。这不是通用逐像素寻址，未接入生产；510 页的 CPU 零观测不能替代平面描述、提交时的权威快照或同步证明。
+
+- `copy_gfx10_1pipe_rx_rgba8` 可恢复非均匀块，但只实现公开 GFX10 非 RB+、单 pipe、256 B interleave、`pipeBankXor=0` 的上述主平面。在 `gfx10_rx` 夹具中，`Addr2ComputeSurfaceAddrFromCoord` 对同一幅 259×131 合成图的 texel (63,64) 在 1 和 2 pipe 下分别给出平面内字节偏移 `0x6a8c` 与 `0x6b8c`。布局码、行距、格式和大小不能选出方程。该函数不改变 `Layout::addressable()`，不用于判断游戏配置或旧色权威。
 
 ## 最小验证
 

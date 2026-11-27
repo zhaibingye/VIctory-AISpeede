@@ -240,7 +240,7 @@ fn pattern(kind: usize, element_log2: u32, block_log2: u32) -> [Vec<u32>; 3] {
     axes
 }
 
-/// Byte offsets inside a block for coordinates 0..2^bits of one axis.
+/// Scatter the low coordinate bits of one axis into the specified offset bits.
 fn spread(bits: &[u32]) -> Vec<u32> {
     (0..1u32 << bits.len())
         .map(|c| {
@@ -754,7 +754,95 @@ pub fn copy_uniform_rx_rgba8_blocks(
     data: &[u8],
     rows: &mut [u8],
 ) -> Result<(), Error> {
-    const SIDE: usize = 128;
+    let plane = rx_rgba8_plane(layout, data, rows)?;
+    // Finish the proof on the whole snapshot before writing even the first row.
+    for block in plane.blocks {
+        if block[1..].iter().any(|word| *word != block[0]) {
+            return Err(Error::Unsupported);
+        }
+    }
+    plane.copy_spans(|block, _, span| span.fill(block[0]));
+    Ok(())
+}
+
+/// Copies a GFX10 non-RB+ `SW_64KB_R_X` main plane to tightly packed RGBA8 rows.
+/// This is one explicit configuration, not generic GFX10 or console addressing:
+/// the caller must independently establish **non-RB+ GFX10, one pipe, 256-byte
+/// pipe interleave, `pipeBankXor = 0`**, and that `source` starts at mip 0 of the
+/// single-mip, single-slice, single-sample/fragment 2D plane with the canonical
+/// pitch. The snapshot must contain authoritative uncompressed RGBA8 texels,
+/// not data requiring compression/clear metadata.
+/// [`Layout`] verifies the geometry, not the hardware, format or snapshot provenance.
+///
+/// In AMD PAL's [GFX10 addrlib](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10addrlib.cpp),
+/// `HwlInitGlobalParams` leaves `m_colorBaseIndex` at zero for this configuration.
+/// `GetSwizzlePatternInfo` adds `log2(4)` to select
+/// [`GFX10_SW_64K_R_X_1xaa_PATINFO[2]`](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10SwizzlePattern.h#L586-L592):
+/// one component, nibble indices `(2, 3, 3, 0)`. `ConvertSwizzlePatternToEquation`
+/// and the single-fragment branch of `ComputeSurfaceAddrFromCoordMacroTiled`
+/// use the 16-bit block offset with byte `x` (`texel_x << 2`). Bits 0..1 select
+/// the byte in the texel; bits 2..15, low first, select
+/// `x0 x1 y0 y1 y2 x2 y3 x3 y4 x4 y5 x5 y6 x6` in *texel* coordinates.
+/// With slice, mip offsets and pipe/bank XOR all zero, the byte address is
+/// `65536 * ((y / 128) * (pitch / 128) + x / 128) + block_offset`.
+///
+/// Requires the entire padded input plane and `width * height * 4` output bytes.
+/// Extra source bytes are ignored; extra destination bytes are untouched. Returns
+/// [`Error::Unsupported`] for out-of-scope descriptions, [`Error::Invalid`] for
+/// malformed layouts, or [`Error::TooSmall`] for short buffers, before any write.
+/// Does not enable [`Layout::offset`] or [`Layout::detile`] for XOR modes.
+pub fn copy_gfx10_1pipe_rx_rgba8(
+    layout: &Layout,
+    source: &[u8],
+    destination: &mut [u8],
+) -> Result<(), Error> {
+    let plane = rx_rgba8_plane(layout, source, destination)?;
+    // Word indices (the two byte-select bits are omitted). Each coordinate bit
+    // selects exactly one offset bit, so the X and Y contributions are disjoint.
+    static AXES: OnceLock<[Vec<u32>; 2]> = OnceLock::new();
+    let [xs, ys] = AXES.get_or_init(|| {
+        [
+            spread(&[0, 1, 5, 7, 9, 11, 13]),
+            spread(&[2, 3, 4, 6, 8, 10, 12]),
+        ]
+    });
+    plane.copy_spans(|block, y, span| {
+        let y_offset = ys[y];
+        for (pixel, x_offset) in span.iter_mut().zip(xs) {
+            *pixel = block[(y_offset | x_offset) as usize];
+        }
+    });
+    Ok(())
+}
+
+const RX_SIDE: usize = 128;
+type RxBlock = [[u8; 4]; RX_SIDE * RX_SIDE];
+
+struct RxPlane<'a> {
+    blocks: &'a [RxBlock],
+    pixels: &'a mut [[u8; 4]],
+    blocks_per_row: usize,
+    width: usize,
+}
+
+impl RxPlane<'_> {
+    // Present only visible texels. Every span starts at local x = 0; only
+    // the final span of a row can be shorter than the full block width.
+    fn copy_spans(self, mut copy: impl FnMut(&RxBlock, usize, &mut [[u8; 4]])) {
+        for (y, row) in self.pixels.chunks_exact_mut(self.width).enumerate() {
+            for (bx, span) in row.chunks_mut(RX_SIDE).enumerate() {
+                let block = &self.blocks[(y / RX_SIDE) * self.blocks_per_row + bx];
+                copy(block, y % RX_SIDE, span);
+            }
+        }
+    }
+}
+
+fn rx_rgba8_plane<'a>(
+    layout: &Layout,
+    data: &'a [u8],
+    rows: &'a mut [u8],
+) -> Result<RxPlane<'a>, Error> {
     let d = &layout.desc;
     if d.swizzle != Swizzle::SW_64KB_R_X
         || d.dimension != Dimension::Tex2d
@@ -778,23 +866,13 @@ pub fn copy_uniform_rx_rgba8_blocks(
     let rows = rows.get_mut(..output_size).ok_or(Error::TooSmall)?;
 
     // The canonical plane is made up of complete blocks, including at the edges.
-    // Finish the proof on the whole snapshot before writing even the first row.
     let words = plane.as_chunks::<4>().0;
-    let blocks = words.as_chunks::<{ SIDE * SIDE }>().0;
-    for block in blocks {
-        if block[1..].iter().any(|word| *word != block[0]) {
-            return Err(Error::Unsupported);
-        }
-    }
-
-    let blocks_per_row = layout.mips[0].pitch as usize / SIDE;
-    let pixels = rows.as_chunks_mut::<4>().0;
-    for (y, row) in pixels.chunks_exact_mut(d.width as usize).enumerate() {
-        for (bx, span) in row.chunks_mut(SIDE).enumerate() {
-            span.fill(blocks[(y / SIDE) * blocks_per_row + bx][0]);
-        }
-    }
-    Ok(())
+    Ok(RxPlane {
+        blocks: words.as_chunks::<{ RX_SIDE * RX_SIDE }>().0,
+        pixels: rows.as_chunks_mut::<4>().0,
+        blocks_per_row: layout.mips[0].pitch as usize / RX_SIDE,
+        width: d.width as usize,
+    })
 }
 
 /// Copy micro-tile runs inline at a known width, or use each run's length for N = 0.
