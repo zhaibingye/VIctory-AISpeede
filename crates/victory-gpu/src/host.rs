@@ -2236,6 +2236,13 @@ impl HostList {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Clear(std::sync::Arc::new(clear))));
     }
 
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn note_page_discard(&self, copy: std::sync::Arc<crate::resource::HostTexture>, whole: bool) {
+        // 只保留弱身份用于比对，不延长纹理及其预算的生命周期。
+        let copy = std::sync::Arc::downgrade(&copy);
+        self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::DiscardNote { copy, whole }));
+    }
+
     pub(crate) fn record_page_clear_depth(&self, clear: crate::page_draw::DepthClear) {
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::ClearDepth(std::sync::Arc::new(clear))));
     }

@@ -45,6 +45,8 @@ pub(crate) enum PageOp {
     Dispatch(std::sync::Arc<crate::page_dispatch::ClosedDispatch>),
     Clear(std::sync::Arc<crate::page_draw::ColorClear>),
     ClearDepth(std::sync::Arc<crate::page_draw::DepthClear>),
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    DiscardNote { copy: std::sync::Weak<crate::resource::HostTexture>, whole: bool },
     Barrier(std::sync::Arc<crate::page_resource::PageBarrier>),
     ClearRaw(std::sync::Arc<crate::page_uav::RawClear>),
     ClearUavTexture(std::sync::Arc<crate::page_uav::TextureClear>),
@@ -202,6 +204,8 @@ impl PageOp {
             Self::Dispatch(_) => "dispatch",
             Self::Clear(_) => "color clear",
             Self::ClearDepth(_) => "depth clear",
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            Self::DiscardNote { .. } => "discard note",
             Self::Barrier(_) => "resource barrier",
             Self::ClearRaw(_) => "buffer UAV clear",
             Self::ClearUavTexture(_) => "texture UAV clear",
@@ -298,7 +302,16 @@ fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError) {
     let mut writers = Vec::new();
     let mut virtual_overlap_ops = 0usize;
     let mut unknown_span_ops = 0usize;
+    let mut last_discard = None;
+    let mut same_discard_count = 0usize;
     for (prior_index, op) in ops[..index].iter().enumerate() {
+        if let PageOp::DiscardNote { copy, whole } = op {
+            if std::ptr::eq(copy.as_ptr(), Arc::as_ptr(target)) {
+                last_discard = Some((prior_index, *whole));
+                same_discard_count += 1;
+            }
+            continue;
+        }
         writers.clear();
         op.writes_native(&mut writers);
         let exact = match op {
@@ -332,6 +345,7 @@ fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError) {
     tracing::info!(
         index, slot, subresource, prior_same_object_ops = mentions, prior_same_object_recent = ?recent,
         prior_virtual_overlap_ops = virtual_overlap_ops, prior_unknown_span_ops = unknown_span_ops,
+        same_discard_count, last_ignored_discard_index_and_whole = ?last_discard,
         known_committed_linear = target.exact_committed_bytes().is_some(),
         known_compatible_source = target.compatible_texture_source().is_some(),
         native_generation_current = target.current_native_generation(),
@@ -380,6 +394,10 @@ impl ClosedTitleBatch {
                 return Err(BatchError::UnloweredList { index, reason: crate::page_slabs::ListRejection::QueryPairing });
             }
         }
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if ops.iter().all(|op| matches!(op, PageOp::DiscardNote { .. })) {
+            ops.clear();
+        }
         Ok(Self(ops))
     }
 
@@ -395,10 +413,14 @@ impl ClosedTitleBatch {
         let mut ordered_colors = Vec::new();
         for op in &self.0 { op.ordered_color_reads(&mut ordered_colors); }
         if !ordered_colors.is_empty() { return false; }
-        self.0.iter().all(|op| matches!(op,
+        self.0.iter().all(|op| match op {
+            #[cfg(feature = "diagnostics")]
+            PageOp::DiscardNote { .. } => true,
             PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
             | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::ResolveTexture(_) | PageOp::Draw(_)
-            | PageOp::Dispatch(_) | PageOp::Input(_) | PageOp::UploadTexture(_) | PageOp::UploadLease(_)))
+            | PageOp::Dispatch(_) | PageOp::Input(_) | PageOp::UploadTexture(_) | PageOp::UploadLease(_) => true,
+            _ => false,
+        })
     }
 
     #[cfg(feature = "paged-title")]
@@ -447,6 +469,8 @@ impl ClosedFootprint {
             PageOp::Draw(_) | PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
             | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::ResolveTexture(_) | PageOp::Input(_) | PageOp::UploadTexture(_)
             | PageOp::UploadLease(_) => true,
+            #[cfg(feature = "diagnostics")]
+            PageOp::DiscardNote { .. } => true,
             PageOp::Dispatch(dispatch) => dispatch.reads_guest_only(),
             PageOp::Copy(_) | PageOp::ClearRaw(_) | PageOp::ReadbackTexture(_) | PageOp::Query(_) | PageOp::PipeWrite(_) => false,
         })
@@ -466,6 +490,8 @@ impl ClosedFootprint {
                     PageOp::PipeWrite(op) => ranges.push(op.span),
                     #[cfg(feature = "paged-title")]
                     PageOp::UploadLease(_) => {},
+                    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+                    PageOp::DiscardNote { .. } => {},
                     #[cfg(feature = "paged-title")]
                     PageOp::Query(op) => {
                         if let QueryOp::Resolve { span, .. } = op.as_ref() { ranges.push(*span); }
@@ -1066,6 +1092,8 @@ impl Host {
                     PageOp::PipeWrite(op) => op.encode(self, list, batch, &mut pipe_timestamp, &mut dirty, targets)?,
                     #[cfg(feature = "paged-title")]
                     PageOp::UploadLease(lease) => { let _ = lease; },
+                    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+                    PageOp::DiscardNote { .. } => {},
                 }
                 Ok(())
             })().map_err(|error| {

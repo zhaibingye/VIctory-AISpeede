@@ -1297,6 +1297,18 @@ unsafe impl Send for Upload {}
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
+/// 只为定位渲染目标首次使用记录被忽略的丢弃；不访问区域指针。
+extern "system" fn discard_resource(this: This, resource: This, region: *const core::ffi::c_void) {
+    #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+    if crate::page_inventory::enabled()
+        && let Some(list) = host_list(this)
+        && let Some(copy) = crate::resource::host_copy(resource)
+    {
+        list.note_page_discard(copy, region.is_null());
+    }
+    let _ = (this, resource, region);
+}
+
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
@@ -1787,7 +1799,7 @@ const METHODS: [(usize, *const ()); 52] = [
 const MORE_METHODS: [(usize, *const ()); 12] = [
     (53, state::clear_unordered_uint as *const ()), // 0x1a8
     (54, state::clear_unordered_float as *const ()), // 0x1b0
-    (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
+    (55, discard_resource as *const ()),            // 0x1b8 DiscardResource
     (28, begin_query as *const ()),                  // 0xe0 BeginQuery
     (29, end_query as *const ()),                  // 0xe8 EndQuery
     (30, resolve_queries as *const ()),             // 0xf0
@@ -1952,14 +1964,14 @@ mod tests {
     /// ClearUnorderedAccessViewUint/Float and DiscardResource come before
     /// the methods newer lists insert: the AMD upscaler calls them there.
     #[test]
-    fn unordered_access_clears_have_the_same_slots_in_both_layouts() {
+    fn unordered_access_clears_and_discard_have_the_same_slots_in_both_layouts() {
         for table in [&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS] {
             assert_eq!(table.0[0x1a8 / 8], state::clear_unordered_uint as *const ());
             assert_eq!(
                 table.0[0x1b0 / 8],
                 state::clear_unordered_float as *const ()
             );
-            assert_eq!(table.0[0x1b8 / 8], ignored_state as *const ());
+            assert_eq!(table.0[0x1b8 / 8], discard_resource as *const ());
         }
     }
 
