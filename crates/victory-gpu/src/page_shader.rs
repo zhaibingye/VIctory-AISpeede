@@ -47,6 +47,10 @@ pub(crate) enum DescriptorSlotReason {
         phase: crate::descriptor::TextureSrvReject,
     },
     UnsupportedBuffer,
+    ScalarBufferView {
+        expected_stride: u32,
+        actual: crate::descriptor::host::BufferViewShape,
+    },
     UnsupportedTextureWrite {
         title_format: Option<u32>, view_format: Option<i32>, view_dimension: Option<i32>,
         phase: crate::page_uav::TextureUavReject,
@@ -540,12 +544,16 @@ impl ShaderBindings {
                                     .ok_or(buffer)?)
                             }
                             StaticViewAccess::ScalarStructuredSrv { stride, .. } => {
-                                let (start, end) = crate::descriptor::host::paged_structured_srv_range(&actual, stride)
-                                    .ok_or(buffer)?;
+                                let unsupported = || reason(DescriptorSlotReason::ScalarBufferView {
+                                    expected_stride: stride,
+                                    actual: crate::descriptor::host::buffer_view_shape(&actual),
+                                });
+                                let (start, end) = crate::descriptor::host::paged_scalar_srv_range(&actual, stride)
+                                    .ok_or_else(unsupported)?;
                                 // SMEM 以字节读取。只为已验证的范围暴露原始视图，
                                 // 不与同槽的向量结构化访问混用。
                                 ClosedView::ScalarStructured(
-                                    BoundedBufferView::new(start, end, false).ok_or(buffer)?, stride,
+                                    BoundedBufferView::new(start, end, false).ok_or_else(unsupported)?, stride,
                                 )
                             }
                             StaticViewAccess::StructuredSrv { stride, .. } => {

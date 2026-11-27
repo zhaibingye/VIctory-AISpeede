@@ -1142,6 +1142,72 @@ pub(crate) fn paged_structured_srv_range(view: &View, stride: u32) -> Option<(u6
     checked_buffer_view(*resource, buffer.FirstElement, buffer.NumElements, stride)
 }
 
+/// 标量 SRV 读取只看字节。允许有明确范围的结构化或原始只读视图，
+/// 包括游戏直接用地址描述的缓冲区。分页批次另外验证地址确有可读后备。
+pub(crate) fn paged_scalar_srv_range(view: &View, stride: u32) -> Option<(u64, u64)> {
+    let (base, size, words): (_, _, &[u32; 10]) = match view {
+        View::Shader(resource, Some(words)) => {
+            let (base, size) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+            (base as u64, size, words)
+        }
+        View::Placed(false, resource, words) if resource[0] == 1 => (
+            u64::from(words[10]) | u64::from(words[11]) << 32,
+            u64::from(resource[4]) | u64::from(resource[5]) << 32,
+            words[..10].try_into().ok()?,
+        ),
+        _ => return None,
+    };
+    let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER
+        || desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+    {
+        return None;
+    }
+    // 安全：视图维度已验证为缓冲区，读取对应的联合体成员。
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    let element = if desc.Format == DXGI_FORMAT_R32_TYPELESS
+        && buffer.StructureByteStride == 0 && buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW
+    {
+        4
+    } else if desc.Format == DXGI_FORMAT_UNKNOWN
+        && buffer.StructureByteStride == stride && buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE
+        && (4..=2048).contains(&stride) && stride.is_multiple_of(4)
+    {
+        stride
+    } else {
+        return None;
+    };
+    checked_buffer_extent(base, size, buffer.FirstElement, buffer.NumElements, element)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BufferViewShape {
+    kind: &'static str,
+    format: Option<u32>,
+    dimension: Option<u32>,
+    stride: Option<u32>,
+    flags: Option<u32>,
+}
+
+pub(crate) fn buffer_view_shape(view: &View) -> BufferViewShape {
+    let (kind, words): (&str, Option<&[u32]>) = match view {
+        View::Shader(_, words) => ("resource_srv", words.as_ref().map(|words| words.as_slice())),
+        View::Placed(false, resource, words) if resource[0] == 1 => ("address_srv_buffer", Some(words)),
+        View::Placed(false, ..) => ("address_srv_other", None),
+        View::Constant(..) | View::NullConstant => ("constant", None),
+        View::Unordered(..) | View::Placed(true, ..) => ("unordered", None),
+        _ => ("other", None),
+    };
+    let buffer = words.filter(|w| w[1] == D3D12_SRV_DIMENSION_BUFFER.0 as u32);
+    BufferViewShape {
+        kind,
+        format: words.map(|w| w[0]),
+        dimension: words.map(|w| w[1]),
+        stride: buffer.map(|w| w[7]),
+        flags: buffer.map(|w| w[8]),
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn paged_structured_srv_uses_the_real_first_record_and_bounds() {
@@ -1157,6 +1223,37 @@ fn paged_structured_srv_uses_the_real_first_record_and_bounds() {
     assert_eq!(paged_structured_srv_range(&view(1, 0, 64), 64), None);
     let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(buffer, 0x10);
     assert_eq!(release(buffer), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn scalar_srv_accepts_exact_address_views_without_reinterpreting_the_layout() {
+    const BASE: u64 = 0x12_2345_0000;
+    let mut resource = [0; 14];
+    resource[0] = 1;
+    resource[4] = 256;
+    let view = |unordered, format, first, count, stride, flags| {
+        let mut words = [0; 16];
+        words[..10].copy_from_slice(&[
+            format, D3D12_SRV_DIMENSION_BUFFER.0 as u32, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0, first, 0, count, stride, flags, 0,
+        ]);
+        words[10] = BASE as u32;
+        words[11] = (BASE >> 32) as u32;
+        View::Placed(unordered, resource, words)
+    };
+    let unknown = DXGI_FORMAT_UNKNOWN.0 as u32;
+    let raw = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+    let raw_flag = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+    let structured = view(false, unknown, 1, 2, 64, 0);
+    let raw_view = view(false, raw, 16, 32, 0, raw_flag);
+    let expected = Some((BASE + 64, BASE + 192));
+    assert_eq!(paged_scalar_srv_range(&structured, 64), expected);
+    assert_eq!(paged_scalar_srv_range(&raw_view, 64), expected);
+    assert_eq!(paged_scalar_srv_range(&structured, 32), None);
+    assert_eq!(paged_scalar_srv_range(&view(false, raw, 16, 64, 0, raw_flag), 64), None);
+    assert_eq!(paged_scalar_srv_range(&view(false, raw, 16, 32, 0, 0), 64), None);
+    assert_eq!(paged_scalar_srv_range(&view(true, unknown, 1, 2, 64, 0), 64), None);
 }
 
 pub(crate) fn paged_structured_uav_range(view: &View, stride: u32) -> Option<(u64, u64)> {
@@ -1177,13 +1274,17 @@ pub(crate) fn paged_structured_uav_range(view: &View, stride: u32) -> Option<(u6
 
 fn checked_buffer_view(resource: usize, first: u64, elements: u32, stride: u32) -> Option<(u64, u64)> {
     let (base, size) = crate::resource::buffer_bytes(resource as crate::object::This)?;
+    checked_buffer_extent(base as u64, size, first, elements, stride)
+}
+
+fn checked_buffer_extent(base: u64, size: u64, first: u64, elements: u32, stride: u32) -> Option<(u64, u64)> {
     let offset = first.checked_mul(u64::from(stride))?;
     let len = u64::from(elements) * u64::from(stride);
     let stop = offset.checked_add(len)?;
-    if len == 0 || stop > size || base.is_null() {
+    if len == 0 || stop > size || base == 0 {
         return None;
     }
-    Some(((base as u64).checked_add(offset)?, (base as u64).checked_add(stop)?))
+    Some((base.checked_add(offset)?, base.checked_add(stop)?))
 }
 
 pub(crate) fn paged_raw_clear(view: &View, values: [u32; 4]) -> Option<crate::page_uav::RawClear> {
