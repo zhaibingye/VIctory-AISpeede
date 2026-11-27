@@ -30,7 +30,9 @@
 
 ## 共享字节读取的生产门禁
 
-- `CapturedUploads::stage` 在拷入第一张页之前，以 `physical::access::try_snapshot` 一次登记整批固定的 section 页，持有到最后一页拷完。`PageWindow` 和 `write_physical` 使用相同物理身份登记完整写窗口；写者等待已有快照退出，新快照遇到相交写者在入队前报 `PhysicalWriterDuringSnapshot`。同址换节不冲突；不能用逐页加锁代替整批保护，否则跨页写的两侧可被拷成两个版本。此协议不覆盖裸 VA、任意来宾 CPU 或原生 GPU 写，不证明 R_X 平面或 draw 15 的旧色。对照见 `xmem::snapshot_tests` 和 `page_queue::paged_copy_snapshot_rejects_physical_writer_before_enqueue`。
+- `CapturedUploads::stage` 在拷入第一张页之前，以 `physical::access::try_snapshot` 一次登记整批固定的 section 页，持有到最后一页拷完。`PageWindow` 和 `write_physical` 使用相同物理身份登记完整写窗口；写者等待已有快照退出，新快照遇到相交写者在入队前报 `PhysicalWriterDuringSnapshot`。同址换节不冲突；不能用逐页加锁代替整批保护，否则跨页写的两侧可被拷成两个版本。此协议不覆盖任意来宾 CPU 或原生 GPU 写，不证明 R_X 平面或 draw 15 的旧色。对照见 `xmem::snapshot_tests` 和 `page_queue::paged_copy_snapshot_rejects_physical_writer_before_enqueue`。
+
+- `paged-title` 的 DirectStorage 裸 VA fill 在整个同步填充（含部分失败）期间持有受管标题视图共享门锁；`XMemMapPhysicalPages` 和 `map_alias` 在独占侧完成拆分、解绑和重映射。原因是只改一页也可能临时卸掉整个宿主视图。填充在门锁内解析**所有**相交 section 页，释放 `PHYSICAL` 才等上传快照；上传拷入不取视图门锁。未知/私有字节不获得 section 身份。多个 fill 可并行，但无关的受管重映射也可能等 I/O。本协议协调写入窗口，不发布像素版本，不能裁决拷入之后的同字节写回。
 
 - `page_resource.rs` 的 `record_write_at_with` 必须将“可能写共享后备”和“可发布整面原生颜色版本”分开。弃旧后只清半面是实际写入，但整面仍为 `Discarded`。`page_queue.rs` 在原生入队前检查本批及此前提交的未分类原生写；拒绝是保守冲突裁决，不是相交证明，更不是旧色生产者。回归 `page_queue::discarded_partial_color_clear_blocks_shared_texture_read` 覆盖本批反例。
 

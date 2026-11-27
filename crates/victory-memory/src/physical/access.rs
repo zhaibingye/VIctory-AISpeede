@@ -103,8 +103,9 @@ impl Drop for Snapshot {
 pub struct Writer(Runs);
 
 /// Runs are (first backing page, number of pages within the extent). Writers
-/// can overlap each other. This may wait for snapshots: callers must not hold
-/// a physical, virtual-page or other mapping lock, or an overlapping snapshot.
+/// can overlap each other. This may wait for snapshots: do not hold an
+/// overlapping snapshot or a lock needed to stage one (including the physical
+/// and virtual-page maps). The raw VA fill's remap gate is not taken by staging.
 pub fn writing(runs: &[(PhysicalPage, usize)]) -> Writer {
     let runs = collect_runs(runs.iter().copied());
     if !runs.is_empty() {

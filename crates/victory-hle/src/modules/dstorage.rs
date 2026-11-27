@@ -960,6 +960,8 @@ fn into_destination(
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
         let probe = victory_gpu::title_backing::probe_dstorage_va_write(at, len);
         let result = {
+            #[cfg(feature = "paged-title")]
+            let _section_writer = super::xmem::raw_va_write(at, len);
             // Raw reads land through the kernel, which does not fault into the
             // GPU side's guard on title buffers; open them first.
             let _writing = victory_gpu::kernel_will_write(at, len);
@@ -1571,6 +1573,45 @@ mod tests {
         assert_eq!(&*window.bytes(), &[0x5a, 0]);
         drop(window);
         assert_eq!(xmem::XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+    }
+
+    #[cfg(feature = "paged-title")]
+    #[test]
+    fn raw_va_fill_excludes_snapshots_even_on_partial_error() {
+        use crate::modules::xmem;
+        use victory_memory::physical::{BackingPins, access::try_snapshot};
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+        let mut handles = [0; 2];
+        let mut n = handles.len();
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut n, handles.as_mut_ptr()), 1);
+        let slot = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | 0x2040_0000, 0, PAGE_READWRITE,
+        );
+        assert!(!slot.is_null());
+        handles.reverse(); // Adjacent VAs, but two different host views in reverse page order.
+        assert_eq!(xmem::XMemMapPhysicalPages(slot, 2, handles.as_ptr()), slot);
+        let at = slot as usize + PAGE - 1;
+        let mut pins = BackingPins::default();
+        xmem::pin_backing(&[(at, at + 2)], &mut pins);
+        let pages = [at, at + 1].map(|v| pins.expected(v).expect("mapped page"));
+        assert_ne!(pages[0], pages[1]);
+        let r = request(0, at as *mut _, 2, std::ptr::null(), 0, 0);
+        let mut blocked = [false; 2];
+        assert_eq!(into_destination(&r, 2, |out| {
+            out[0] = 0x5a;
+            blocked = pages.map(|page| try_snapshot(std::iter::once(page)).err() == Some(page));
+            Err(INVALID_DATA)
+        }), Err(INVALID_DATA));
+        drop(try_snapshot(pages.into_iter()).expect("error releases the whole write claim"));
+        // SAFETY: both adjacent bytes are still mapped; the synchronous fill has returned.
+        assert_eq!(unsafe { (at as *const [u8; 2]).read() }, [0x5a, 0]);
+        assert_eq!(xmem::XMemMapPhysicalPages(slot, 2, std::ptr::null()), slot);
+        assert_eq!(xmem::XMemFreePhysicalPages(n, handles.as_ptr()), 1);
+        // The mapping was split into two placeholders; release each reservation separately.
+        assert_ne!(xmem::private_virtual_free(slot, 0, MEM_RELEASE), 0);
+        assert_ne!(xmem::private_virtual_free(slot.wrapping_byte_add(PAGE), 0, MEM_RELEASE), 0);
+        assert_eq!(blocked, [true; 2]);
     }
 
     #[test]

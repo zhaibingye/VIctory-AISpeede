@@ -59,6 +59,72 @@ fn physical_copy_claims_discontiguous_runs_together_before_writing() {
 }
 
 #[test]
+fn raw_va_write_claims_only_the_touched_pages_of_the_current_section() {
+    const N: usize = 4;
+    let allocate_section = || {
+        let mut numbers = [0usize; N];
+        let mut n = N;
+        assert_eq!(
+            XMemAllocatePhysicalPages(0, &mut n, numbers.as_mut_ptr()),
+            1
+        );
+        assert_eq!(n, N);
+        // Resolve test identities independently of the VA that we'll rebind.
+        let physical = physical();
+        let pages = numbers.map(|number| physical.pages[&number].page(0));
+        (numbers, pages)
+    };
+    let (original, a) = allocate_section();
+    let (replacement, b) = allocate_section();
+    let slot = XMemVirtualAlloc(
+        std::ptr::null_mut(),
+        N * PAGE,
+        MEM_RESERVE | PAGES_64K,
+        0,
+        PAGE_READWRITE,
+    );
+    assert!(!slot.is_null());
+    let dest = slot.wrapping_byte_add(2 * PAGE - 1).cast::<[u8; 2]>();
+    let fill = |numbers: &[usize; N],
+                current: [PhysicalPage; N],
+                other: [PhysicalPage; N],
+                before: [u8; 2],
+                after: [u8; 2]| {
+        assert_eq!(XMemMapPhysicalPages(slot, N, numbers.as_ptr()), slot);
+        let guard = raw_va_write(dest as usize, after.len()).expect("nonempty fill");
+        // Probe the exclusive side used by both managed remap entry points. No
+        // sleep, and no recursive lock acquisition on the fill thread.
+        assert!(std::thread::spawn(|| matches!(
+            TITLE_VIEW_GATE.try_write(), Err(std::sync::TryLockError::WouldBlock)
+        )).join().unwrap());
+        // Check separately: a batch conflict alone wouldn't prove *both* pages are claimed.
+        for page in [current[1], current[2]] {
+            assert_eq!(try_snapshot(std::iter::once(page)).unwrap_err(), page);
+        }
+        let unrelated = try_snapshot([current[0], current[3]].into_iter().chain(other))
+            .expect("untouched pages and the other section must stay available");
+        // SAFETY: the two bytes straddle committed pages in our live view. This test
+        // owns both sections, and the snapshot covers only pages the fill does not touch.
+        unsafe {
+            assert_eq!(dest.read(), before);
+            dest.write(after);
+        }
+        drop(unrelated);
+        drop(guard);
+        drop(try_snapshot(current.into_iter()).expect("completed fill released its pages"));
+    };
+    let marker = [0x53, 0xa7];
+    fill(&original, a, b, [0; 2], marker);
+    fill(&replacement, b, a, [0; 2], [0x19, 0x37]);
+    fill(&original, a, b, marker, [0; 2]);
+
+    assert_eq!(XMemMapPhysicalPages(slot, N, std::ptr::null()), slot);
+    assert_eq!(XMemFreePhysicalPages(N, replacement.as_ptr()), 1);
+    assert_eq!(XMemFreePhysicalPages(N, original.as_ptr()), 1);
+    assert_ne!(private_virtual_free(slot, 0, MEM_RELEASE), 0);
+}
+
+#[test]
 fn page_window_blocks_snapshots_of_both_pinned_pages_but_not_a_rebound_va() {
     const OFFSET: usize = PAGE - 1;
     const MARKER: [u8; 2] = [0x53, 0xa7];

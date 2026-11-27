@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+#[cfg(feature = "paged-title")]
+use std::sync::{RwLock, RwLockReadGuard};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, ERROR_NOT_ENOUGH_MEMORY, GetLastError, HANDLE, INVALID_HANDLE_VALUE, SetLastError,
@@ -628,6 +630,43 @@ impl Physical {
     }
 }
 
+// A raw VA fill may run through I/O or a decoder. Block even unrelated title
+// remaps during that time: unmapping a subrange briefly removes the *whole*
+// host view before remapping its sides. Concurrent fills can share the gate.
+// Both sides take this gate before PHYSICAL. Snapshot readers must never
+// need this gate: they acquire PHYSICAL to stage pages while a writer waits.
+#[cfg(feature = "paged-title")]
+static TITLE_VIEW_GATE: RwLock<()> = RwLock::new(());
+
+#[cfg(feature = "paged-title")]
+#[must_use = "keep the title views and physical writer until the raw write finishes"]
+pub(crate) struct RawVaWrite {
+    _writer: Option<victory_memory::physical::access::Writer>,
+    _views: RwLockReadGuard<'static, ()>,
+}
+
+/// Stabilize the VA, then claim just the section pages intersecting the fill.
+/// Gaps have no physical writer, but cannot become section mappings mid-fill.
+#[cfg(feature = "paged-title")]
+pub(crate) fn raw_va_write(at: usize, len: usize) -> Option<RawVaWrite> {
+    let end = at.saturating_add(len);
+    if at >= end {
+        return None;
+    }
+    let views = TITLE_VIEW_GATE.read().unwrap_or_else(|e| e.into_inner());
+    let runs: Vec<_> = {
+        let physical = physical();
+        physical.views_in(at, end).map(|(base, &(size, ref slice))| {
+            let first = at.saturating_sub(base) / PAGE;
+            let limit = (end - base).min(size).div_ceil(PAGE);
+            (slice.page(first), limit - first)
+        }).collect()
+    };
+    // Never hold PHYSICAL while waiting for snapshots or during the fill.
+    let writer = (!runs.is_empty()).then(|| victory_memory::physical::access::writing(&runs));
+    Some(RawVaWrite { _writer: writer, _views: views })
+}
+
 /// Resolve title ranges once with the mapping lock. The GPU holds the
 /// returned section leases after the OS views or title handles are removed.
 fn remember_private(
@@ -1090,14 +1129,19 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    if n == 0 {
+        return address;
+    }
     let base = address as usize;
-    if n != 0 && (base == 0 || !base.is_multiple_of(PAGE)) {
+    if base == 0 || !base.is_multiple_of(PAGE) {
         return std::ptr::null_mut();
     }
-    let mut physical = physical();
     let Some(len) = n.checked_mul(PAGE).filter(|&len| base.checked_add(len).is_some()) else {
         return std::ptr::null_mut();
     };
+    #[cfg(feature = "paged-title")]
+    let _views = TITLE_VIEW_GATE.write().unwrap_or_else(|e| e.into_inner());
+    let mut physical = physical();
     if !unmap(&mut physical, base, len) {
         return std::ptr::null_mut();
     }
@@ -1166,7 +1210,6 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
-    let mut physical = physical();
     if len == 0 {
         return true;
     }
@@ -1175,6 +1218,9 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     {
         return false;
     }
+    #[cfg(feature = "paged-title")]
+    let _views = TITLE_VIEW_GATE.write().unwrap_or_else(|e| e.into_inner());
+    let mut physical = physical();
     if !unmap(&mut physical, to, len) {
         return false;
     }
