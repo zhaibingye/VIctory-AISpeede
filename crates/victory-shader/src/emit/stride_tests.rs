@@ -574,3 +574,82 @@ fn a_sampler_chosen_by_a_uniform_branch_samples_as_chosen() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+// s0：常量表；s1：动态常量行；s2：输出表。同行的逐分量结果与静态
+// 读取的标记一起写回，确保越界只影响动态读取，不会意外读取第零行。
+const TABLE_CONSTANT_ROW_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0
+    0x7E02_0201, // v_mov_b32 v1, s1
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF420_0504,
+    0xFA00_0000, // s_buffer_load_dword s20, s[8:11], 0
+    0xE038_2000,
+    0x8002_0201, // buffer_load_dwordx4 v[2:5], v1, s[8:11], 0 idxen
+    0xBF8C_0070, // 等待向量和标量内存读取
+    0x7E0C_0214, // v_mov_b32 v6, s20
+    0xE078_0000,
+    0x8004_0200, // buffer_store_dwordx4 v[2:5], s[16:19], 0
+    0xE070_0010,
+    0x8004_0600, // buffer_store_dword v6, s[16:19], 0 offset:16
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn table_constant_dynamic_vector_does_not_wrap_or_read_past_the_view() {
+    let shader = build(
+        TABLE_CONSTANT_ROW_WAVE32,
+        vec![
+            param(RootType::Table, 0),
+            param(RootType::Constants, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![entry(ResourceType::Cbv, 4, 0), entry(ResourceType::Uav, 4, 2)],
+        1,
+    );
+    let first = [11, 12, 13, 14];
+    let last = [21, 22, 23, 24];
+    let mut full = vec![0u32; 16_384];
+    full[..4].copy_from_slice(&first);
+    full[16_380..].copy_from_slice(&last);
+    let short = [11, 12, 13, 14, 25, 26];
+    let neighbor = [0xCAFEu32; 4];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).or_else(|_| Host::new(true)).expect("需要 SM 6.6 实机或 WARP");
+    let (root, pso) = host.compute_pipeline(&shader).expect("创建常量边界测试 PSO");
+    for (data, index, expected) in [
+        (full.as_slice(), 0, first),
+        (&full, 4095, last),
+        (&full, 4096, [0; 4]),
+        (&full, 0x1000_0000, [0; 4]),
+        (&full, u32::MAX, [0; 4]),
+        (&short, 1, [25, 26, 0, 0]),
+    ] {
+        let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.index) {
+                (RootType::Table, 0) => 0,
+                (RootType::Constants, 1) => index,
+                (RootType::Table, 2) => 2,
+                other => panic!("未知绑定 {other:?}"),
+            };
+        }
+        let views = [
+            View::Buffer { data, stride: Stride::Raw },
+            View::Buffer { data: &neighbor, stride: Stride::Raw },
+            View::RawUav(5),
+        ];
+        let words = host.dispatch(
+            &root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(ud))], views: &views, samplers: &[], groups: [1, 1, 1],
+            },
+        ).expect("运行不含游戏数据的常量边界测试");
+        assert_eq!(&words[0][..4], &expected, "索引 {index:#x}");
+        assert_eq!(words[0][4], first[0], "静态读取必须使用同一常量表");
+    }
+}
