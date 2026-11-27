@@ -681,6 +681,7 @@ fn trace_missing_color(
         );
         trace_byte_write_history(index, slot, subresource, &capture.pages);
         crate::title_backing::trace_dstorage_write_history(index, slot, subresource, &capture.pages, target.candidate_guest_span);
+        crate::title_backing::trace_color_section_history(index, slot, subresource, target.candidate_guest_span, &capture.pages);
     }
     plan.trace_color_predecessor(target, subresource);
 

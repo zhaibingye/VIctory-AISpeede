@@ -14,6 +14,12 @@ mod dstorage;
 pub use dstorage::{DstorageVaWrite, note_dstorage_section_write, probe_dstorage_va_write};
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 pub(crate) use dstorage::trace_dstorage_write_history;
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+mod section_history;
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+pub use section_history::{note_xmem_section_mapping, prepare_xmem_section_history};
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+pub(crate) use section_history::trace_color_section_history;
 
 type Range = (usize, usize);
 pub type BackingPinner = fn(&[Range], &mut BackingPins);

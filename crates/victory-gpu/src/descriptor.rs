@@ -7,6 +7,9 @@
 //! leaves room for whatever stride a title assumes.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC;
+
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
@@ -249,14 +252,37 @@ pub(crate) struct RtvRecord {
 const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
+/// Keep the view and its diagnostic origin from the same RTV record. A
+/// description alone (in particular, a default view) cannot identify it.
+#[cfg(windows)]
+#[derive(Default)]
+pub(crate) struct RtvDescription {
+    pub(crate) view: Option<D3D12_RENDER_TARGET_VIEW_DESC>,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) origin: Option<crate::resource::GuestRtvOrigin>,
+}
+
+#[cfg(windows)]
+impl RtvDescription {
+    pub(crate) fn as_ref(&self) -> Option<&D3D12_RENDER_TARGET_VIEW_DESC> {
+        self.view.as_ref()
+    }
+}
+
 impl RtvRecord {
-    /// The view description in the host's type (the same layout).
+    /// The host-compatible description and the guest origin at binding time.
     #[cfg(windows)]
-    pub(crate) fn desc(
-        &self,
-    ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
+    pub(crate) fn desc(&self) -> RtvDescription {
         const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        RtvDescription {
+            view: self.host_desc(TEXTURE_2D),
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            origin: if crate::page_inventory::enabled() {
+                crate::resource::guest_rtv_origin(self.resource)
+            } else {
+                None
+            },
+        }
     }
 
     /// The depth view description in the host's type (the same layout).

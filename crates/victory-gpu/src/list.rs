@@ -1297,6 +1297,24 @@ unsafe impl Send for Upload {}
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
+#[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+static IGNORED_470_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+pub(crate) fn ignored_470_calls() -> u64 {
+    IGNORED_470_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// 只观察已知插槽的调用；不读取未知参数、不改变命令索引或执行。
+extern "system" fn ignored_newer_state_470(this: This) {
+    #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+    if crate::page_inventory::enabled() {
+        IGNORED_470_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(list) = host_list(this) { list.note_ignored_state_470(); }
+    }
+    let _ = this;
+}
+
 /// 传统整面弃旧只支持可验证颜色资源，不访问可选区域指针。
 extern "system" fn discard_resource(this: This, resource: This, region: *const core::ffi::c_void) {
     #[cfg(all(windows, feature = "paged-title"))]
@@ -2023,7 +2041,7 @@ const fn newer_slot(slot: usize) -> usize {
 /// shortcut: 0x470's purpose is unknown; ignored until a title shows it
 /// matters.
 const NEWER_METHODS: [(usize, *const ()); 3] = [
-    (142, ignored_state as *const ()),
+    (142, ignored_newer_state_470 as *const ()),
     (146, barrier_groups as *const ()),
     (148, allocate_upload as *const ()),
 ];

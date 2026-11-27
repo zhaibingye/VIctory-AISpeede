@@ -840,6 +840,51 @@ impl Drop for Backing {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ResourceInitial {
+    State(u32),
+    BarrierLayout(u32),
+    SynthesizedView,
+}
+
+impl ResourceInitial {
+    fn host_state_input(self) -> u32 {
+        // 初始增强布局仍不参与宿主状态跟踪，不把这个 COMMON 当作来宾参数。
+        match self {
+            Self::State(state) => state,
+            Self::BarrierLayout(_) | Self::SynthesizedView => 0,
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeAtGuestCreation {
+    NewWithoutKnownPredecessor,
+    NewAfterExpiredSameKey,
+    ReplacedLiveSameKey,
+    ReusedLiveSameKey,
+}
+
+#[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+struct GuestCreation {
+    initial: ResourceInitial,
+    optimized_clear_supplied: Option<bool>,
+    native: NativeAtGuestCreation,
+}
+
+/// 实际来宾资源对象的创建参数，不从宿主纹理的创建参数逆推。
+#[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GuestRtvOrigin {
+    pub(crate) backing: &'static str,
+    pub(crate) desc_layout: u32,
+    pub(crate) initial_state: Option<u32>,
+    pub(crate) initial_barrier_layout: Option<u32>,
+    pub(crate) optimized_clear_supplied: Option<bool>,
+    pub(crate) native_at_creation: NativeAtGuestCreation,
+}
+
 #[repr(C)]
 struct Resource {
     object: Object,
@@ -847,6 +892,8 @@ struct Resource {
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
+    #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+    guest_creation: Option<GuestCreation>,
     /// Textures also live on the host GPU (decision 0007); buffers do not
     /// yet.
     #[cfg(windows)]
@@ -1436,6 +1483,31 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.clone()
 }
 
+/// 调用方正在解释一个命名此资源的 RTV；只拷贝元数据，不保留资源指针。
+#[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+pub(crate) fn guest_rtv_origin(this: This) -> Option<GuestRtvOrigin> {
+    if this.is_null() { return None; }
+    let resource = resource(this);
+    resource.host.as_ref()?;
+    let creation = resource.guest_creation.as_ref()?;
+    let backing = match resource.backing {
+        Backing::Committed(_) => "committed",
+        Backing::Placed { .. } => "ordinary-placed",
+        Backing::Address(_) if matches!(creation.initial, ResourceInitial::SynthesizedView) => "synthesized-address-view",
+        Backing::Address(_) => "address-style",
+    };
+    let (initial_state, initial_barrier_layout) = match creation.initial {
+        ResourceInitial::State(state) => (Some(state), None),
+        ResourceInitial::BarrierLayout(layout) => (None, Some(layout)),
+        ResourceInitial::SynthesizedView => (None, None),
+    };
+    Some(GuestRtvOrigin {
+        backing, desc_layout: resource.desc.layout, initial_state, initial_barrier_layout,
+        optimized_clear_supplied: creation.optimized_clear_supplied,
+        native_at_creation: creation.native,
+    })
+}
+
 /// 记录拒绝原生读取时已知的线索，不把写入能力或同地址等同于最新版本。
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1588,12 +1660,25 @@ fn shared_texture(
     state: u32,
     clear: *const c_void,
     sparse_prefix: u32,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))] mut creation: Option<&mut GuestCreation>,
 ) -> Option<std::sync::Arc<HostTexture>> {
     let d = host_desc(desc)?;
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
-    let live = key.and_then(|k| map.get(&k)?.upgrade());
+    let prior = key.and_then(|k| map.get(&k));
+    let live = prior.and_then(std::sync::Weak::upgrade);
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    if let Some(creation) = &mut creation {
+        // MEMORY 可能已清理失效条目；缺失只能说未识别前代。
+        creation.native = if live.is_some() {
+            NativeAtGuestCreation::ReplacedLiveSameKey
+        } else if prior.is_some() {
+            NativeAtGuestCreation::NewAfterExpiredSameKey
+        } else {
+            NativeAtGuestCreation::NewWithoutKnownPredecessor
+        };
+    }
     if live.is_none() && key.is_some() && sparse_prefix != 0 {
         use windows::Win32::Graphics::Direct3D12::*;
         // SAFETY: host_desc normalizes the repr(C) resource description.
@@ -1613,6 +1698,10 @@ fn shared_texture(
     if let Some(t) = &live
         && takes(t, &d)
     {
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if let Some(creation) = creation {
+            creation.native = NativeAtGuestCreation::ReusedLiveSameKey;
+        }
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(host) = crate::host::host() {
             // The live texture's own description: `d` may ask for uses its
@@ -2099,12 +2188,13 @@ fn hand_out_resource(
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
-    state: u32,
+    initial: ResourceInitial,
     clear: *const c_void,
     iid: *const Iid,
     out: *mut This,
     sparse_prefix: u32,
 ) -> HRESULT {
+    let state = initial.host_state_input();
     #[cfg(not(windows))]
     let _ = (state, clear, sparse_prefix);
     #[allow(unused_mut)] // the host texture is set on Windows only
@@ -2114,13 +2204,23 @@ fn hand_out_resource(
         heap,
         heap_flags,
         backing,
+        #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+        guest_creation: (desc.dimension != BUFFER && crate::page_inventory::enabled()).then(|| GuestCreation {
+            initial,
+            optimized_clear_supplied: (!matches!(initial, ResourceInitial::SynthesizedView)).then_some(!clear.is_null()),
+            native: NativeAtGuestCreation::NewWithoutKnownPredecessor,
+        }),
         #[cfg(windows)]
         host: None,
     });
     #[cfg(windows)]
     {
         use victory_memory::authority::ByteExposure;
-        resource.host = shared_texture(resource.data() as u64, &desc, state, clear, sparse_prefix);
+        resource.host = shared_texture(
+            resource.data() as u64, &desc, state, clear, sparse_prefix,
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            resource.guest_creation.as_mut(),
+        );
         if let Some(texture) = &resource.host {
             #[cfg(feature = "paged-title")]
             let _ordered = crate::host::host().map(|host| host.direct_queue());
@@ -2267,6 +2367,18 @@ pub(crate) extern "system" fn create_committed(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    committed_resource(heap, heap_flags, desc, ResourceInitial::State(state), clear, iid, out)
+}
+
+fn committed_resource(
+    heap: *const HeapProperties,
+    heap_flags: u32,
+    desc: *const ResourceDesc,
+    initial: ResourceInitial,
+    clear: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     // SAFETY: the title passes both descriptions (null is tolerated).
     let (Some(&heap), Some(&desc)) = (unsafe { (heap.as_ref(), desc.as_ref()) }) else {
         return E_INVALIDARG;
@@ -2290,7 +2402,7 @@ pub(crate) extern "system" fn create_committed(
         heap,
         heap_flags,
         Backing::Committed(memory),
-        state,
+        initial,
         clear,
         iid,
         out,
@@ -2306,11 +2418,11 @@ pub(crate) extern "system" fn create_committed(
 /// copy starts in the common state, as layouts are not tracked.
 #[allow(clippy::too_many_arguments)] // the method's own arguments
 pub(crate) extern "system" fn create_committed3(
-    this: This,
+    _: This,
     heap: *const HeapProperties,
     heap_flags: u32,
     desc: *const ResourceDesc,
-    _layout: u32,
+    layout: u32,
     clear: *const c_void,
     _protected: This,
     _castable_count: u32,
@@ -2318,8 +2430,7 @@ pub(crate) extern "system" fn create_committed3(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    const COMMON: u32 = 0;
-    create_committed(this, heap, heap_flags, desc, COMMON, clear, iid, out)
+    committed_resource(heap, heap_flags, desc, ResourceInitial::BarrierLayout(layout), clear, iid, out)
 }
 
 /// Registered page pools (64 KiB pages the title maps into tiled
@@ -2380,13 +2491,13 @@ pub(crate) extern "system" fn create_at_address(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    address_resource(address, desc, layout, clear, iid, out, 0)
+    address_resource(address, desc, ResourceInitial::BarrierLayout(layout), clear, iid, out, 0)
 }
 
 fn address_resource(
     address: u64,
     desc: ResourceDesc,
-    layout: u32,
+    initial: ResourceInitial,
     clear: *const c_void,
     iid: *const Iid,
     out: *mut This,
@@ -2395,6 +2506,10 @@ fn address_resource(
     if address == 0 {
         return E_INVALIDARG;
     }
+    let layout = match initial {
+        ResourceInitial::BarrierLayout(layout) => layout,
+        _ => 0,
+    };
     tracing::debug!(
         address = format_args!("{address:#x}"),
         dimension = desc.dimension,
@@ -2402,7 +2517,6 @@ fn address_resource(
         layout,
         "按地址绑定的资源"
     );
-    const COMMON: u32 = 0;
     const DEFAULT: HeapProperties = HeapProperties {
         kind: 1,
         cpu_pages: 0,
@@ -2415,7 +2529,7 @@ fn address_resource(
         DEFAULT,
         0,
         Backing::Address(address as *mut u8),
-        COMMON,
+        initial,
         clear,
         iid,
         out,
@@ -2676,7 +2790,7 @@ fn texture_at_inner(
     };
     let mut out = std::ptr::null();
     let made = address_resource(
-        address, d, 0, std::ptr::null(), &RESOURCE_IIDS[0], &mut out, sparse_prefix,
+        address, d, ResourceInitial::SynthesizedView, std::ptr::null(), &RESOURCE_IIDS[0], &mut out, sparse_prefix,
     );
     if made != S_OK {
         return fallback;
@@ -2736,7 +2850,7 @@ pub(crate) extern "system" fn create_placed(
         h.desc.properties,
         h.desc.flags,
         backing,
-        state,
+        ResourceInitial::State(state),
         clear,
         iid,
         out,
@@ -3228,6 +3342,49 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+    #[test]
+    fn rtv_origin_follows_copied_descriptor_not_shared_native_object() {
+        use crate::descriptor::{copy_simple, create_rtv, rtv_record};
+        if !crate::page_inventory::enabled() || crate::host::host().is_none() { return; }
+
+        let auto = ResourceDesc { flags: 1, ..texture(64, 64, 28, 1) };
+        let explicit = ResourceDesc { layout: 0x11b, ..auto };
+        let memory = Memory::new(footprint(&auto).unwrap()).unwrap();
+        let address = memory.address();
+        let null = std::ptr::null();
+        let mut first = null;
+        let mut second = null;
+        let clear = [28u32, 0, 0, 0, 0];
+        assert_eq!(create_at_address(null, address, &auto, 3, null.cast(), &RESOURCE_IIDS[0], &mut first), S_OK);
+        assert_eq!(create_at_address(null, address, &explicit, 5, clear.as_ptr().cast(), &RESOURCE_IIDS[0], &mut second), S_OK);
+        assert!(std::sync::Arc::ptr_eq(&host_copy(first).unwrap(), &host_copy(second).unwrap()));
+
+        let mut slots = [[0u64; 16]; 2];
+        let original = slots[0].as_mut_ptr() as u64;
+        let copied = slots[1].as_mut_ptr() as u64;
+        create_rtv(null, first, null.cast(), original);
+        copy_simple(null, 1, copied, original, 2);
+        create_rtv(null, second, null.cast(), original);
+        let before = rtv_record(copied).unwrap().desc().origin.unwrap();
+        let after = rtv_record(original).unwrap().desc().origin.unwrap();
+        assert_eq!(resource_release(first), 0);
+        assert_eq!(resource_release(second), 0);
+
+        assert!(matches!(before.native_at_creation,
+            NativeAtGuestCreation::NewWithoutKnownPredecessor | NativeAtGuestCreation::NewAfterExpiredSameKey));
+        assert_eq!(before, GuestRtvOrigin {
+            backing: "address-style", desc_layout: 0, initial_state: None,
+            initial_barrier_layout: Some(3), optimized_clear_supplied: Some(false),
+            ..before
+        });
+        assert_eq!(after, GuestRtvOrigin {
+            backing: "address-style", desc_layout: explicit.layout, initial_state: None,
+            initial_barrier_layout: Some(5), optimized_clear_supplied: Some(true),
+            native_at_creation: NativeAtGuestCreation::ReusedLiveSameKey,
+        });
     }
 
     fn heap(size: u64) -> This {

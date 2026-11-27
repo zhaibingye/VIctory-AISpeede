@@ -6,6 +6,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use std::sync::{Arc, atomic::Ordering};
 
+use crate::descriptor::RtvDescription;
 use crate::host::{Host, HostList, transition_subresource};
 #[cfg(all(test, feature = "diagnostics"))]
 use crate::host::transition;
@@ -40,6 +41,8 @@ pub(crate) struct ColorTarget {
     sub: ColorSubresource,
     samples: u32,
     format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    guest_origin: Option<crate::resource::GuestRtvOrigin>,
 }
 
 impl ColorTarget {
@@ -56,13 +59,18 @@ impl ColorTarget {
         if !copy.host_written.load(Ordering::Acquire) {
             return None;
         }
-        Self::capture_candidate(copy, desc)
+        Self::capture_candidate(copy, RtvDescription { view: desc, ..Default::default() })
     }
 
     pub(crate) fn capture_candidate(
         copy: Arc<HostTexture>,
-        desc: Option<D3D12_RENDER_TARGET_VIEW_DESC>,
+        desc: RtvDescription,
     ) -> Option<Self> {
+        let RtvDescription {
+            view: desc,
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            origin: guest_origin,
+        } = desc;
         // SAFETY: the retained COM object is live.
         let tex = unsafe { copy.texture.GetDesc() };
         if copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
@@ -80,7 +88,11 @@ impl ColorTarget {
                 return None;
             }
             let desc = desc.map(|d| D3D12_RENDER_TARGET_VIEW_DESC { Format: tex.Format, ..d });
-            return Some(Self { copy, desc, sub, samples: tex.SampleDesc.Count, format: tex.Format });
+            return Some(Self {
+                copy, desc, sub, samples: tex.SampleDesc.Count, format: tex.Format,
+                #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+                guest_origin,
+            });
         }
         let (mip, slice) = match desc.as_ref() {
             None if tex.DepthOrArraySize == 1 => (0, 0),
@@ -105,7 +117,11 @@ impl ColorTarget {
         if !sub.allows(&copy) || sub.is_scoped() && format != tex.Format {
             return None;
         }
-        Some(Self { copy, desc, sub, samples: 1, format })
+        Some(Self {
+            copy, desc, sub, samples: 1, format,
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            guest_origin,
+        })
     }
 
     fn extent(&self) -> (u64, u32) { (self.sub.width, self.sub.height) }
@@ -432,6 +448,8 @@ pub(crate) struct ClosedDraw {
     color_writes: u8,
     #[cfg(feature = "paged-title")]
     color_destination_reads: u8,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    ignored_state_470_before_draw: u64,
     depth: Option<DepthTarget>,
     depth_tests: u32,
     depth_writes: u32,
@@ -477,6 +495,12 @@ impl ClosedDraw {
     }
 
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn with_ignored_state_470(mut self, calls: u64) -> Self {
+        self.ignored_state_470_before_draw = calls;
+        self
+    }
+
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     pub(crate) fn color_binding(&self, slot: usize) -> Option<(&Arc<HostTexture>, u32)> {
         self.targets.get(slot).map(|t| (&t.copy, t.sub.index))
     }
@@ -500,6 +524,23 @@ impl ClosedDraw {
             reads_old_color = self.color_destination_reads & (1 << slot) != 0,
             depth_stencil_tests = self.depth_tests, viewport_contains_target_rect, scissor_contains_target_rect,
             "缺少旧内容的绘制状态：范围允许覆盖并不证明实际写满");
+        if !crate::page_inventory::enabled() { return; }
+        let subresource = target.sub.index;
+        tracing::info!(slot, subresource, same_recording_before_draw = self.ignored_state_470_before_draw,
+            process_before_failure = crate::list::ignored_470_calls(),
+            "[VNME_IGNORED_STATE_470] 新版命令列表未知插槽：仅记录调用，不解释参数或认作初始化");
+        let Some(origin) = target.guest_origin else {
+            tracing::info!(slot, subresource, "[VNME_RTV_ORIGIN] 缺少旧内容：未捕获来宾 RTV 创建信息");
+            return;
+        };
+        tracing::info!(slot, subresource,
+            guest_backing = origin.backing, guest_desc_layout = origin.desc_layout,
+            guest_initial_state = origin.initial_state, guest_initial_barrier_layout = origin.initial_barrier_layout,
+            guest_optimized_clear_supplied = origin.optimized_clear_supplied,
+            native_at_guest_creation = ?origin.native_at_creation,
+            native_predecessor_recorded = target.copy.diagnostic_predecessor.is_some(),
+            host_write_marker_now = target.copy.host_written.load(Ordering::Acquire),
+            "[VNME_RTV_ORIGIN] 缺少旧内容的实际 RTV：来宾初始参数不是写入；同键宿主对象沿革不证明同一物理代或旧像素；标志为假不排除其他写入");
     }
 
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
@@ -547,6 +588,8 @@ impl ClosedDraw {
             shader: ShaderBindings::default(),
             #[cfg(feature = "paged-title")]
             color_destination_reads: 0,
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            ignored_state_470_before_draw: 0,
             blend_factor: [1.0; 4],
             sample: None,
         }
@@ -634,6 +677,8 @@ impl ClosedDraw {
             targets, color_writes: pipeline.closed_color_writes,
             #[cfg(feature = "paged-title")]
             color_destination_reads: pipeline.closed_color_destination_reads,
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            ignored_state_470_before_draw: 0,
             depth, depth_tests: pipeline.closed_depth_tests, depth_writes: pipeline.closed_depth_writes,
             stencil_ref, topology, viewport, scissor, inputs, call, shader,
             blend_factor: [1.0; 4],
@@ -858,7 +903,7 @@ fn paged_title_partial_color_clear_observes_submission_order() {
         D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
     ) }.unwrap();
     let copy = Arc::new(HostTexture::new(texture.unwrap(), 0, Vec::new()));
-    let target = ColorTarget::capture_candidate(copy.clone(), None).unwrap();
+    let target = ColorTarget::capture_candidate(copy.clone(), RtvDescription::default()).unwrap();
 
     // 先录制局部使用者，再录制整面生产者；录制不会发布像素或权限。
     let partial = host.new_list().unwrap();
@@ -1154,7 +1199,7 @@ float4 pixel() : SV_Target0 {
     ));
     assert!(ColorTarget::capture(target_state.clone(), None).is_none());
     target_state.host_written.store(writes_color && !discard, Ordering::Release);
-    let color = ColorTarget::capture_candidate(target_state.clone(), None).unwrap();
+    let color = ColorTarget::capture_candidate(target_state.clone(), RtvDescription::default()).unwrap();
     let title = host.new_list().unwrap();
     title.defer_copy(VA as *mut u8, (ALIAS + 32) as *const u8, 24);
     let call = if indirect {
@@ -1217,7 +1262,7 @@ float4 pixel() : SV_Target0 {
     title.record_page_draw(draw);
     if discard {
         title.record_page_clear(ColorClear {
-            target: ColorTarget::capture_candidate(target_state.clone(), None).unwrap(),
+            target: ColorTarget::capture_candidate(target_state.clone(), RtvDescription::default()).unwrap(),
             color: [0., 0., 1., 1.],
             rects: vec![
                 RECT { left: 2, top: 0, right: 4, bottom: 4 },

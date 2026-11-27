@@ -742,6 +742,8 @@ pub(crate) struct HostList {
     page_rejection: std::sync::Mutex<Option<crate::page_slabs::ListRejection>>,
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     page_inventory: Mutex<crate::page_inventory::Inventory>,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    ignored_state_470: std::sync::atomic::AtomicU64,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1122,6 +1124,8 @@ impl Host {
                 page_rejection: std::sync::Mutex::new(None),
                 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
                 page_inventory: Mutex::default(),
+                #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+                ignored_state_470: std::sync::atomic::AtomicU64::new(0),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -1783,6 +1787,11 @@ impl HostList {
         self.page_inventory.lock().unwrap_or_else(|e| e.into_inner()).observe(entry);
     }
 
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn note_ignored_state_470(&self) {
+        self.ignored_state_470.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// 只比较同一录制列表中之前已转换的操作，不读取游戏内存或执行命令。
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     pub(crate) fn earlier_texture_write(&self, copy: &crate::resource::HostTexture) -> crate::page_inventory::EarlierTextureWrite {
@@ -1977,6 +1986,7 @@ impl HostList {
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
         if crate::page_inventory::enabled() {
             self.page_inventory.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.ignored_state_470.store(0, Ordering::Relaxed);
         }
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2225,6 +2235,8 @@ impl HostList {
 
     #[allow(dead_code, reason = "closed draws require paged queue submission")]
     pub(crate) fn record_page_draw(&self, draw: crate::page_draw::ClosedDraw) {
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        let draw = draw.with_ignored_state_470(self.ignored_state_470.load(Ordering::Relaxed));
         self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Draw(std::sync::Arc::new(draw))));
     }
 

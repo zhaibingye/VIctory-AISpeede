@@ -873,6 +873,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    victory_gpu::title_backing::prepare_xmem_section_history();
     let mut physical = physical();
     let Some(first) = physical.numbers.allocate(n) else {
         // SAFETY: fresh owned section with no views, and a non-null count.
@@ -1239,7 +1241,11 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         victory_gpu::title_memory_aliased(address, physical.shown.addresses(page));
         physical.shown.mapped(page, address);
     }
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    let binding = (slice.section.first, slice.index);
     physical.views.insert(base, (len, slice));
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    victory_gpu::title_backing::note_xmem_section_mapping(binding.0, binding.1, base, len, true);
     true
 }
 
@@ -1334,6 +1340,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) -> bool {
             physical.shown.unmapped(slice.page(k), at + k * PAGE);
         }
         victory_gpu::title_memory_remapped(at, size);
+        // 整个原视图已解绑。切分后各片段只有重新映射成功才登记。
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        victory_gpu::title_backing::note_xmem_section_mapping(slice.section.first, slice.index, at, size, false);
         let left = at >= base || map(physical, at, base - at, slice.clone());
         let right = at + size <= end || map(physical, end, at + size - end, Slice {
             index: slice.index + (end - at) / PAGE, ..slice
