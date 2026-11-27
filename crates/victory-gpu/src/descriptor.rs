@@ -405,7 +405,11 @@ pub(crate) enum TextureSrvReject {
     WriterAlias,
     SurrogateFormat,
     ScopedAuthority,
-    NativeOrBytes { external_alias: bool, host_format: i32 },
+    NativeOrBytes {
+        external_alias: bool,
+        host_format: i32,
+        authority_evidence: crate::resource::SrvAuthorityEvidence,
+    },
 }
 
 impl View {
@@ -482,13 +486,17 @@ impl View {
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
         let observed_span = copy.candidate_guest_span;
         TextureInput::native(copy.clone(), format, compatible.or(plain_linear)).or_else(|| {
-            plain_linear.map(|input| TextureInput::Linear { copy, input })
+            plain_linear.map(|input| TextureInput::Linear { copy: copy.clone(), input })
         }).ok_or_else(|| {
             #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
             if external_alias {
                 crate::page_resource::trace_rejected_shared_read(observed_span);
             }
-            NativeOrBytes { external_alias, host_format: actual.Format.0 }
+            NativeOrBytes {
+                external_alias,
+                host_format: actual.Format.0,
+                authority_evidence: crate::resource::srv_authority_evidence(resource, &copy),
+            }
         })
     }
 
@@ -533,7 +541,11 @@ impl View {
             if crate::resource::alias_source(resource).is_some() { return Err(WriterAlias); }
             Some(crate::resource::address_volume_bytes(resource)
                 .filter(|bytes| bytes.format == format)
-                .ok_or(NativeOrBytes { external_alias: true, host_format: actual.Format.0 })?)
+                .ok_or_else(|| NativeOrBytes {
+                    external_alias: true,
+                    host_format: actual.Format.0,
+                    authority_evidence: crate::resource::srv_authority_evidence(resource, &copy),
+                })?)
         } else {
             None
         };

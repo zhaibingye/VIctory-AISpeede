@@ -1420,6 +1420,41 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.clone()
 }
 
+/// 记录拒绝原生读取时已知的线索，不把写入能力或同地址等同于最新版本。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SrvAuthorityEvidence {
+    completed_native: bool,
+    legacy_write_marker: bool,
+    not_known_replaced: bool,
+    pointer_exposed: bool,
+    known_same_start_alias: bool,
+    known_graphics_heap_span: Option<bool>,
+}
+
+#[cfg(windows)]
+pub(crate) fn srv_authority_evidence(this: This, copy: &HostTexture) -> SrvAuthorityEvidence {
+    use std::sync::atomic::Ordering;
+    use victory_memory::authority::Representation;
+    let completed_native = copy.native_authority.lock().unwrap_or_else(|e| e.into_inner())
+        .get(&None).is_some_and(|complete| complete.version.representation == Representation::NativeGpu);
+    SrvAuthorityEvidence {
+        completed_native,
+        legacy_write_marker: copy.host_written.load(Ordering::Acquire),
+        not_known_replaced: current(this),
+        pointer_exposed: copy.has_pointer_exposure(),
+        known_same_start_alias: alias_source(this).is_some(),
+        known_graphics_heap_span: {
+            #[cfg(feature = "paged-title")]
+            { copy.candidate_guest_span.map(|(start, end)| {
+                crate::title_backing::is_private_heap_span(start as usize, end as usize)
+            }) }
+            #[cfg(not(feature = "paged-title"))]
+            { None }
+        },
+    }
+}
+
 /// The host description of a title texture: the same, without the
 /// console's layout and flags, in a format the host takes for its use.
 #[cfg(windows)]
