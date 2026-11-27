@@ -37,6 +37,8 @@
 
 - 已完成 Fence 的物理页写回也不能按整页认领：`title_backing::merge_page` 只写提交前像与 GPU 回读的差异及显式覆盖的并集，即使两者分成很多段。整页读改写会回写未归 GPU 的间隙，既可能丢失并行 CPU 更新，也可能因间隙不可写而失败。`title_backing::writeback_tests` 用夹在可写片段之间的只读宿主页区分两条路径。只保证不触及间隙，不裁决 CPU/GPU 对同一字节的冲突。
 
+- 单次 `GuestCopy` 的源和目的重叠可经暂存保留源字节，但暂存不能证明**目的自身**的映射是单射。`copy_plan::GuestCopy::bind` 用提交固定页和页内半开区间检查；不同目的 VA 在同一物理页写到不同字节是合法的，若争写同一字节则在编码时拒绝整批。不同命令的有序覆盖不是这个反例。见 `copy_plan::alias_tests` 和 `page_queue::paged_buffer_copy_rejects_self_aliased_destination_before_submitting_prefix`。
+
 ## 已有的受限字节转换
 
 - HLE `modules/xg.rs::layout` 输出的是 `victory_formats::texture::Texture::new` 建模的 data/depth/stencil plane；该模型没有 DCC 等元数据平面。GPU `resource::texture_layout` 使用同一构造器。因此默认 RTV 的 XG 单 plane、offset 0、与 GPU 计算大小相符，不是主平面无需元数据解释的独立证据。

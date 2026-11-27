@@ -1558,6 +1558,7 @@ impl Host {
                         let pieces = copy.bind(pins).map_err(|miss| match miss {
                             Unbound::AddressWidth => BatchError::Range(copy.src as u64, copy.dst as u64),
                             Unbound::Source(va) | Unbound::Destination(va) => BatchError::NotCaptured(va as u64),
+                            Unbound::OverlappingDestination => BatchError::OverlappingCopyDestination,
                         })?;
                         record_copy(list, batch, &pieces, &mut dirty, || {
                             if let Some(buffer) = &scratch {
@@ -2276,6 +2277,26 @@ fn paged_buffer_copy_gathers_overlapping_physical_aliases() {
         }
     );
     assert_eq!(&section.lock().unwrap()[..6], &[10, 10, 20, 30, 40, 50]);
+}
+
+#[cfg(test)]
+#[test]
+fn paged_buffer_copy_rejects_self_aliased_destination_before_submitting_prefix() {
+    use victory_memory::physical::PageNumbers;
+    const PAGE: usize = PAGE_BYTES as usize;
+    const VA: usize = 4 * PAGE;
+    let host = crate::host::host().expect("D3D12 renderer host");
+    let heap = crate::memory::heap().unwrap();
+    let id = PageNumbers::default().allocate(1).unwrap();
+    let (mut backing, section) = crate::title_backing::test_capture(id, &[VA, VA + PAGE]);
+    section.lock().unwrap()[..2].copy_from_slice(&[10, 20]);
+    let prefix = GuestCopy::new(VA + 1, VA, 1).unwrap();
+    let ambiguous = GuestCopy::new(VA, VA + 1, PAGE + 1).unwrap();
+    let result = host.execute_paged_copies(heap, &mut backing, &[prefix, ambiguous]);
+    assert!(matches!(result, Err(BatchError::Operation {
+        phase: "encode", index: 1, operation: "buffer copy", cause,
+    }) if matches!(*cause, BatchError::OverlappingCopyDestination)));
+    assert_eq!(&section.lock().unwrap()[..2], &[10, 20]);
 }
 
 #[cfg(test)]

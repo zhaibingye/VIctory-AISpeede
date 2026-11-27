@@ -302,6 +302,7 @@ pub(crate) enum BatchError {
     UnclassifiedSharedTextureWriter { previous_submission: bool, current_submission: bool },
     Range(u64, u64),
     NotCaptured(u64),
+    OverlappingCopyDestination,
     Native(Error),
     Table(BindError),
 }

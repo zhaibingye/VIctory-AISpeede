@@ -2,6 +2,8 @@
 //! Splitting a range resolves both ends against the same backing capture,
 //! never against a host buffer baked in during title command recording.
 
+use std::collections::BTreeMap;
+
 use victory_memory::{
     PAGE_BYTES,
     gpu_table::ADDRESS_LIMIT,
@@ -29,6 +31,7 @@ pub(crate) enum Unbound {
     AddressWidth,
     Source(usize),
     Destination(usize),
+    OverlappingDestination,
 }
 
 impl GuestCopy {
@@ -53,12 +56,26 @@ impl GuestCopy {
             return Err(Unbound::AddressWidth);
         }
         let mut pieces = Vec::new();
+        let mut destinations = BTreeMap::new();
+        let crosses_dst_page = self.len > PAGE - self.dst % PAGE;
         let (mut src, mut dst, mut left) = (self.src, self.dst, self.len);
         while left != 0 {
             let source = pins.expected(src).ok_or(Unbound::Source(src))?;
             let dest = pins.expected(dst).ok_or(Unbound::Destination(dst))?;
             let (s, d) = (src % PAGE, dst % PAGE);
-            let count = left.min(PAGE - s).min(PAGE - d);
+            let dst_count = left.min(PAGE - d);
+            if crosses_dst_page && (dst == self.dst || d == 0) {
+                // Check the whole VA page fragment once, regardless of source splits.
+                // Only the first and last fragments can be partial, so a disjoint
+                // second visit to a physical page must already be the last fragment.
+                let span = d..d + dst_count;
+                if let Some(prior) = destinations.insert(dest, span.clone())
+                    && d.max(prior.start) < span.end.min(prior.end)
+                {
+                    return Err(Unbound::OverlappingDestination);
+                }
+            }
+            let count = dst_count.min(PAGE - s);
             pieces.push(CopyPiece {
                 src: source,
                 src_offset: s as u32,
@@ -71,6 +88,9 @@ impl GuestCopy {
         Ok(pieces)
     }
 }
+
+#[cfg(test)]
+mod alias_tests;
 
 #[cfg(test)]
 #[test]
