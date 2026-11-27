@@ -1835,6 +1835,81 @@ mod tests {
     }
 
     #[test]
+    fn native_reserved_section_first_commit_is_zero_but_pinned_remap_keeps_bytes() {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile};
+        if on_wine() { return; } // Wine uses SEC_COMMIT instead.
+        const LEN: usize = 2 * PAGE;
+        let slot = XMemVirtualAlloc(
+            std::ptr::null_mut(), LEN, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+        );
+        assert!(!slot.is_null());
+        let base = slot as usize;
+        let map_fresh = |prewrite: bool| {
+            let pages = allocate(2);
+            let section = physical().pages[&pages[0]].section.clone();
+            // SAFETY: inspect a fresh pagefile section without committing or reading its bytes.
+            let at = unsafe { MapViewOfFile(section.handle, FILE_MAP_READ, 0, 0, LEN) };
+            assert!(!at.Value.is_null());
+            let probe = View { at, len: LEN, section: Some(section) };
+            for offset in [0, PAGE] {
+                assert_eq!(query(probe.at.Value.wrapping_byte_add(offset)).host.State, MEM_RESERVE);
+            }
+            drop(probe);
+            // A physical writer can be the first committer, before any title VA is published.
+            let mut expected = vec![0u8; LEN];
+            if prewrite {
+                expected[PAGE - 1..=PAGE].copy_from_slice(&[3, 7]);
+                assert!(write_physical(&pages, PAGE - 1, &[3, 7]));
+            }
+            assert_eq!(XMemMapPhysicalPages(slot, 2, pages.as_ptr()), slot);
+            for offset in [0, PAGE] {
+                assert_eq!(query(slot.wrapping_byte_add(offset)).host.State, MEM_COMMIT);
+            }
+            // SAFETY: the first guest mapping now shows two committed pages.
+            let bytes = unsafe { std::slice::from_raw_parts(slot.cast::<u8>(), LEN) };
+            assert_eq!(bytes.iter().zip(expected).position(|(&a, b)| a != b), None,
+                "first guest map must expose any earlier physical write");
+            pages
+        };
+        let pages = map_fresh(true);
+        let mut writer = page_window(&pages, 0, LEN).expect("physical writer on original section");
+        let mut pins = BackingPins::default();
+        pin_backing(&[(base, base + LEN)], &mut pins);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        assert_eq!(XMemMapPhysicalPages(slot, 2, std::ptr::null()), slot);
+        for offset in [0, PAGE] {
+            assert_eq!(query(slot.wrapping_byte_add(offset)).host.State, MEM_RESERVE);
+        }
+
+        let replacement = map_fresh(false);
+        // The pin captures identity, not a byte version. Finish a physical write on the old
+        // section AFTER the same VA has been rebound; its worker view then goes away as well.
+        let marker: Vec<u8> = (0..LEN).map(|i| (1 + i % 251) as u8).collect();
+        writer.bytes().copy_from_slice(&marker);
+        drop(writer);
+        // SAFETY: slot still maps the entire replacement; no writer targets it.
+        let current = unsafe { std::slice::from_raw_parts(slot.cast::<u8>(), LEN) };
+        assert_eq!(current.iter().position(|&b| b != 0), None);
+
+        // Only the submission still owns the original section.
+        let mut checked = 0;
+        read_backing_runs(base, base + LEN, &pins, &mut |address, source, len, same| {
+            assert!(!same);
+            assert_eq!(address, base + checked);
+            let source = source.expect("pinned original section");
+            // SAFETY: the temporary section view covers this run for the callback's lifetime.
+            let old = unsafe { std::slice::from_raw_parts(source as *const u8, len) };
+            let expected = &marker[checked..checked + len];
+            assert_eq!(old.iter().zip(expected).position(|(a, b)| a != b), None, "pinned remap");
+            checked += len;
+        });
+        assert_eq!(checked, LEN);
+        assert_eq!(XMemMapPhysicalPages(slot, 2, std::ptr::null()), slot);
+        assert_eq!(XMemFreePhysicalPages(2, replacement.as_ptr()), 1);
+        assert_ne!(private_virtual_free(slot, 0, MEM_RELEASE), 0);
+    }
+
+    #[test]
     fn submitted_byte_writeback_reaches_the_original_backing_after_remap() {
         let pages = allocate(2);
         let ptr = XMemVirtualAlloc(

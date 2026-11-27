@@ -25,6 +25,7 @@
 ## 开场 XMem 的宿主 RAM 准入
 
 - 原生 Windows `paged-title` 用 `SEC_RESERVE` 创建 section。`DeferredRam` 按 **section 内页号**预扣净新增 64 KiB 页；宿主提交失败退回新增额度，解绑单个 VA 不释放仍存活的 section。`xmem::tests::deferred_native_` 用真实重叠视图、只读视图提交失败、同 VA 换节后重试验证这些边界。拒绝日志的 `requested_mib` 是整段长度，不是净新增字节；不能据此断言重复计费。
+- `xmem::tests::native_reserved_section_first_commit_is_zero_but_pinned_remap_keeps_bytes` 在真实 Windows section 上区分了三个时刻：无写者的新节首提交为零；`write_physical` 可在首次来宾映射之前提交并写入；提交固定页之后，尚存的 `page_window` 仍能写旧节，即使来宾已在同一 VA 绑定新节。`read_backing_runs` 能读回旧节的**后写值**，不是 pin 时的前像。首次绑定、固定身份、冻结字节版本不能互换；这些对照均不证明实机目标发生过相同写入。
 - 启动时 `prepare` 持有原文件的完整补丁副本；`load` 返回的 `LoadedImage` 已有独立宿主映射和解析信息，无需把原始或准备缓冲保留到 `main.join()`。释放它们不释放 XMem 租约，也不改变预算公式；是否还有足够 RAM 须按当次采样验证。
 
 ## 共享字节读取的生产门禁
