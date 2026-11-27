@@ -296,6 +296,7 @@ fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError) {
     let PageOp::Draw(draw) = &ops[index] else { return; };
     let Some((target, bound_subresource)) = draw.color_binding(slot) else { return; };
     if subresource != bound_subresource { return; }
+    draw.trace_color_coverage_inputs(slot);
 
     let mut mentions = 0usize;
     let mut recent = std::collections::VecDeque::with_capacity(12);
@@ -304,7 +305,17 @@ fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError) {
     let mut unknown_span_ops = 0usize;
     let mut last_discard = None;
     let mut same_discard_count = 0usize;
+    let mut enhanced_counts_by_kind = [0u64; 4];
+    let mut enhanced_headers_skipped = 0u64;
     for (prior_index, op) in ops[..index].iter().enumerate() {
+        if let PageOp::Barrier(barrier) = op
+            && let crate::page_resource::PageBarrier::EnhancedUav { counts_by_kind, headers_skipped } = barrier.as_ref()
+        {
+            for (total, count) in enhanced_counts_by_kind.iter_mut().zip(counts_by_kind) {
+                *total = total.saturating_add(*count);
+            }
+            enhanced_headers_skipped = enhanced_headers_skipped.saturating_add(u64::from(*headers_skipped));
+        }
         if let PageOp::DiscardNote { copy, whole } = op {
             if std::ptr::eq(copy.as_ptr(), Arc::as_ptr(target)) {
                 last_discard = Some((prior_index, *whole));
@@ -346,6 +357,7 @@ fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError) {
         index, slot, subresource, prior_same_object_ops = mentions, prior_same_object_recent = ?recent,
         prior_virtual_overlap_ops = virtual_overlap_ops, prior_unknown_span_ops = unknown_span_ops,
         same_discard_count, last_ignored_discard_index_and_whole = ?last_discard,
+        enhanced_counts_by_kind = ?enhanced_counts_by_kind, enhanced_headers_skipped,
         known_committed_linear = target.exact_committed_bytes().is_some(),
         known_compatible_source = target.compatible_texture_source().is_some(),
         native_generation_current = target.current_native_generation(),

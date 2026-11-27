@@ -491,6 +491,8 @@ pub(crate) enum PageBarrier {
     Texture(Arc<HostTexture>, u32),
     NativeUav(Arc<HostTexture>),
     Uav,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    EnhancedUav { counts_by_kind: [u64; 4], headers_skipped: u32 },
 }
 
 impl PageBarrier {
@@ -531,6 +533,8 @@ impl PageBarrier {
             Self::Texture(copy, wanted) => resources.transition_texture(list, copy, *wanted),
             Self::NativeUav(copy) => { Self::native_uav(list, copy); Ok(()) }
             Self::Uav => { Self::emit_uav(list, None); Ok(()) }
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            Self::EnhancedUav { .. } => { Self::emit_uav(list, None); Ok(()) }
         }
     }
 }

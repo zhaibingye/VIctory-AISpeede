@@ -1674,8 +1674,48 @@ extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _referen
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0 {
+        #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+        if crate::page_inventory::enabled() && let Some(list) = host_list(this) {
+            // 安全：来宾方法签名约定 count 个 16 字节组头；只读有界组头的数值字段。
+            let (counts_by_kind, headers_skipped) = unsafe { enhanced_group_counts(count, _groups) };
+            list.record_page_barrier(crate::page_resource::PageBarrier::EnhancedUav {
+                counts_by_kind, headers_skipped,
+            });
+            return;
+        }
         wait_for_shader_writes(this);
     }
+}
+
+/// 类型 0/1/2 按 D3D12 标准分别对应全局、纹理和缓冲区。
+/// 这里记录原始类别，不读载荷指针，也不把类型 1 当成已证实丢弃。
+#[cfg(any(test, all(windows, feature = "paged-title", feature = "diagnostics")))]
+unsafe fn enhanced_group_counts(count: u32, groups: *const u8) -> ([u64; 4], u32) {
+    const MAX_HEADERS: u32 = 64;
+    let mut counts = [0; 4];
+    if groups.is_null() { return (counts, count); }
+    let inspected = count.min(MAX_HEADERS);
+    for index in 0..inspected as usize {
+        // 安全：调用者保证组头存在，每项前两个字段分别为类型和屏障数量。
+        let (kind, entries) = unsafe {
+            let at = groups.add(index * 16);
+            (at.cast::<u32>().read_unaligned(), at.add(4).cast::<u32>().read_unaligned())
+        };
+        counts[kind.min(3) as usize] += u64::from(entries);
+    }
+    (counts, count - inspected)
+}
+
+#[test]
+fn enhanced_group_inventory_counts_types_without_reading_payload() {
+    let mut groups = [[0u32; 4]; 65];
+    groups[0] = [1, 3, u32::MAX, u32::MAX];
+    groups[1] = [2, 5, u32::MAX, u32::MAX];
+    groups[2] = [u32::MAX, 2, 0, 0];
+    groups[64] = [1, 99, 0, 0];
+    // 安全：组头由测试持有；载荷故意无效，并且不应读取。
+    assert_eq!(unsafe { enhanced_group_counts(65, groups.as_ptr().cast()) }, ([0, 3, 5, 2], 1));
+    assert_eq!(unsafe { enhanced_group_counts(4, std::ptr::null()) }, ([0; 4], 4));
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

@@ -429,6 +429,26 @@ impl ClosedDraw {
     }
 
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn trace_color_coverage_inputs(&self, slot: usize) {
+        let Some(target) = self.targets.get(slot) else { return; };
+        let (width, height) = target.extent();
+        let viewport_contains_target_rect = self.viewport.TopLeftX <= 0.0 && self.viewport.TopLeftY <= 0.0
+            && self.viewport.TopLeftX + self.viewport.Width >= width as f32
+            && self.viewport.TopLeftY + self.viewport.Height >= height as f32;
+        let scissor_contains_target_rect = self.scissor.left <= 0 && self.scissor.top <= 0
+            && u64::try_from(self.scissor.right).is_ok_and(|right| right >= width)
+            && u32::try_from(self.scissor.bottom).is_ok_and(|bottom| bottom >= height);
+        let (kind, count) = match self.call {
+            DrawCall::Direct { vertices, .. } => ("直接", Some(vertices)),
+            DrawCall::Indexed { indices, .. } => ("索引", Some(indices)),
+            DrawCall::Indirect(_) => ("间接", None),
+        };
+        tracing::info!(slot, kind, ?count, topology = self.topology.0, samples = target.samples,
+            depth_stencil_tests = self.depth_tests, viewport_contains_target_rect, scissor_contains_target_rect,
+            "缺少旧内容的绘制状态：范围允许覆盖并不证明实际写满");
+    }
+
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     pub(crate) fn color_write_mentions(&self, copy: &Arc<HostTexture>, subresource: u32) -> Option<&'static str> {
         let mut matches_object = false;
         for (slot, target) in self.targets.iter().enumerate() {
