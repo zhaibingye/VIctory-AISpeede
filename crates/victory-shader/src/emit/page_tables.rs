@@ -28,6 +28,8 @@ pub enum StaticViewAccess {
     /// A statically bounded aligned byte window on a raw UAV, as used by DXIL.
     RawUav { offset: u32, bytes: u32, write: bool },
     RawSrv { offset: u32, bytes: u32 },
+    /// 标量指令以字节寻址；宿主须先验证真实的结构化 SRV。
+    ScalarStructuredSrv { stride: u32, offset: u32, bytes: u32 },
     /// 游戏表内 CBV 由宿主翻译为原始只读缓冲区。
     ConstantTable { offset: u32, bytes: u32 },
     RootSrv { bytes: u32 },
@@ -633,6 +635,9 @@ fn proven_slot(
             match used.kind {
                 ResourceType::Cbv => StaticViewAccess::ConstantTable { offset, bytes },
                 ResourceType::Srv if used.stride == 0 => StaticViewAccess::RawSrv { offset, bytes },
+                ResourceType::Srv if native.stage == HwStage::Vs
+                    && (4..=2048).contains(&used.stride) && used.stride.is_multiple_of(4) =>
+                    StaticViewAccess::ScalarStructuredSrv { stride: used.stride, offset, bytes },
                 _ => return Err(reject),
             }
         }
@@ -675,4 +680,37 @@ fn scalar_buffer_proof_bounds_all_four_dwords_and_rejects_wrap() {
     assert_eq!(scalar_buffer_read_window(name, 16, 2), None);
     assert_eq!(scalar_buffer_read_window(name, 16, u32::MAX - 3), None);
     assert_eq!(scalar_buffer_read_window("s_buffer_store_dwordx4", 0, 0), None);
+}
+
+#[cfg(test)]
+#[test]
+fn vertex_scalar_load_proves_a_byte_window_on_one_structured_srv() {
+    use crate::native::{RootParam, UsedResource};
+    let address = Address { param: 0, offset: 32, dynamic: None };
+    let used = UsedResource {
+        kind: ResourceType::Srv, root: RootType::Table, table_offset_dwords: 0,
+        lower_bound: 0, stride: 64, dwords: 4, user_data: 2, slot: 3,
+    };
+    let mut native = NativeProgram {
+        stage: HwStage::Vs, wave64: false, vgprs: 0, io: StageIo::None, code: Vec::new(),
+        layout: vec![RootParam {
+            root: RootType::Table, table_offset_dwords: 0, sgprs: 1,
+            base_register: 0, user_data: 2, slot: 3,
+        }],
+        used: vec![used],
+    };
+    // 第 60 字节开始的 16 字节读取横跨相邻记录，不能把步幅乘到字节地址上。
+    let proof = || AccessProof::ScalarBufferRead { offset: 60, bytes: 16 };
+    assert_eq!(proven_slot(&native, address, 0, proof()), Ok(StaticViewSlot {
+        slot: StaticTextureSlot { root: 3, index: 1 },
+        access: StaticViewAccess::ScalarStructuredSrv { stride: 64, offset: 60, bytes: 16 },
+    }));
+    native.used.push(used);
+    assert!(proven_slot(&native, address, 0, proof()).is_err());
+    native.used.pop();
+    native.stage = HwStage::Ps;
+    assert!(proven_slot(&native, address, 0, proof()).is_err());
+    native.stage = HwStage::Vs;
+    native.used[0].kind = ResourceType::Uav;
+    assert!(proven_slot(&native, address, 0, proof()).is_err());
 }

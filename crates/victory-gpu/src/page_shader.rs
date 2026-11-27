@@ -300,6 +300,7 @@ enum ClosedView {
     NullTexture(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, crate::page_texture::TextureSelection),
     TextureUav(crate::page_uav::ShaderTextureUav),
     Raw(BoundedBufferView),
+    ScalarStructured(BoundedBufferView, u32),
     TableConstant(BoundedBufferView),
     Structured(BoundedBufferView, u32),
 }
@@ -538,6 +539,15 @@ impl ShaderBindings {
                                 ClosedView::Raw(BoundedBufferView::new(start, end, false)
                                     .ok_or(buffer)?)
                             }
+                            StaticViewAccess::ScalarStructuredSrv { stride, .. } => {
+                                let (start, end) = crate::descriptor::host::paged_structured_srv_range(&actual, stride)
+                                    .ok_or(buffer)?;
+                                // SMEM 以字节读取。只为已验证的范围暴露原始视图，
+                                // 不与同槽的向量结构化访问混用。
+                                ClosedView::ScalarStructured(
+                                    BoundedBufferView::new(start, end, false).ok_or(buffer)?, stride,
+                                )
+                            }
                             StaticViewAccess::StructuredSrv { stride, .. } => {
                                 let (start, end) = crate::descriptor::host::paged_structured_srv_range(&actual, stride)
                                     .ok_or(buffer)?;
@@ -582,6 +592,11 @@ impl ShaderBindings {
                             if *actual == stride && !view.unordered() =>
                         {
                             view.allow_access(0, elements.checked_mul(stride).ok_or(reject)?, false).ok_or(reject)?;
+                        }
+                        (Some(ClosedView::ScalarStructured(view, actual)), StaticViewAccess::ScalarStructuredSrv { stride, offset, bytes })
+                            if *actual == stride =>
+                        {
+                            view.allow_access(offset, bytes, false).ok_or(reject)?;
                         }
                         (Some(ClosedView::TableConstant(view)), StaticViewAccess::ConstantTableDescriptor)
                             if !view.unordered() =>
@@ -643,7 +658,8 @@ impl ShaderBindings {
                     ClosedView::Texture(texture) => texture.ranges(ranges)?,
                     // The queue footprint records writable native textures separately.
                     ClosedView::TextureUav(_) | ClosedView::NullTexture(..) => {},
-                    ClosedView::Raw(raw) | ClosedView::TableConstant(raw) | ClosedView::Structured(raw, _) => ranges.push(raw.range()),
+                    ClosedView::Raw(raw) | ClosedView::TableConstant(raw)
+                    | ClosedView::Structured(raw, _) | ClosedView::ScalarStructured(raw, _) => ranges.push(raw.range()),
                 }
             }
         }
@@ -766,6 +782,7 @@ impl ShaderBindings {
         let spans = self.tables.values().flat_map(|table| table.values()).filter_map(|view| {
             match view {
                 ClosedView::Raw(raw) | ClosedView::TableConstant(raw) if !raw.unordered() => Some((raw.range(), 0)),
+                ClosedView::ScalarStructured(view, _) => Some((view.range(), 0)),
                 ClosedView::Structured(view, stride) if !view.unordered() => Some((view.range(), *stride)),
                 _ => None,
             }
@@ -810,7 +827,7 @@ impl ShaderBindings {
                         view.prepare(host, list, batch, plan, shared.then_some(&mut shared_access))?
                     },
                     ClosedView::Raw(raw) if raw.unordered() => raw.prepare_uav(batch, &mut shader_dirty, 0)?,
-                    ClosedView::Raw(raw) | ClosedView::TableConstant(raw) => {
+                    ClosedView::Raw(raw) | ClosedView::TableConstant(raw) | ClosedView::ScalarStructured(raw, _) => {
                         let span = raw.range();
                         let (buffer, at) = bounded_reads.slot(span, 0)?;
                         TableDescriptor::Raw(buffer.clone(), at, span.1 - span.0, false)
@@ -837,6 +854,7 @@ impl ShaderBindings {
                 match view {
                     ClosedView::Texture(tex) => tex.ranges(&mut reads)?,
                     ClosedView::Raw(raw) | ClosedView::TableConstant(raw) if !raw.unordered() => reads.push(raw.range()),
+                    ClosedView::ScalarStructured(view, _) => reads.push(view.range()),
                     ClosedView::Structured(view, _) if !view.unordered() => reads.push(view.range()),
                     _ => {},
                 }
