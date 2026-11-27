@@ -1002,46 +1002,41 @@ float4 vertex(uint id : SV_VertexID) : SV_Position {
     float2 p[4] = { float2(-1, -1), float2(-1, 1), float2(1, -1), float2(1, 1) };
     return float4(p[id], 0, 1);
 }
-float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
+float4 translucent() : SV_Target0 { return float4(0, 1, 0, 0.5); }
+float4 opaque() : SV_Target0 { return float4(0, 1, 0, 1); }
+float4 opaque_with_holes(float4 pos : SV_Position) : SV_Target0 {
+    clip(2 - pos.x);
+    return opaque();
+}
 "#;
-    let compile = |entry| {
+    let compile = |entry, profile| {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the HLSL source and entry point remain live for the call.
         unsafe {
             D3DCompile(source.as_ptr().cast(), source.len(), s!("page_draw_blend"), None, None,
-                entry, s!("vs_5_0"), 0, 0, &mut code, None).unwrap();
+                entry, profile, 0, 0, &mut code, None).unwrap();
         }
         code.unwrap()
     };
-    let vs = compile(s!("vertex"));
-    let ps = {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the HLSL source and entry point remain live for the call.
-        unsafe {
-            D3DCompile(source.as_ptr().cast(), source.len(), s!("page_draw_blend"), None, None,
-                s!("pixel"), s!("ps_5_0"), 0, 0, &mut code, None).unwrap();
-        }
-        code.unwrap()
-    };
-    let (root, pso) = unsafe {
+    let vs = compile(s!("vertex"), s!("vs_5_0"));
+    // SAFETY: the empty root signature has no borrowed arrays.
+    let root: ID3D12RootSignature = unsafe {
         let mut serialized: Option<ID3DBlob> = None;
         D3D12SerializeRootSignature(
             &D3D12_ROOT_SIGNATURE_DESC {
-                NumParameters: 0,
-                pParameters: std::ptr::null(),
-                NumStaticSamplers: 0,
-                pStaticSamplers: std::ptr::null(),
                 Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+                ..Default::default()
             },
-            D3D_ROOT_SIGNATURE_VERSION_1,
-            &mut serialized,
-            None,
+            D3D_ROOT_SIGNATURE_VERSION_1, &mut serialized, None,
         ).unwrap();
         let serialized = serialized.unwrap();
         let bytes = std::slice::from_raw_parts(
             serialized.GetBufferPointer().cast::<u8>(), serialized.GetBufferSize(),
         );
-        let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+        host.device.CreateRootSignature(0, bytes).unwrap()
+    };
+    // SAFETY: root and both shader blobs remain live for PSO creation.
+    let build_pipeline = |ps: &ID3DBlob| unsafe {
         let mut blend = D3D12_BLEND_DESC::default();
         blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
             BlendEnable: true.into(),
@@ -1083,7 +1078,7 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
         };
         let pso: ID3D12PipelineState = host.device.CreateGraphicsPipelineState(&desc).unwrap();
         let _ = std::mem::ManuallyDrop::into_inner(desc.pRootSignature);
-        (root, pso)
+        pso
     };
 
     #[derive(Clone, Copy)]
@@ -1102,7 +1097,12 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
         payload: *const u8,
     }
 
-    let run = |producer| {
+    let translucent = build_pipeline(&compile(s!("translucent"), s!("ps_5_0")));
+    let opaque = build_pipeline(&compile(s!("opaque"), s!("ps_5_0")));
+    let opaque_with_holes = build_pipeline(&compile(s!("opaque_with_holes"), s!("ps_5_0")));
+    let red = [1., 0., 0., 1.];
+    let blue_background = [0., 0., 1., 1.];
+    let run = |producer, pso: &ID3D12PipelineState, background: &[f32; 4]| {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: 4,
@@ -1179,12 +1179,11 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
         let clear = slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const list::Rect)>(
             guest_list, 52 * size_of::<usize>(),
         );
-        let red = [1., 0., 0., 1.];
         let half = RECT { left: 0, top: 0, right: 2, bottom: 4 };
         match producer {
-            Producer::Full => clear(guest_list, rtv, &red, 0, null.cast()),
-            Producer::Partial => clear(guest_list, rtv, &red, 1, (&raw const half).cast()),
-            Producer::OtherTarget => clear(guest_list, other_rtv, &red, 0, null.cast()),
+            Producer::Full => clear(guest_list, rtv, background, 0, null.cast()),
+            Producer::Partial => clear(guest_list, rtv, background, 1, (&raw const half).cast()),
+            Producer::OtherTarget => clear(guest_list, other_rtv, background, 0, null.cast()),
             Producer::None | Producer::FullAfterReader => {}
         }
         // Reproduce only the known transition shape; the reader is synthetic
@@ -1210,7 +1209,7 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
         list::barrier_groups(guest_list, 1, (&raw const group).cast());
         list.record_page_draw(draw);
         if matches!(producer, Producer::FullAfterReader) {
-            clear(guest_list, rtv, &red, 0, null.cast());
+            clear(guest_list, rtv, background, 0, null.cast());
         }
         assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(guest_list, 0x48)(guest_list), S_OK);
         if matches!(producer, Producer::Full | Producer::OtherTarget) {
@@ -1247,29 +1246,47 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
         let (readback, footprint) = crate::capture::read_back(&host.device, read.recording(), &copy.texture).unwrap();
         read.close();
         host.execute(&[&read]);
-        // SAFETY: the readback list has completed before the mapped bytes are
-        // inspected; the footprint bounds the selected 4×4 RGBA8 texel.
-        let pixel = unsafe {
+        // SAFETY: the readback list has completed; each row of the 4×4 RGBA8
+        // footprint has at least four pixels, excluding row pitch padding.
+        let pixels: [[[u8; 4]; 4]; 4] = unsafe {
             let mut ptr = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut ptr)).unwrap();
-            let row = ptr.cast::<u8>().add(
-                footprint.Offset as usize + 2 * footprint.Footprint.RowPitch as usize,
-            );
-            let pixel: [u8; 4] = std::slice::from_raw_parts(row.add(2 * 4), 4).try_into().unwrap();
+            let pixels = std::array::from_fn(|y| {
+                let row = ptr.cast::<u8>().add(
+                    footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize,
+                );
+                std::array::from_fn(|x| row.add(x * 4).cast::<[u8; 4]>().read())
+            });
             readback.Unmap(0, None);
-            pixel
+            pixels
         };
-        Ok(pixel)
+        Ok(pixels)
     };
+    let painted = |pso, background| run(Producer::Full, pso, background).unwrap();
+    let green = [0, 255, 0, 255];
+    for (background, old_pixel, old_channel, zero_channel) in [
+        (&red, [255, 0, 0, 255], 0, 2),
+        (&blue_background, [0, 0, 255, 255], 2, 0),
+    ] {
+        let blended = painted(&translucent, background);
+        let replaced = painted(&opaque, background);
+        let clipped = painted(&opaque_with_holes, background);
+        for y in 0..4 {
+            for x in 0..4 {
+                let pixel = blended[y][x];
+                // sRGB encodes 0.5 linear as about 188; alpha is linear (0.75).
+                assert!((187..=189).contains(&pixel[old_channel]) && (187..=189).contains(&pixel[1]),
+                    "混合没有读到当前底图和绿色源：({x},{y}) {pixel:?}");
+                assert_eq!(pixel[zero_channel], 0);
+                assert!((190..=192).contains(&pixel[3]), "Alpha 混合错误：{pixel:?}");
+                assert_eq!(replaced[y][x], green, "整面 Alpha 1：({x},{y})");
+                assert_eq!(clipped[y][x], if x < 2 { green } else { old_pixel },
+                    "Alpha 1 不代表整面写入：({x},{y})");
+            }
+        }
+    }
 
-    let blended = run(Producer::Full).expect("完整原生生产者后混合绘制应入队");
-    // sRGB encodes 0.5 linear as about 188; alpha remains linear (0.75).
-    assert!((187..=189).contains(&blended[0]) && (187..=189).contains(&blended[1]),
-        "没有同时读到红色底图和绿色源：{blended:?}");
-    assert_eq!(blended[2], 0, "不能使用蓝色优化清除值");
-    assert!((190..=192).contains(&blended[3]), "Alpha 混合错误：{blended:?}");
-
-    let error = run(Producer::OtherTarget).expect_err("改清另一张同尺寸的纹理必须拒绝");
+    let error = run(Producer::OtherTarget, &translucent, &red).expect_err("改清另一张同尺寸的纹理必须拒绝");
     assert!(matches!(error,
         BatchError::Operation { phase: "encode", index: 2, operation: "draw", ref cause }
             if matches!(cause.as_ref(), BatchError::MissingTextureContent {
@@ -1278,13 +1295,13 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
             })
     ), "不同目的描述符的对照首错不匹配：{error:?}");
     for producer in [Producer::None, Producer::FullAfterReader] {
-        let error = run(producer).expect_err("缺失或后置生产者必须拒绝旧色读取");
+        let error = run(producer, &translucent, &red).expect_err("缺失或后置生产者必须拒绝旧色读取");
         assert!(matches!(error,
             BatchError::Operation { phase: "encode", index: 1, operation: "draw", ref cause }
                 if matches!(cause.as_ref(), BatchError::MissingTextureContent { .. })
         ), "旧色准入结果不匹配：{error:?}");
     }
-    let error = run(Producer::Partial).expect_err("局部清除也需要已有整面内容");
+    let error = run(Producer::Partial, &translucent, &red).expect_err("局部清除也需要已有整面内容");
     assert!(matches!(error,
         BatchError::Operation { phase: "encode", index: 0, operation: "color clear", ref cause }
             if matches!(cause.as_ref(), BatchError::TargetNotInitialized)
