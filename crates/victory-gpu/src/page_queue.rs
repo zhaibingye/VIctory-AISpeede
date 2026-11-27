@@ -285,9 +285,176 @@ impl PageOp {
     }
 }
 
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+fn copy_prefix_va(
+    destination: Option<(u64, u64)>, target: Option<(u64, u64)>,
+) -> (&'static str, bool) {
+    match (destination, target) {
+        (Some((a, b)), Some((c, d))) if a <= c && d <= b => ("目的虚拟范围覆盖目标候选范围", true),
+        (Some((a, b)), Some((c, d))) if a < d && c < b => ("目的虚拟范围与目标候选范围部分重叠", true),
+        (Some(_), Some(_)) => ("虚拟范围不重叠", false),
+        _ => ("虚拟关系未分类（候选范围缺失）", false),
+    }
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+struct CopyPrefixPages {
+    target_pages: BTreeSet<PhysicalPage>,
+    complete: bool,
+    remaining: u64,
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+impl CopyPrefixPages {
+    fn new(pins: &BackingPins, target: (u64, u64)) -> Self {
+        let mut result = Self { target_pages: BTreeSet::new(), complete: true, remaining: 4096 };
+        if let Some(pages) = Self::pages(target, &mut result.remaining) {
+            for va in pages {
+                if let Some(page) = pins.expected(va) {
+                    result.target_pages.insert(page);
+                } else {
+                    result.complete = false;
+                }
+            }
+        } else {
+            result.complete = false;
+        }
+        result
+    }
+
+    // 每次失败共享查页预算；只读本提交首次捕获，不查询当前或写入时的 VA。
+    fn pages((start, end): (u64, u64), remaining: &mut u64) -> Option<impl Iterator<Item = usize> + use<>> {
+        if start >= end { return None; }
+        let (first, last) = (start / PAGE_BYTES, (end - 1) / PAGE_BYTES);
+        *remaining = remaining.checked_sub(last - first + 1)?;
+        Some((first..=last).map(|page| (page * PAGE_BYTES) as usize))
+    }
+
+    // 部分已固定的页仍可报告共页；排除共页需要两边都已完整捕获。
+    fn shares_page(&mut self, pins: &BackingPins, destination: (u64, u64)) -> Option<bool> {
+        if self.target_pages.is_empty() { return None; }
+        let mut complete = self.complete;
+        for va in Self::pages(destination, &mut self.remaining)? {
+            match pins.expected(va) {
+                Some(page) if self.target_pages.contains(&page) => return Some(true),
+                None => complete = false,
+                Some(_) => {},
+            }
+        }
+        complete.then_some(false)
+    }
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[derive(Default)]
+struct CopyPrefixEvidence {
+    by_kind: [CopyPrefixKind; 3],
+    pages: Option<CopyPrefixPages>,
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[derive(Default)]
+struct CopyPrefixKind {
+    total: usize,
+    destinations: BTreeMap<&'static str, usize>,
+    fixed_pages: BTreeMap<&'static str, usize>,
+    recent: std::collections::VecDeque<(usize, &'static str, &'static str)>,
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+impl CopyPrefixEvidence {
+    fn observe(
+        &mut self, index: usize, op: &PageOp, target: &std::sync::Arc<crate::resource::HostTexture>,
+        subresource: u32, pins: &BackingPins,
+    ) {
+        use std::sync::Arc;
+        let (kind, span, coverage) = match op {
+            PageOp::Copy(copy) => {
+                let [_, destination] = copy.ranges();
+                (0, Some(destination), None)
+            }
+            PageOp::UploadTexture(upload) => (1, upload.target().candidate_guest_span,
+                Arc::ptr_eq(upload.target(), target).then(|| upload.color_write_coverage(subresource))),
+            PageOp::CopyTexture(copy) => (2, copy.target().candidate_guest_span,
+                Arc::ptr_eq(copy.target(), target).then(|| copy.color_write_coverage(subresource))),
+            _ => return,
+        };
+        let stats = &mut self.by_kind[kind];
+        stats.total += 1;
+        let (relation, related, physical) = if let Some(coverage) = coverage {
+            (coverage, true, "同宿主对象：未比较候选页")
+        } else {
+            let target_span = target.candidate_guest_span;
+            let (relation, va_match) = copy_prefix_va(span, target_span);
+            let shared = span.zip(target_span).and_then(|(span, target_span)| {
+                self.pages.get_or_insert_with(|| CopyPrefixPages::new(pins, target_span)).shares_page(pins, span)
+            });
+            let physical = match shared {
+                Some(true) => "提交已有捕获中共页",
+                Some(false) => "提交已有捕获完整，未见共页",
+                None => "不可观测（缺范围、缺捕获或超预算）",
+            };
+            (relation, va_match || shared == Some(true), physical)
+        };
+        *stats.destinations.entry(relation).or_default() += 1;
+        *stats.fixed_pages.entry(physical).or_default() += 1;
+        if related {
+            if stats.recent.len() == 4 { stats.recent.pop_front(); }
+            stats.recent.push_back((index, relation, physical));
+        }
+    }
+
+    fn trace(&self, index: usize, slot: usize, subresource: u32) {
+        for (kind, stats) in ["来宾字节复制（目的为来宾地址）", "显式纹理上传（目的为宿主对象）", "显式纹理复制（目的为宿主对象）"]
+            .into_iter().zip(&self.by_kind)
+        {
+            tracing::info!(
+                index, slot, subresource, kind, total = stats.total,
+                destination_relations = ?stats.destinations, captured_page_relations = ?stats.fixed_pages,
+                recent_candidate_index_and_relations = ?stats.recent,
+                "[VNME_PREFIX_COPY_INVENTORY] 颜色目标缺少内容：未提交前缀复制盘点（纹理虚拟范围仅作候选；共页不证明字节相交或旧像素）"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+#[test]
+fn copy_prefix_classifies_destination_cover_partial_and_unobservable() {
+    let target = Some((4, 9));
+    let source_only = GuestCopy::new(9, 4, 5).unwrap();
+    let [_, destination] = source_only.ranges();
+    assert_eq!(copy_prefix_va(Some(destination), target), ("虚拟范围不重叠", false));
+    assert_eq!(copy_prefix_va(Some((8, 10)), target), ("目的虚拟范围与目标候选范围部分重叠", true));
+    assert_eq!(copy_prefix_va(Some((4, 9)), target), ("目的虚拟范围覆盖目标候选范围", true));
+    assert_eq!(copy_prefix_va(Some(destination), None), ("虚拟关系未分类（候选范围缺失）", false));
+}
+
+#[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+#[test]
+fn copy_prefix_reports_only_observable_page_relations() {
+    let physical = victory_memory::physical::PageNumbers::default().allocate(2).unwrap();
+    let page = PAGE_BYTES as usize;
+    let span = |n: u64| (n * PAGE_BYTES, (n + 1) * PAGE_BYTES);
+    let mut pins = BackingPins::default();
+    pins.remember(page, 2 * page, Some(physical));
+    pins.remember(3 * page, 4 * page, Some(physical)); // 目的 VA 不同，但共页。
+    pins.remember(4 * page, 5 * page, Some(physical.offset(1)));
+    let mut incomplete = CopyPrefixPages::new(&pins, (PAGE_BYTES, 3 * PAGE_BYTES));
+    assert_eq!(incomplete.shares_page(&pins, span(3)), Some(true));
+    assert_eq!(incomplete.shares_page(&pins, span(4)), None); // 目标有空洞。
+    let mut complete = CopyPrefixPages::new(&pins, span(1));
+    assert_eq!(complete.shares_page(&pins, span(4)), Some(false));
+    assert_eq!(complete.shares_page(&pins, span(2)), None); // 目的未捕获。
+    assert_eq!(complete.shares_page(&pins, (PAGE_BYTES, PAGE_BYTES * 5000)), None); // 超预算。
+    assert_eq!(complete.shares_page(&pins, span(3)), Some(true));
+}
+
 /// 只在颜色目标缺少内容的失败路径上回查，不把候选写入当作权威。
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError, plan: &crate::page_resource::ResourcePlan) {
+fn trace_missing_color(
+    ops: &[PageOp], index: usize, error: &BatchError, plan: &crate::page_resource::ResourcePlan, pins: &BackingPins,
+) {
     use crate::page_slabs::TextureContentUse;
     use std::sync::Arc;
     let BatchError::MissingTextureContent {
@@ -311,7 +478,12 @@ fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError, plan: &
     let mut enhanced_payload_coverage = [0u64; 4];
     let mut enhanced_matched_objects = 0usize;
     let mut enhanced_same_target_recent = std::collections::VecDeque::with_capacity(8);
+    let mut copies = (crate::page_inventory::enabled() && tracing::enabled!(tracing::Level::INFO))
+        .then(CopyPrefixEvidence::default);
     for (prior_index, op) in ops[..index].iter().enumerate() {
+        if let Some(copies) = &mut copies {
+            copies.observe(prior_index, op, target, subresource, pins);
+        }
         if let PageOp::Barrier(barrier) = op
             && let crate::page_resource::PageBarrier::EnhancedUav { counts_by_kind, headers_skipped, payload_coverage, textures } = barrier.as_ref()
         {
@@ -379,6 +551,9 @@ fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError, plan: &
         native_generation_current = target.current_native_generation(),
         "颜色目标缺少内容：失败命令之前的已编码批内写入（虚拟范围重叠不证明物理别名）"
     );
+    if let Some(copies) = copies {
+        copies.trace(index, slot, subresource);
+    }
 }
 
 #[cfg(feature = "paged-title")]
@@ -1126,7 +1301,7 @@ impl Host {
                 Ok(())
             })().map_err(|error| {
                 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-                trace_missing_color(ops, index, &error, targets);
+                trace_missing_color(ops, index, &error, targets, pins);
                 op.failure("encode", index, error)
             })?;
         }
