@@ -127,6 +127,15 @@ pub(crate) fn stage_words(
         return Err(UnloweredShader::RootView);
     }
     for u in used {
+        // 立即采样器已由该着色器生成静态绑定，并由宿主 PSO 写入根签名，
+        // 不占用运行时描述符表。动态采样器表仍不属于此闭合路径。
+        if u.root == RootType::ImmediateSampler
+            && u.kind == victory_shader::ResourceType::Sampler
+            && !shader.static_samplers.is_empty()
+            && shader.static_samplers.len() == shader.samplers.len()
+        {
+            continue;
+        }
         if u.root == RootType::Descriptor
             && (u.kind == victory_shader::ResourceType::Cbv && cbvs(u.slot)
                 || u.kind == victory_shader::ResourceType::Srv && root_srvs(u.slot))
@@ -262,6 +271,20 @@ fn closed_draw_rejects_unlowered_shader_accesses() {
         constants_only(&shader, &[used], None, |_, _| None).err(),
         Some(UnloweredShader::DescriptorDeclaration { root: 0, kind: used.kind, source: used.root }),
     );
+    let sampler = [0; 4];
+    let baked = HostShader {
+        samplers: vec![sampler],
+        static_samplers: vec![victory_shader::emit::StaticSampler::from_words(sampler)],
+        ..shader.clone()
+    };
+    let declared = UsedResource {
+        root: RootType::ImmediateSampler, kind: victory_shader::ResourceType::Sampler,
+        slot: 7, dwords: 4, stride: 0, ..used
+    };
+    assert!(matches!(constants_only(&baked, &[declared], None, |_, _| None), Ok(None)));
+    assert!(constants_only(&shader, &[declared], None, |_, _| None).is_err());
+    assert!(constants_only(&baked, &[UsedResource { root: RootType::Table, ..declared }], None,
+        |_, _| None).is_err());
 }
 
 
