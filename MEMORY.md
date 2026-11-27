@@ -56,3 +56,12 @@
 
 - 使用仓库锁定的 Rust、Windows x64 MSVC、`--locked --features paged-title,diagnostics,blake3/pure`。新增诊断的定向测试过滤 `page_resource::native_history_tests`、`page_queue::copy_prefix_`；内容顺序的实像素测试为 `page_draw::paged_title_partial_color_clear_observes_submission_order`，仅相关改动时重跑。
 - 构建按提交分目录，先核对程序的 SHA-256 和来源再实跑。不同程序或触发条件用独立日志；仅提炼脱敏证据，不保存游戏数据、原始地址或私人路径到仓库。尚未达到可玩验证，不以离线测试或菜单停留替代。
+
+## 轮次 12 的生产判别 — 有序旧色生产者端到端反例
+
+- 基线 `8294e04768d43ac29c9df2ee6298b83a605735e1`；整合提交 `8aa9317a2cb9c92a9cb726fea808a8a5ffb26427`，已普通推送并核对 `origin/refactor/unified-memory-engine` 同 SHA。改动限于 `page_draw.rs` 和 `page_queue.rs`，staged asset policy 通过。
+- 新增无游戏数据的 D3D12/WARP 队列夹具：合成地址式 RGBA8 颜色目标由前置整面原生清除生产，再以真实 `SRC_ALPHA/INV_SRC_ALPHA` 混合绘制消费；Fence 完成后读回同时含底图红色和源绿色，证明旧色确实进入混合。无生产者、仅局部生产者、生产者晚于读者三种对照均在编码阶段拒绝，未放宽 `MissingTextureContent` 或 `TargetNotInitialized` 门槛。
+- `ordered_color_disjoint` 现在拒绝空/倒置候选范围，新增固定多页目的、首尾页物理别名、普通操作共页、未捕获页的正反例。它只加强最终物理身份检查，不把候选 VA 或诊断历史当作内容权威。
+- 定向验证使用锁定 Windows x64 MSVC 和 `--locked --offline`：有序颜色 2/2、混合旧色端到端 1/1、局部清除顺序 1/1、线性读取 2/2、UAV 预填充 2/2，共 8/8；测试程序 SHA-256 `0b046289ec1f06fa2c0bd05bf0bb5f964cd31b6ba990c222b72c5fe3f58e45e0`。
+- 判别结论：正例证明现有提交内“完整原生生产者 → 同目标旧色读者”路径可运行，负例证明不能用局部覆盖、后置写或仅有不相交线索替代生产者。最近实机首错没有改变；`64dd795` 仍是 draw 15 `MissingTextureContent`，本轮未重复启动已知坏包，也没有把合成夹具说成实机修复。当前工程决策保持拒绝，继续追同一次提交中目标绑定、真实读者及可证明底图生产者；格式 29 的 `SW_64KB_R_X` 主平面/元数据和 510 页最新字节仍未证明。
+- 下一步：从来宾调用录制还原 draw 15 的真实绑定和同提交前缀，优先找能在生产路径声明完整目的范围、物理身份和顺序的实际生产操作；若仍没有，审查最小缺失证据并换到数据平面/元数据来源，不再扩大历史日志。可控场景、10 分钟稳定性、峰值/帧时间和发行仍未验。
