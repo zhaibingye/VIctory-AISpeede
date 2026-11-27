@@ -712,6 +712,13 @@ pub(crate) struct TextureUpload {
 }
 
 impl TextureUpload {
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn color_write_coverage(&self, subresource: u32) -> &'static str {
+        if self.sub.index != subresource { "同对象其他子资源上传" }
+        else if self.fills_target { "同子资源整面上传" }
+        else { "同子资源局部上传" }
+    }
+
     #[cfg(feature = "paged-title")]
     pub(crate) fn preserves_color(&self) -> Option<&Arc<HostTexture>> {
         (!self.fills_target).then_some(&self.target)
@@ -898,6 +905,16 @@ struct CopyArea {
 }
 
 impl TextureCopy {
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn color_write_coverage(&self, subresource: u32) -> &'static str {
+        match &self.area {
+            None => "同对象整资源复制",
+            Some(_) if self.destination.index != subresource => "同对象其他子资源复制",
+            Some(area) if area.fills_destination => "同子资源整面复制",
+            Some(_) => "同子资源局部复制",
+        }
+    }
+
     #[cfg(feature = "paged-title")]
     pub(crate) fn preserves_color(&self) -> Option<&Arc<HostTexture>> {
         self.area.as_ref().filter(|area| !area.fills_destination).map(|_| &self.dst)

@@ -281,6 +281,64 @@ impl PageOp {
     }
 }
 
+/// 只在颜色目标缺少内容的失败路径上回查，不把候选写入当作权威。
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError) {
+    use crate::page_slabs::TextureContentUse;
+    use std::sync::Arc;
+    let BatchError::MissingTextureContent {
+        usage: TextureContentUse::ColorTarget { slot, subresource }, ..
+    } = *error else { return; };
+    let PageOp::Draw(draw) = &ops[index] else { return; };
+    let Some((target, bound_subresource)) = draw.color_binding(slot) else { return; };
+    if subresource != bound_subresource { return; }
+
+    let mut mentions = 0usize;
+    let mut recent = std::collections::VecDeque::with_capacity(12);
+    let mut writers = Vec::new();
+    let mut virtual_overlap_ops = 0usize;
+    let mut unknown_span_ops = 0usize;
+    for (prior_index, op) in ops[..index].iter().enumerate() {
+        writers.clear();
+        op.writes_native(&mut writers);
+        let exact = match op {
+            PageOp::Clear(clear) => clear.color_write_mentions(target, subresource),
+            PageOp::Draw(draw) => draw.color_write_mentions(target, subresource),
+            PageOp::CopyTexture(copy) => Some(copy.color_write_coverage(subresource)),
+            PageOp::UploadTexture(upload) => Some(upload.color_write_coverage(subresource)),
+            PageOp::ResolveTexture(_) if subresource == 0 => Some("同子资源整面解析"),
+            _ => None,
+        };
+        let mut same = false;
+        let mut overlap = false;
+        let mut unknown = false;
+        for writer in &writers {
+            if Arc::ptr_eq(writer, target) {
+                same = true;
+            } else if let (Some((a, b)), Some((c, d))) = (writer.candidate_guest_span, target.candidate_guest_span) {
+                overlap |= a < d && c < b;
+            } else {
+                unknown = true;
+            }
+        }
+        virtual_overlap_ops += usize::from(overlap);
+        unknown_span_ops += usize::from(unknown);
+        if same {
+            mentions += 1;
+            if recent.len() == 12 { recent.pop_front(); }
+            recent.push_back((prior_index, op.operation(), exact.unwrap_or("同对象写入候选（未分类覆盖）")));
+        }
+    }
+    tracing::info!(
+        index, slot, subresource, prior_same_object_ops = mentions, prior_same_object_recent = ?recent,
+        prior_virtual_overlap_ops = virtual_overlap_ops, prior_unknown_span_ops = unknown_span_ops,
+        known_committed_linear = target.exact_committed_bytes().is_some(),
+        known_compatible_source = target.compatible_texture_source().is_some(),
+        native_generation_current = target.current_native_generation(),
+        "颜色目标缺少内容：失败命令之前的已编码批内写入（虚拟范围重叠不证明物理别名）"
+    );
+}
+
 #[cfg(feature = "paged-title")]
 fn valid_query_pairs(ops: &[PageOp]) -> bool {
     let mut open = BTreeMap::new();
@@ -1010,7 +1068,11 @@ impl Host {
                     PageOp::UploadLease(lease) => { let _ = lease; },
                 }
                 Ok(())
-            })().map_err(|error| op.failure("encode", index, error))?;
+            })().map_err(|error| {
+                #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+                trace_missing_color(ops, index, &error);
+                op.failure("encode", index, error)
+            })?;
         }
         Ok(dirty)
     }

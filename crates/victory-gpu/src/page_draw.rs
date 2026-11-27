@@ -129,6 +129,18 @@ pub(crate) struct ColorClear {
 }
 
 impl ColorClear {
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn color_write_mentions(&self, copy: &Arc<HostTexture>, subresource: u32) -> Option<&'static str> {
+        if !Arc::ptr_eq(&self.target.copy, copy) { return None; }
+        Some(if self.target.sub.index != subresource {
+            "同对象其他子资源清除"
+        } else if self.replaces_all() {
+            "同子资源整面清除"
+        } else {
+            "同子资源局部清除"
+        })
+    }
+
     #[cfg(feature = "paged-title")]
     pub(crate) fn preserves_color(&self) -> Option<&Arc<HostTexture>> {
         (!self.replaces_all()).then_some(&self.target.copy)
@@ -406,6 +418,23 @@ fn closed_rectangle_topology_requires_a_geometry_shader() {
 }
 
 impl ClosedDraw {
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn color_binding(&self, slot: usize) -> Option<(&Arc<HostTexture>, u32)> {
+        self.targets.get(slot).map(|t| (&t.copy, t.sub.index))
+    }
+
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn color_write_mentions(&self, copy: &Arc<HostTexture>, subresource: u32) -> Option<&'static str> {
+        let mut matches_object = false;
+        for target in &self.targets {
+            if Arc::ptr_eq(&target.copy, copy) {
+                if target.sub.index == subresource { return Some("同子资源绘制（未证明整面覆盖）"); }
+                matches_object = true;
+            }
+        }
+        matches_object.then_some("同对象其他子资源绘制")
+    }
+
     #[cfg(feature = "paged-title")]
     pub(crate) fn preserved_colors<'a>(&'a self, out: &mut Vec<&'a Arc<HostTexture>>) {
         out.extend(self.targets.iter().map(|target| &target.copy));
