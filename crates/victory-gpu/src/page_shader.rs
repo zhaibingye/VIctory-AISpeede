@@ -882,13 +882,17 @@ impl ShaderBindings {
                     ClosedView::Texture(texture) => {
                         let shared = color_targets.iter().chain(&shared_uavs).any(|target| texture.aliases_target(target));
                         let (resource, format) = texture.encode(host, list, batch, plan,
-                            shared.then_some(&mut shared_access))?;
+                            shared.then_some(&mut shared_access))
+                            .map_err(|e| e.at_texture(crate::page_slabs::TextureContentUse::ShaderRead { root, index },
+                                texture.host_texture()))?;
                         TableDescriptor::Texture(resource, format, texture.selection())
                     }
                     ClosedView::NullTexture(format, selection) => TableDescriptor::NullTexture(*format, *selection),
                     ClosedView::TextureUav(view) => {
                         let shared = shared_uavs.iter().any(|target| target.texture == view.target().texture);
-                        view.prepare(host, list, batch, plan, shared.then_some(&mut shared_access))?
+                        view.prepare(host, list, batch, plan, shared.then_some(&mut shared_access))
+                            .map_err(|e| e.at_texture(crate::page_slabs::TextureContentUse::ShaderWrite { root, index },
+                                &view.target().texture))?
                     },
                     ClosedView::Raw(raw) if raw.unordered() => raw.prepare_uav(batch, &mut shader_dirty, 0)?,
                     ClosedView::Raw(raw) | ClosedView::TableConstant(raw) | ClosedView::ScalarStructured(raw, _) => {

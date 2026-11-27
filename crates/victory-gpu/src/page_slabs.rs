@@ -271,6 +271,14 @@ pub(crate) enum ListRejection {
     QueryPairing,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextureContentUse {
+    ColorTarget { slot: usize, subresource: u32 },
+    DepthStencil { required_planes: u32 },
+    ShaderRead { root: u8, index: u32 },
+    ShaderWrite { root: u8, index: u32 },
+}
+
 #[derive(Debug)]
 pub(crate) enum BatchError {
     UnloweredList { index: usize, reason: ListRejection },
@@ -281,6 +289,12 @@ pub(crate) enum BatchError {
         cause: Box<BatchError>,
     },
     TargetNotInitialized,
+    MissingTextureContent {
+        usage: TextureContentUse,
+        format: i32,
+        extent: (u64, u32, u16),
+        mip_levels: u16,
+    },
     UnsupportedDepth,
     UnsupportedBarrier,
     UnsupportedTextureMap { reason: &'static str, location: &'static std::panic::Location<'static> },
@@ -293,6 +307,17 @@ pub(crate) enum BatchError {
 }
 
 impl BatchError {
+    /// 给未初始化错误附上用途与无地址资源形状；其他错误原样传递。
+    pub(crate) fn at_texture(self, usage: TextureContentUse, texture: &ID3D12Resource) -> Self {
+        if !matches!(self, Self::TargetNotInitialized) { return self; }
+        // 安全：调用者保留了该原生资源。
+        let desc = unsafe { texture.GetDesc() };
+        Self::MissingTextureContent {
+            usage, format: desc.Format.0, extent: (desc.Width, desc.Height, desc.DepthOrArraySize),
+            mip_levels: desc.MipLevels,
+        }
+    }
+
     /// 保留拒绝的位置和原因，不记录来宾地址或纹理内容。
     #[track_caller]
     pub(crate) fn unsupported_texture_map(reason: &'static str) -> Self {

@@ -390,7 +390,7 @@ impl TextureInput {
         }
     }
 
-    pub(crate) fn aliases_target(&self, target: &crate::resource::HostTexture) -> bool {
+    pub(crate) fn host_texture(&self) -> &ID3D12Resource {
         let copy = match self {
             Self::Linear { copy, .. } | Self::Native { copy, .. } | Self::Scoped { copy, .. } => copy,
             #[cfg(feature = "paged-title")]
@@ -398,7 +398,11 @@ impl TextureInput {
             #[cfg(feature = "paged-title")]
             Self::OrderedRender(read) => &read.copy,
         };
-        copy.texture == target.texture
+        &copy.texture
+    }
+
+    pub(crate) fn aliases_target(&self, target: &crate::resource::HostTexture) -> bool {
+        self.host_texture() == &target.texture
     }
 
     pub(crate) fn is_native_depth_read_of(

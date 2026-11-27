@@ -561,7 +561,10 @@ impl ClosedDraw {
     ) -> Result<(), BatchError> {
         if let Some(depth) = &self.depth {
             depth.validate_backing()?;
-            initialized.require_depth_planes(&depth.copy, self.depth_tests)?;
+            initialized.require_depth_planes(&depth.copy, self.depth_tests)
+                .map_err(|e| e.at_texture(crate::page_slabs::TextureContentUse::DepthStencil {
+                    required_planes: self.depth_tests,
+                }, &depth.copy.texture))?;
         }
         let sampled_depth = self.depth.as_ref().is_some_and(|d| self.shader.samples_target(&d.copy));
         if let Some(depth) = &self.depth && sampled_depth && !self.shader.depth_reads_are_exact(&depth.copy) {
@@ -575,9 +578,12 @@ impl ClosedDraw {
         {
             return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
         }
-        for target in &self.targets {
+        for (slot, target) in self.targets.iter().enumerate() {
             target.validate_native()?;
-            initialized.require_color_subresource(host, list, batch, &target.copy, target.sub)?;
+            initialized.require_color_subresource(host, list, batch, &target.copy, target.sub)
+                .map_err(|e| e.at_texture(crate::page_slabs::TextureContentUse::ColorTarget {
+                    slot, subresource: target.sub.index,
+                }, &target.copy.texture))?;
         }
         let indirect = match self.call {
             DrawCall::Indirect(draw) => Some(draw.prepare(host, list, batch, budget)?),
