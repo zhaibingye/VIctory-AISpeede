@@ -460,12 +460,7 @@ impl TextureInput {
                     if plan.authoritative(copy) {
                         return Err(BatchError::unsupported_texture_map("共享体纹理的原生副本仍是权威来源"));
                     }
-                    for span in input.ranges() {
-                        batch.verify_independent_texture_backing(span)?;
-                    }
-                    plan.section_texture_read = true;
-                    plan.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
-                    input.transfer(host, list, batch, &copy.texture, None)?;
+                    input.gather_into(host, list, batch, plan, copy)?;
                 } else {
                     plan.require_native(host, list, batch, copy)?;
                 }
@@ -519,12 +514,7 @@ impl TextureInput {
                 if let Some(reason) = rejection {
                     return Err(BatchError::unsupported_texture_map(reason));
                 }
-                for span in input.ranges() {
-                    batch.verify_independent_texture_backing(span)?;
-                }
-                plan.section_texture_read = true;
-                plan.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
-                input.transfer(host, list, batch, &copy.texture, None)?;
+                input.gather_into(host, list, batch, plan, copy)?;
                 plan.transition_texture(list, copy, SHADER_READ.0 as u32)?;
                 list.keep(&copy.texture);
                 Ok((copy.texture.clone(), input.format))
@@ -785,6 +775,20 @@ impl SharedTextureBytes {
             return Err(BatchError::unsupported_texture_map("宿主纹理形状或格式与已固定的共享字节不一致"));
         }
         checked_texture_footprint(host, desc)
+    }
+
+    /// SRV 上传与 UAV 预填充都读取既有字节；成功后交由队列检查未分类的原生写者。
+    pub(crate) fn gather_into(
+        &self, host: &Host, list: &HostList, batch: &PinnedBatch,
+        plan: &mut crate::page_resource::ResourcePlan, copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) -> Result<(), BatchError> {
+        for span in self.ranges() {
+            batch.verify_independent_texture_backing(span)?;
+        }
+        plan.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
+        self.transfer(host, list, batch, &copy.texture, None)?;
+        plan.section_texture_read = true;
+        Ok(())
     }
 
     /// 调用方保证上传/读回所需状态；只交换有效行，不覆盖来宾填充字节。

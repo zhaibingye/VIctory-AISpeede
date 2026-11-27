@@ -26,6 +26,8 @@
 
 - `page_resource.rs` 的 `record_write_at_with` 必须将“可能写共享后备”和“可发布整面原生颜色版本”分开。弃旧后只清半面是实际写入，但整面仍为 `Discarded`。`page_queue.rs` 在原生入队前检查本批及此前提交的未分类原生写；拒绝是保守冲突裁决，不是相交证明，更不是旧色生产者。回归 `page_queue::discarded_partial_color_clear_blocks_shared_texture_read` 覆盖本批反例。
 
+- 共享体纹理 UAV 虽是输出，`ShaderTextureUav::prepare` 仍要从固定页预填充整面，以保留着色器未写的 texel。它与共享 SRV 同走 `SharedTextureBytes::gather_into`：逐有效区间验证独立后备，登记共享读取，交给提交门禁检查未分类原生写者。`verify_shared_volume` 只检查本条派发的视图与范围，不能代替这两项。`page_uav::prefill_tests` 有同页双 VA 不同宿主对象、后续 W 分片来源未证的反例。这条规则不为 R_X 颜色目标提供旧色。
+
 - 已完成 Fence 的物理页写回也不能按整页认领：`title_backing::merge_page` 只写提交前像与 GPU 回读的差异及显式覆盖的并集，即使两者分成很多段。整页读改写会回写未归 GPU 的间隙，既可能丢失并行 CPU 更新，也可能因间隙不可写而失败。`title_backing::writeback_tests` 用夹在可写片段之间的只读宿主页区分两条路径。只保证不触及间隙，不裁决 CPU/GPU 对同一字节的冲突。
 
 ## 已有的受限字节转换

@@ -2,6 +2,9 @@
 //! authoritative copy. Join aliases before creating native range views.
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(all(test, feature = "paged-title"))]
+mod prefill_tests;
+
 use victory_memory::{PAGE_BYTES, gpu_table::ADDRESS_LIMIT, physical::PhysicalPage};
 
 use crate::host::{Host, HostList};
@@ -322,8 +325,7 @@ impl ShaderTextureUav {
             if shared.is_some() || resources.authoritative(self.target()) {
                 return Err(BatchError::unsupported_texture_map("共享体纹理存在同一指令的别名绑定或原生权威副本"));
             }
-            resources.transition_texture(list, self.target(), D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
-            backing.transfer(host, list, pages, &self.target().texture, None)?;
+            backing.gather_into(host, list, pages, resources, self.target())?;
         } else {
             resources.require_color_subresource(host, list, pages, self.target(), self.subresource())?;
         }
