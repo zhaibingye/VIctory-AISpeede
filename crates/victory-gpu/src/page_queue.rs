@@ -287,7 +287,7 @@ impl PageOp {
 
 /// 只在颜色目标缺少内容的失败路径上回查，不把候选写入当作权威。
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError) {
+fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError, plan: &crate::page_resource::ResourcePlan) {
     use crate::page_slabs::TextureContentUse;
     use std::sync::Arc;
     let BatchError::MissingTextureContent {
@@ -297,6 +297,7 @@ fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError) {
     let Some((target, bound_subresource)) = draw.color_binding(slot) else { return; };
     if subresource != bound_subresource { return; }
     draw.trace_color_coverage_inputs(slot);
+    plan.trace_color_predecessor(target, subresource);
 
     let mut mentions = 0usize;
     let mut recent = std::collections::VecDeque::with_capacity(12);
@@ -1125,7 +1126,7 @@ impl Host {
                 Ok(())
             })().map_err(|error| {
                 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-                trace_missing_color(ops, index, &error);
+                trace_missing_color(ops, index, &error, targets);
                 op.failure("encode", index, error)
             })?;
         }

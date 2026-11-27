@@ -909,6 +909,9 @@ pub(crate) struct HostTexture {
     pub(crate) began_on_private_heap: bool,
     #[cfg(feature = "paged-title")]
     address_identity_key: Option<MemoryKey>,
+    // 只供诊断：同一查找键的前一个宿主对象，不证明分配未被复用。
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) diagnostic_predecessor: Option<std::sync::Weak<HostTexture>>,
     #[cfg(feature = "paged-title")]
     committed_linear: std::sync::OnceLock<crate::page_texture::LinearTexture>,
     #[cfg(feature = "paged-title")]
@@ -1221,6 +1224,8 @@ impl HostTexture {
             candidate_guest_span: None,
             #[cfg(feature = "paged-title")]
             address_identity_key: None,
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            diagnostic_predecessor: None,
             #[cfg(feature = "paged-title")]
             began_on_private_heap: false,
             #[cfg(feature = "paged-title")]
@@ -1622,6 +1627,10 @@ fn shared_texture(
     {
         texture.candidate_guest_span = native_writer_candidate_span(address, desc);
         texture.address_identity_key = key;
+        #[cfg(feature = "diagnostics")]
+        if crate::page_inventory::enabled() {
+            texture.diagnostic_predecessor = live.as_ref().map(std::sync::Arc::downgrade);
+        }
         texture.began_on_private_heap = texture.candidate_guest_span.is_some_and(|(start, end)|
             crate::title_backing::is_private_heap_span(start as usize, end as usize));
     }

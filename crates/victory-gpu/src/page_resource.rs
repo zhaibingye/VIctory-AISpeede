@@ -167,6 +167,37 @@ impl ResourcePlan {
         self.version_at(copy, None)
     }
 
+    /// 仅在缺失颜色内容时核对对象换代；不据此移交像素或判断物理别名。
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn trace_color_predecessor(&self, target: &Arc<HostTexture>, index: u32) {
+        if !crate::page_inventory::enabled() { return; }
+        let Some(weak) = &target.diagnostic_predecessor else {
+            tracing::info!(subresource = index, "颜色目标溯源：未记录同键前代");
+            return;
+        };
+        let Some(prior) = weak.upgrade() else {
+            tracing::info!(subresource = index, "颜色目标溯源：同键前代已释放");
+            return;
+        };
+        let describe = |copy: &Arc<HostTexture>, subresource| {
+            let key = (Self::key(copy), subresource);
+            let completed = copy.native_authority.lock().unwrap_or_else(|e| e.into_inner())
+                .get(&subresource)
+                .map(|entry| (entry.version.representation, entry.version.number, entry.fence.0));
+            let submitted = self.inherited.versions.get(&key)
+                .map(|entry| (entry.representation, entry.number));
+            (completed, submitted)
+        };
+        tracing::info!(
+            subresource = index,
+            predecessor_whole = ?describe(&prior, None),
+            predecessor_scoped = ?describe(&prior, Some(index)),
+            target_whole = ?describe(target, None),
+            target_scoped = ?describe(target, Some(index)),
+            "颜色目标溯源：同键前代与当前对象（已完成版本及 Fence，已提交版本）"
+        );
+    }
+
     pub(crate) fn authoritative(&self, copy: &Arc<HostTexture>) -> bool {
         #[cfg(feature = "paged-title")]
         if self.refreshed.contains_key(&Self::key(copy)) {
