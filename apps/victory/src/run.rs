@@ -83,8 +83,10 @@ pub fn run(
     // Before the import registry is first used: it holds the module only
     // when the host's FidelityFX serves.
     victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
-    let original = std::fs::read(exe).with_context(|| format!("无法读取 {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let prepared = {
+        let original = std::fs::read(exe).with_context(|| format!("无法读取 {}", exe.display()))?;
+        victory_loader::prepare(&original)?
+    };
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
@@ -100,6 +102,8 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // 映射已有独立的模块和解析信息；不把整份准备缓冲留到游戏线程退出。
+    drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(

@@ -22,6 +22,11 @@
 
 - `7174c48` 证实实际 PSO 的 RGB/Alpha 都是 `ADD(SRC_ALPHA, INV_SRC_ALPHA)`，不是可以删掉的旧色依赖。`9e65b0d` 的一次性只读探针完整观测到目标 510 个 CPU 页均为零（无内容或指纹落盘），仅代表 CPU 当前读值。`e61c206` 显示前缀 8/10 两个颜色清除及 12/13 两个绘制都写别的默认私有堆对象（格式 28，而目标为 29），6 的 compute 输出不同且失败时物理页交集为零。不能按尺寸移交。下一步应从可信物理节的初始字节、物理写入时序和可验证的数据平面转换构建可独立回归的字节兼容路径，不从零观测直接推导清屏。
 
+## 开场 XMem 的宿主 RAM 准入
+
+- 原生 Windows `paged-title` 用 `SEC_RESERVE` 创建 section。`DeferredRam` 按 **section 内页号**预扣净新增 64 KiB 页；宿主提交失败退回新增额度，解绑单个 VA 不释放仍存活的 section。`xmem::tests::deferred_native_` 用真实重叠视图、只读视图提交失败、同 VA 换节后重试验证这些边界。拒绝日志的 `requested_mib` 是整段长度，不是净新增字节；不能据此断言重复计费。
+- 启动时 `prepare` 持有原文件的完整补丁副本；`load` 返回的 `LoadedImage` 已有独立宿主映射和解析信息，无需把原始或准备缓冲保留到 `main.join()`。释放它们不释放 XMem 租约，也不改变预算公式；是否还有足够 RAM 须按当次采样验证。
+
 ## 共享字节读取的生产门禁
 
 - `page_resource.rs` 的 `record_write_at_with` 必须将“可能写共享后备”和“可发布整面原生颜色版本”分开。弃旧后只清半面是实际写入，但整面仍为 `Discarded`。`page_queue.rs` 在原生入队前检查本批及此前提交的未分类原生写；拒绝是保守冲突裁决，不是相交证明，更不是旧色生产者。回归 `page_queue::discarded_partial_color_clear_blocks_shared_texture_read` 覆盖本批反例。
