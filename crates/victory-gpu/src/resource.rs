@@ -2570,7 +2570,7 @@ fn texture_at_inner(
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { key.1.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER || require_current && d.dimension != 3 {
+    if d.dimension == BUFFER || require_current && !matches!(d.dimension, 3 | TEXTURE_3D) {
         return None;
     }
     // Never select sparse backing where an existing title texture can

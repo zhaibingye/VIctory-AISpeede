@@ -26,16 +26,36 @@ impl MipSelection {
     }
 }
 
-/// Shader dimension and plane-zero subresource selection. A one-slice
-/// array is still an array view and must match the shader operand.
+/// 一层数组仍是数组；体纹理的深度绝不是数组层。
+#[derive(Clone, Copy)]
+pub(crate) enum TextureViewKind {
+    Plane,
+    Array(MipSelection),
+    Volume,
+}
+
+/// 原生视图的维度与 mip 范围。
 #[derive(Clone, Copy)]
 pub(crate) struct TextureSelection {
     pub(crate) mips: MipSelection,
-    pub(crate) slices: Option<MipSelection>,
+    pub(crate) kind: TextureViewKind,
 }
 
 impl TextureSelection {
-    pub(crate) const SINGLE: Self = Self { mips: MipSelection::SINGLE, slices: None };
+    pub(crate) const SINGLE: Self = Self { mips: MipSelection::SINGLE, kind: TextureViewKind::Plane };
+    pub(crate) const VOLUME: Self = Self { kind: TextureViewKind::Volume, ..Self::SINGLE };
+
+    pub(crate) fn color_2d(mips: MipSelection, slices: Option<MipSelection>) -> Self {
+        Self { mips, kind: slices.map_or(TextureViewKind::Plane, TextureViewKind::Array) }
+    }
+
+    pub(crate) fn slices(self) -> Option<MipSelection> {
+        if let TextureViewKind::Array(slices) = self.kind { Some(slices) } else { None }
+    }
+
+    pub(crate) fn matches_2d(self, array: bool) -> bool {
+        matches!((self.kind, array), (TextureViewKind::Plane, false) | (TextureViewKind::Array(_), true))
+    }
 }
 
 const SHADER_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
@@ -81,6 +101,12 @@ impl ScopedTextureAccess {
 /// One admitted shader view, consumed from ordered native authority or
 /// from an exact compatible byte representation.
 pub(crate) enum TextureInput {
+    #[cfg(feature = "paged-title")]
+    Volume {
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        format: DXGI_FORMAT,
+        backing: Option<SharedTextureBytes>,
+    },
     #[cfg(feature = "paged-title")]
     Section2d {
         copy: std::sync::Arc<crate::resource::HostTexture>,
@@ -143,6 +169,31 @@ fn extended_color_support(host: &Host, format: DXGI_FORMAT) -> bool {
             D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut caps).cast(), size_of_val(&caps) as u32,
         ) }.is_ok()
             && caps.Support1.contains(D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)
+    })
+}
+
+#[cfg(feature = "paged-title")]
+fn volume_sampling_supported(host: &Host, format: DXGI_FORMAT) -> bool {
+    const FORMATS: [DXGI_FORMAT; EXTENDED_COLOR.len() + 2] = {
+        let mut result = [DXGI_FORMAT_R8G8B8A8_UNORM; EXTENDED_COLOR.len() + 2];
+        result[1] = DXGI_FORMAT_B8G8R8A8_UNORM;
+        let mut i = 0;
+        while i < EXTENDED_COLOR.len() {
+            result[i + 2] = EXTENDED_COLOR[i];
+            i += 1;
+        }
+        result
+    };
+    static SUPPORT: [std::sync::OnceLock<bool>; FORMATS.len()] =
+        [const { std::sync::OnceLock::new() }; FORMATS.len()];
+    let Some(index) = FORMATS.iter().position(|&f| f == format) else { return false; };
+    *SUPPORT[index].get_or_init(|| {
+        let mut caps = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+        // 安全：查询结果写入与类型匹配的本地结构。
+        unsafe { host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut caps).cast(), size_of_val(&caps) as u32,
+        ) }.is_ok()
+            && caps.Support1.contains(D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)
     })
 }
 
@@ -210,7 +261,7 @@ impl TextureInput {
         // SAFETY: retained native resource.
         let desc = unsafe { copy.texture.GetDesc() };
         if !sample_color(format) || desc.Format != format
-            || (desc.DepthOrArraySize > 1) != selection.slices.is_some()
+            || !selection.matches_2d(desc.DepthOrArraySize > 1)
             || (desc.DepthOrArraySize == 1 && desc.MipLevels <= 1)
             || desc.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
             || copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
@@ -218,22 +269,27 @@ impl TextureInput {
             return None;
         }
         let mips = MipSelection::resolve(selection.mips.first, selection.mips.count, u32::from(desc.MipLevels))?;
-        let slices = match selection.slices {
+        let slices = match selection.slices() {
             Some(slices) => Some(MipSelection::resolve(slices.first, slices.count, u32::from(desc.DepthOrArraySize))?),
             None => None,
         };
         let sub = crate::page_resource::ColorSubresource::from_mip_slice(desc, mips.first, slices.map_or(0, |s| s.first))?;
         if !sub.allows(&copy) { return None; }
-        Some(Self::Scoped { copy, format, selection: TextureSelection { mips, slices } })
+        Some(Self::Scoped { copy, format, selection: TextureSelection::color_2d(mips, slices) })
     }
 
     #[cfg(feature = "paged-title")]
     pub(crate) fn has_exact_guest_bytes(&self) -> bool {
-        matches!(self, Self::Linear { .. } | Self::Section2d { .. })
+        matches!(self, Self::Linear { .. } | Self::Section2d { .. } | Self::Volume { backing: Some(_), .. })
     }
 
     pub(crate) fn selection(&self) -> TextureSelection {
-        match self { Self::Scoped { selection, .. } => *selection, _ => TextureSelection::SINGLE }
+        match self {
+            Self::Scoped { selection, .. } => *selection,
+            #[cfg(feature = "paged-title")]
+            Self::Volume { .. } => TextureSelection::VOLUME,
+            _ => TextureSelection::SINGLE,
+        }
     }
 
     pub(crate) fn native_depth(
@@ -269,6 +325,10 @@ impl TextureInput {
         match self {
             Self::Scoped { .. } => {},
             #[cfg(feature = "paged-title")]
+            Self::Volume { backing, .. } => {
+                if let Some(input) = backing { ranges.extend(input.ranges()); }
+            },
+            #[cfg(feature = "paged-title")]
             Self::Section2d { input, .. } => ranges.extend(input.ranges()),
             Self::Linear { input, .. } => ranges.extend(input.rows()?),
             Self::Native { copy, compatible_input: Some(input), .. } => {
@@ -297,7 +357,7 @@ impl TextureInput {
         let copy = match self {
             Self::Linear { copy, .. } | Self::Native { copy, .. } | Self::Scoped { copy, .. } => copy,
             #[cfg(feature = "paged-title")]
-            Self::Section2d { copy, .. } => copy,
+            Self::Section2d { copy, .. } | Self::Volume { copy, .. } => copy,
         };
         copy.texture == target.texture
     }
@@ -321,7 +381,7 @@ impl TextureInput {
         let mips = u32::from(unsafe { copy.texture.GetDesc() }.MipLevels);
         if mips == 0 { return true; }
         let (mip, slice) = (sub.index % mips, sub.index / mips);
-        let slices = selection.slices.unwrap_or(MipSelection::SINGLE);
+        let slices = selection.slices().unwrap_or(MipSelection::SINGLE);
         mip >= selection.mips.first && mip - selection.mips.first < selection.mips.count
             && slice >= slices.first && slice - slices.first < slices.count
     }
@@ -331,6 +391,33 @@ impl TextureInput {
         plan: &mut crate::page_resource::ResourcePlan, mut shared: Option<&mut ScopedTextureAccess>,
     ) -> Result<(ID3D12Resource, DXGI_FORMAT), BatchError> {
         match self {
+            #[cfg(feature = "paged-title")]
+            Self::Volume { copy, format, backing } => {
+                if shared.is_some() || copy.has_pointer_exposure()
+                    || copy.uses_unproven_alias_backing() != backing.is_some()
+                {
+                    return Err(BatchError::unsupported_texture_map("体纹理采样的所有权或别名未获证明"));
+                }
+                if !volume_sampling_supported(host, *format) {
+                    return Err(BatchError::unsupported_texture_map("设备不支持该格式的原生体纹理采样"));
+                }
+                if let Some(input) = backing {
+                    if plan.authoritative(copy) {
+                        return Err(BatchError::unsupported_texture_map("共享体纹理的原生副本仍是权威来源"));
+                    }
+                    for span in input.ranges() {
+                        batch.verify_independent_texture_backing(span)?;
+                    }
+                    plan.section_texture_read = true;
+                    plan.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
+                    input.transfer(host, list, batch, &copy.texture, None)?;
+                } else {
+                    plan.require_native(host, list, batch, copy)?;
+                }
+                plan.transition_texture(list, copy, SHADER_READ.0 as u32)?;
+                list.keep(&copy.texture);
+                Ok((copy.texture.clone(), *format))
+            }
             Self::Scoped { copy, format, selection } => {
                 if !extended_color_support(host, *format) {
                     return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
@@ -338,7 +425,7 @@ impl TextureInput {
                 // SAFETY: live resource retained by this view.
                 let desc = unsafe { copy.texture.GetDesc() };
                 let mips = selection.mips;
-                let slices = selection.slices.unwrap_or(MipSelection::SINGLE);
+                let slices = selection.slices().unwrap_or(MipSelection::SINGLE);
                 for slice in slices.first..slices.first + slices.count {
                     for mip in mips.first..mips.first + mips.count {
                         let sub = crate::page_resource::ColorSubresource::from_mip_slice(desc, mip, slice)
@@ -971,10 +1058,10 @@ impl PreparedSample {
     }
 }
 
-/// 验证宿主 D3D12 有类型三维纹理视图的边缘写入，不依赖游戏材料或 VNME 准入规则。
+/// 验证三维视图边缘写入与 VNME SRV 原生采样，不需要游戏。
 #[cfg(test)]
 #[test]
-fn native_texture3d_typed_store_preserves_every_voxel_after_edge_writes() {
+fn native_texture3d_store_and_sample_level_zero_keep_depth_coordinates() {
     let host = crate::host::host().expect("D3D12 宿主设备");
     let (root, pso) = crate::memory::tests::pipeline(r#"
 #define RS "DescriptorTable(UAV(u0)), RootConstants(num32BitConstants=1, b0)"
@@ -989,6 +1076,17 @@ void main(uint3 pos : SV_DispatchThreadID) {
     } else {
         if (!inside) volume[pos] = float4(-1.0, -2.0, -3.0, -4.0);
     }
+}
+"#);
+    let (sample_root, sample_pso) = crate::memory::tests::pipeline(r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_POINT)"
+Texture3D<float4> volume : register(t0);
+SamplerState points : register(s0);
+RWByteAddressBuffer result : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    result.Store4(0, asuint(volume.SampleLevel(points, float3(2.5, 4.5, 28.5) / 33.0, 0)));
 }
 "#);
     const SIDE: u32 = 33;
@@ -1015,13 +1113,21 @@ void main(uint3 pos : SV_DispatchThreadID) {
     };
     let texture = make(D3D12_HEAP_TYPE_DEFAULT, &desc, unordered);
     let (footprint, total) = checked_texture_footprint(host, desc).unwrap();
-    let readback = make(D3D12_HEAP_TYPE_READBACK, &D3D12_RESOURCE_DESC {
+    let bytes_desc = |width| D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+        Width: width, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         ..Default::default()
-    }, D3D12_RESOURCE_STATE_COPY_DEST);
+    };
+    let readback = make(D3D12_HEAP_TYPE_READBACK, &bytes_desc(total), D3D12_RESOURCE_STATE_COPY_DEST);
+    let sample_readback = make(D3D12_HEAP_TYPE_READBACK, &bytes_desc(16), D3D12_RESOURCE_STATE_COPY_DEST);
+    let sample_result = make(D3D12_HEAP_TYPE_DEFAULT, &D3D12_RESOURCE_DESC {
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..bytes_desc(16)
+    }, unordered);
+    let srv_heap = crate::memory::heap().unwrap();
+    let srv_slot = srv_heap.dynamic(1).unwrap();
+    srv_heap.paged_texture_at(srv_slot, Some(&texture), desc.Format, TextureSelection::VOLUME);
     let list = host.new_list().unwrap();
     let cmd = list.recording();
     // 安全：独占测试堆中的一个描述符，绑定一个与原格式/全深度一致的三维资源。
@@ -1048,7 +1154,18 @@ void main(uint3 pos : SV_DispatchThreadID) {
         cmd.ResourceBarrier(&[transition(&texture, copy_source, unordered)]);
         cmd.SetComputeRoot32BitConstant(1, 1, 0);
         cmd.Dispatch(5, 5, SIDE);
-        cmd.ResourceBarrier(&[transition(&texture, unordered, copy_source)]);
+        cmd.ResourceBarrier(&[transition(&texture, unordered, SHADER_READ)]);
+        cmd.SetDescriptorHeaps(&[Some(srv_heap.heap.clone())]);
+        cmd.SetComputeRootSignature(&sample_root);
+        cmd.SetComputeRootDescriptorTable(0, srv_heap.gpu(srv_slot));
+        cmd.SetComputeRootUnorderedAccessView(1, sample_result.GetGPUVirtualAddress());
+        cmd.SetPipelineState(&sample_pso);
+        cmd.Dispatch(1, 1, 1);
+        cmd.ResourceBarrier(&[
+            transition(&texture, SHADER_READ, copy_source),
+            transition(&sample_result, unordered, copy_source),
+        ]);
+        cmd.CopyBufferRegion(&sample_readback, 0, &sample_result, 0, 16);
         let src = D3D12_TEXTURE_COPY_LOCATION {
             pResource: std::mem::transmute_copy(&texture),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -1066,6 +1183,15 @@ void main(uint3 pos : SV_DispatchThreadID) {
     {
         let mut signal = host.direct_queue();
         host.run_native_group(&mut signal, &[Some(cmd.cast().unwrap())]).unwrap();
+    }
+    srv_heap.paged_texture_at(srv_slot, None, desc.Format, TextureSelection::VOLUME);
+    srv_heap.release(srv_slot, 1);
+    let mut sampled = std::ptr::null_mut();
+    // 安全：GPU 已完成，读回缓冲区恰好含有四个 f32。
+    unsafe {
+        sample_readback.Map(0, None, Some(&mut sampled)).unwrap();
+        assert_eq!(std::slice::from_raw_parts(sampled.cast::<f32>(), 4), &[3.0, 5.0, 29.0, 1.0]);
+        sample_readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
     }
     let half = |positive: u32| {
         let exponent = positive.ilog2();

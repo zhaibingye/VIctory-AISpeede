@@ -41,7 +41,7 @@ pub(crate) enum DescriptorSlotReason {
     RootWord,
     UnboundOrStale,
     UnsupportedTexture {
-        array: bool, kind: &'static str, title_format: Option<u32>,
+        array: bool, volume: bool, kind: &'static str, title_format: Option<u32>,
         view_format: Option<u32>, view_dimension: Option<u32>,
         texture_signature: Option<crate::resource::TextureSrvShape>,
         phase: crate::descriptor::TextureSrvReject,
@@ -543,10 +543,21 @@ impl ShaderBindings {
                                         let (kind, title_format, view_format, view_dimension, texture_signature) =
                                             actual.texture_srv_metadata();
                                         reason(DescriptorSlotReason::UnsupportedTexture {
-                                            array, kind, title_format, view_format, view_dimension, texture_signature, phase,
+                                            array, volume: false, kind, title_format, view_format, view_dimension, texture_signature, phase,
                                         })
                                     })?)
                                 }
+                            }
+                            #[cfg(feature = "paged-title")]
+                            StaticViewAccess::VolumeTextureRead => {
+                                ClosedView::Texture(actual.paged_volume_srv().map_err(|phase| {
+                                    let (kind, title_format, view_format, view_dimension, texture_signature) =
+                                        actual.texture_srv_metadata();
+                                    reason(DescriptorSlotReason::UnsupportedTexture {
+                                        array: false, volume: true, kind, title_format, view_format, view_dimension,
+                                        texture_signature, phase,
+                                    })
+                                })?)
                             }
                             StaticViewAccess::TextureWrite { .. } if pipeline.compute => {
                                 ClosedView::TextureUav(crate::descriptor::host::paged_shader_texture_uav(&actual).map_err(|phase| {
@@ -601,9 +612,11 @@ impl ShaderBindings {
                     }
                     match (table.get_mut(&slot.index), proof.access) {
                         (Some(ClosedView::Texture(texture)), StaticViewAccess::TextureRead { array })
-                            if texture.selection().slices.is_some() == array => {},
+                            if texture.selection().matches_2d(array) => {},
+                        (Some(ClosedView::Texture(texture)), StaticViewAccess::VolumeTextureRead)
+                            if matches!(texture.selection().kind, crate::page_texture::TextureViewKind::Volume) => {},
                         (Some(ClosedView::NullTexture(_, selection)), StaticViewAccess::TextureRead { array })
-                            if selection.slices.is_some() == array => {},
+                            if selection.matches_2d(array) => {},
                         (Some(ClosedView::TextureUav(view)), StaticViewAccess::TextureWrite { x, y, z, sources, exec_guard, dispatch }) => {
                             if !view.allows(x, y, z) && !view.allows_dispatch_edge(x, y, z, dispatch) {
                                 return Err(reason(DescriptorSlotReason::TextureWriteRange {

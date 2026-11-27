@@ -423,7 +423,7 @@ impl PinnedBatch {
         for va in (first..end).step_by(PAGE_BYTES as usize) {
             let &(page, own_reservation) = self.aliases.get(&va).ok_or(BatchError::NotCaptured(va))?;
             if page.is_private() && !own_reservation {
-                return Err(BatchError::unsupported_texture_map("二维纹理的私有页未证明来自独立保留区"));
+                return Err(BatchError::unsupported_texture_map("纹理的私有页未证明来自独立保留区"));
             }
         }
         Ok(())

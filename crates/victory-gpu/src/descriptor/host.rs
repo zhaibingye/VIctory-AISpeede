@@ -688,15 +688,19 @@ impl HostHeap {
     ) {
         let Some(host) = host() else { return };
         let mips = view.mips;
-        let (dimension, fields) = match view.slices {
-            Some(slices) => (D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+        use crate::page_texture::TextureViewKind::*;
+        let (dimension, fields) = match view.kind {
+            Volume => (D3D12_SRV_DIMENSION_TEXTURE3D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_SRV { MostDetailedMip: mips.first, MipLevels: mips.count, ResourceMinLODClamp: 0.0 },
+            }),
+            Array(slices) => (D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
                     MostDetailedMip: mips.first, MipLevels: mips.count,
                     FirstArraySlice: slices.first, ArraySize: slices.count,
                     ..Default::default()
                 },
             }),
-            None => (D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Plane => (D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mips.first, MipLevels: mips.count, ..Default::default() },
             }),
         };
@@ -973,7 +977,23 @@ pub(super) fn paged_2d_srv(words: &[u32; 10]) -> Option<(DXGI_FORMAT, crate::pag
         }
         _ => return None,
     };
-    Some((desc.Format, TextureSelection { mips, slices }))
+    Some((desc.Format, TextureSelection::color_2d(mips, slices)))
+}
+
+/// 体纹理 SRV 按 mip 寻址，不能将空间深度解释为数组层。
+#[cfg(feature = "paged-title")]
+pub(super) fn paged_volume_srv(words: &[u32; 10]) -> Option<(DXGI_FORMAT, crate::page_texture::MipSelection)> {
+    let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE3D
+        || desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+    {
+        return None;
+    }
+    // 安全：视图维度已验证。
+    let view = unsafe { desc.Anonymous.Texture3D };
+    (view.ResourceMinLODClamp == 0.0).then_some((desc.Format, crate::page_texture::MipSelection {
+        first: view.MostDetailedMip, count: view.MipLevels,
+    }))
 }
 
 pub(crate) fn paged_texture_uav_desc(
@@ -1896,14 +1916,24 @@ fn placed_pending(view: &View) -> bool {
 
 /// 将已验证的地址式 SRV 接到 VNME，不重用过时纹理或接纳写者别名。
 #[cfg(feature = "paged-title")]
-pub(super) fn paged_placed_texture(view: &View, array: bool) -> Result<(crate::object::This, [u32; 10]), super::TextureSrvReject> {
+pub(super) fn paged_placed_texture(view: &View, array: bool, volume: bool) -> Result<(crate::object::This, [u32; 10]), super::TextureSrvReject> {
     use super::TextureSrvReject::*;
     let View::Placed(false, resource, desc) = view else { return Err(ViewKind); };
     let words: [u32; 10] = desc[..10].try_into().map_err(|_| ViewShape)?;
     // 先验证视图形状、映射和格式，不为必定拒绝的描述符分配宿主纹理。
-    let (_, selection) = paged_2d_srv(&words).ok_or(ViewShape)?;
-    if resource[0] != 3 || selection.slices.is_some() != array {
-        return Err(ViewShape);
+    if volume {
+        let (format, mips) = paged_volume_srv(&words).ok_or(ViewShape)?;
+        // 只支持单 mip，提前拒绝不支持的格式或窗口，不浪费原生分配。
+        if resource[0] != 4 || resource[7] >> 16 != 1 || !crate::page_texture::sample_color(format)
+            || crate::page_texture::MipSelection::resolve(mips.first, mips.count, 1).is_none()
+        {
+            return Err(ViewShape);
+        }
+    } else {
+        let (_, selection) = paged_2d_srv(&words).ok_or(ViewShape)?;
+        if resource[0] != 3 || !selection.matches_2d(array) {
+            return Err(ViewShape);
+        }
     }
     let address = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
     if address == 0 || address >= victory_memory::gpu_table::ADDRESS_LIMIT {

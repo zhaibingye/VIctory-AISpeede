@@ -574,7 +574,7 @@ struct BitmapTracking {
 pub(crate) struct PageDescriptors<'a> {
     pub(crate) heap: &'a HostHeap,
     slots: Vec<u32>,
-    textures: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)>,
+    textures: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, crate::page_texture::TextureSelection)>,
     raw_views: Vec<(u32, bool)>,
     structured_views: Vec<(u32, u32, bool)>,
     texture_uavs: Vec<(u32, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, crate::page_uav::TextureUavSelection)>,
@@ -634,7 +634,7 @@ impl PageDescriptors<'_> {
                         _ => (None, DXGI_FORMAT_R8G8B8A8_UNORM, crate::page_texture::TextureSelection::SINGLE),
                     };
                     self.heap.paged_texture_at(slot, resource, format, selection);
-                    self.textures.push((slot, format));
+                    self.textures.push((slot, format, selection));
                 }
             }
         }
@@ -657,7 +657,7 @@ impl PageDescriptors<'_> {
     ) -> Result<u32> {
         let slot = self.heap.dynamic(1).ok_or_else(oom)?;
         self.heap.paged_texture_at(slot, Some(texture), format, crate::page_texture::TextureSelection::SINGLE);
-        self.textures.push((slot, format));
+        self.textures.push((slot, format, crate::page_texture::TextureSelection::SINGLE));
         Ok(slot)
     }
 }
@@ -676,8 +676,8 @@ impl Drop for PageDescriptors<'_> {
             self.heap.raw_view_at(slot, None, 0, 0, unordered);
             self.heap.release(slot, 1);
         }
-        for (slot, format) in self.textures.drain(..) {
-            self.heap.paged_texture_at(slot, None, format, crate::page_texture::TextureSelection::SINGLE);
+        for (slot, format, selection) in self.textures.drain(..) {
+            self.heap.paged_texture_at(slot, None, format, selection);
             self.heap.release(slot, 1);
         }
         for slot in self.slots.drain(..) {

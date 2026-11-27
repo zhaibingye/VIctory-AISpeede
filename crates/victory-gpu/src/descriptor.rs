@@ -421,7 +421,7 @@ impl View {
             Self::Shader(resource, desc) => (resource as This, desc),
             #[cfg(feature = "paged-title")]
             Self::Placed(false, _, _) => {
-                let (resource, words) = host::paged_placed_texture(self, array)?;
+                let (resource, words) = host::paged_placed_texture(self, array, false)?;
                 (resource, Some(words))
             }
             _ => return Err(ViewKind),
@@ -435,11 +435,11 @@ impl View {
             let slices = (actual.DepthOrArraySize > 1).then_some(MipSelection {
                 first: 0, count: u32::from(actual.DepthOrArraySize),
             });
-            (DXGI_FORMAT(crate::resource::title_format(resource).ok_or(ViewKind)? as i32), TextureSelection {
-                mips: MipSelection { first: 0, count: u32::MAX }, slices,
-            })
+            (DXGI_FORMAT(crate::resource::title_format(resource).ok_or(ViewKind)? as i32), TextureSelection::color_2d(
+                MipSelection { first: 0, count: u32::MAX }, slices,
+            ))
         };
-        if array != selection.slices.is_some() { return Err(ViewShape); }
+        if !selection.matches_2d(array) { return Err(ViewShape); }
         selection.mips = MipSelection::resolve(
             selection.mips.first, selection.mips.count, u32::from(actual.MipLevels),
         ).ok_or(ViewRange)?;
@@ -492,6 +492,54 @@ impl View {
         })
     }
 
+    #[cfg(all(windows, feature = "paged-title"))]
+    pub(crate) fn paged_volume_srv(&self) -> Result<crate::page_texture::TextureInput, TextureSrvReject> {
+        use TextureSrvReject::*;
+        use crate::page_texture::{MipSelection, TextureInput, sample_color};
+        use windows::Win32::Graphics::{Direct3D12::D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE, Dxgi::Common::DXGI_FORMAT};
+        let (resource, desc) = match *self {
+            Self::Shader(resource, desc) if resource != 0 => (resource as This, desc),
+            Self::Placed(false, _, _) => {
+                let (resource, words) = host::paged_placed_texture(self, false, true)?;
+                (resource, Some(words))
+            }
+            _ => return Err(ViewKind),
+        };
+        let title = DXGI_FORMAT(crate::resource::title_format(resource).ok_or(ViewKind)? as i32);
+        let copy = crate::resource::host_copy(resource).ok_or(NativeAllocation)?;
+        // 安全：宿主纹理由 copy 持有。
+        let actual = unsafe { copy.texture.GetDesc() };
+        if crate::resource::stands_in(resource) || title != actual.Format {
+            return Err(SurrogateFormat);
+        }
+        let (format, mips) = if let Some(words) = desc {
+            host::paged_volume_srv(&words).ok_or(ViewShape)?
+        } else {
+            (title, MipSelection::SINGLE)
+        };
+        if !sample_color(format) || format != title
+            || actual.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+            || crate::page_resource::ColorSubresource::single_volume(actual, 0).is_none()
+        {
+            return Err(ViewShape);
+        }
+        MipSelection::resolve(mips.first, mips.count, 1).ok_or(ViewRange)?;
+        if copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
+            || copy.has_pointer_exposure()
+        {
+            return Err(WriterAlias);
+        }
+        let backing = if copy.uses_unproven_alias_backing() {
+            if crate::resource::alias_source(resource).is_some() { return Err(WriterAlias); }
+            Some(crate::resource::address_volume_bytes(resource)
+                .filter(|bytes| bytes.format == format)
+                .ok_or(NativeOrBytes { external_alias: true, host_format: actual.Format.0 })?)
+        } else {
+            None
+        };
+        Ok(TextureInput::Volume { copy, format, backing })
+    }
+
     /// 仅游戏显式绑定的带类型空 SRV 才可生成宿主空视图，绝不替代真实纹理。
     #[cfg(windows)]
     pub(crate) fn paged_null_texture_srv(&self, array: bool) -> Option<(
@@ -505,9 +553,9 @@ impl View {
             s.count > 0 && s.first.checked_add(s.count).is_some_and(|end| end <= limit)
         };
         if !crate::page_texture::sample_color(format)
-            || array != selection.slices.is_some()
+            || !selection.matches_2d(array)
             || !within(selection.mips, D3D12_REQ_MIP_LEVELS)
-            || selection.slices.is_some_and(|s| !within(s, D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION))
+            || selection.slices().is_some_and(|s| !within(s, D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION))
         {
             return None;
         }

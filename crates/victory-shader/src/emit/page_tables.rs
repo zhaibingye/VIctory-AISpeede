@@ -20,6 +20,7 @@ pub struct StaticTextureSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StaticViewAccess {
     TextureRead { array: bool },
+    VolumeTextureRead,
     TextureWrite {
         x: u32, y: u32, z: Option<u32>,
         sources: [&'static str; 3], exec_guard: bool,
@@ -289,6 +290,7 @@ fn closed_image_read(operation: &str, dimension: u8) -> Option<StaticViewAccess>
     }
     match dimension {
         1 => Some(StaticViewAccess::TextureRead { array: false }),
+        2 if operation == "image_sample_lz" => Some(StaticViewAccess::VolumeTextureRead),
         4 => Some(StaticViewAccess::TextureRead { array: true }),
         _ => None,
     }
@@ -301,6 +303,10 @@ fn page_image_size_query_uses_the_exact_2d_shader_view() {
     assert_eq!(closed_image_read("image_get_resinfo", 4), None);
     assert_eq!(closed_image_read("image_get_resinfo", 3), None);
     assert_eq!(closed_image_read("image_store", 1), None);
+    assert_eq!(closed_image_read("image_sample_lz", 2), Some(StaticViewAccess::VolumeTextureRead));
+    for operation in ["image_sample", "image_sample_lz_o", "image_get_resinfo", "image_store"] {
+        assert_eq!(closed_image_read(operation, 2), None);
+    }
 }
 
 /// One instruction set for raw atomic admission and DXIL lowering.
@@ -643,7 +649,10 @@ fn proven_slot(
         }
         AccessProof::Native(access @ StaticViewAccess::TextureWrite { .. })
             if native.stage == HwStage::Cs && unique && used.kind == ResourceType::Uav && used.dwords == 8 => access,
-        AccessProof::Native(access @ StaticViewAccess::TextureRead { .. }) if used.kind == ResourceType::Srv && used.dwords == 8 => access,
+        AccessProof::Native(access @ StaticViewAccess::TextureRead { .. })
+            if used.kind == ResourceType::Srv && used.dwords == 8 => access,
+        AccessProof::Native(access @ StaticViewAccess::VolumeTextureRead)
+            if unique && used.kind == ResourceType::Srv && used.dwords == 8 => access,
         AccessProof::Native(StaticViewAccess::RawUav { offset, bytes, write: false })
             if used.kind == ResourceType::Srv && used.dwords == 4 && used.stride == 0 && unique =>
         {
