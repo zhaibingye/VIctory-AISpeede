@@ -32,8 +32,8 @@ pub enum StaticViewAccess {
     ConstantTable { offset: u32, bytes: u32 },
     RootSrv { bytes: u32 },
     StructuredSrv { stride: u32, elements: u32 },
-    /// 元素索引由完整的只读结构化描述符限制，绑定时不可裁剪视图。
-    StructuredSrvDescriptor { stride: u32 },
+    /// 动态常量行以真实只读描述符的完整范围为界，不能裁剪。
+    ConstantTableDescriptor,
     StructuredUav { stride: u32, elements: u32, write: bool },
 }
 
@@ -469,6 +469,29 @@ fn bounded_typed_load(
     })
 }
 
+pub(super) const CONSTANT_ROW_BYTES: u32 = 16;
+pub const CONSTANT_TABLE_MAX_BYTES: u32 = 64 * 1024;
+
+/// 允许编译器和运行时对同一种闭合寻址形式使用一致的范围规则。
+pub(super) fn constant_row_addressing(offset: u16, bytes: u32, scalar: Operand, indexed: bool, vector_offset: bool) -> bool {
+    indexed && !vector_offset && offset.is_multiple_of(4)
+        && matches!(scalar, Operand::Scalar { code: NULL, .. } | Operand::Const(128))
+        && (4..=CONSTANT_ROW_BYTES).contains(&bytes)
+        && u32::from(offset) + bytes <= CONSTANT_ROW_BYTES
+}
+
+#[cfg(test)]
+#[test]
+fn constant_row_does_not_cross_a_record_or_accept_a_second_offset() {
+    let z = Operand::Const(128);
+    assert!(constant_row_addressing(0, 16, z, true, false));
+    assert!(constant_row_addressing(12, 4, z, true, false));
+    assert!(!constant_row_addressing(4, 16, z, true, false));
+    assert!(!constant_row_addressing(0, 16, z, true, true));
+    assert!(!constant_row_addressing(0, 16, Operand::Const(132), true, false));
+    assert!(!constant_row_addressing(0, 16, z, false, false));
+}
+
 fn bounded_structured_access(
     inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>,
 ) -> Option<AccessProof> {
@@ -492,7 +515,9 @@ fn bounded_structured_access(
     let elements = bounds.unsigned_upper_bound(index)
         .and_then(|max_index| max_index.checked_add(1));
     // 不为动态写入推测范围。只读候选仍必须通过描述符类型和字段范围证明。
-    if write && elements.is_none() { return None; }
+    if elements.is_none() && (write || !constant_row_addressing(*offset, bytes, *soffset, true, false)) {
+        return None;
+    }
     Some(AccessProof::StructuredAccess {
         elements, last_byte: u32::from(*offset).checked_add(bytes)?, write,
     })
@@ -587,20 +612,19 @@ fn proven_slot(
         field_fits_stride, statically_bounded_index,
     };
     let access = match proof {
-        AccessProof::StructuredAccess { elements, last_byte, write }
+        AccessProof::StructuredAccess { last_byte, write: false, .. }
+            if native.stage == HwStage::Vs && unique && used.kind == ResourceType::Cbv
+                && used.dwords == 4 && used.stride == 0 && last_byte <= CONSTANT_ROW_BYTES =>
+            StaticViewAccess::ConstantTableDescriptor,
+        AccessProof::StructuredAccess { elements: Some(elements), last_byte, write }
             if unique && used.dwords == 4
                 && (4..=2048).contains(&used.stride) && used.stride.is_multiple_of(4)
-                && last_byte <= used.stride =>
+                && last_byte <= used.stride && elements.checked_mul(used.stride).is_some_and(|bytes| bytes <= 65536) =>
         {
-            match (used.kind, elements) {
-                (ResourceType::Srv, Some(elements)) if !write && elements.checked_mul(used.stride).is_some_and(|bytes| bytes <= 65536) =>
+            match used.kind {
+                ResourceType::Srv if !write =>
                     StaticViewAccess::StructuredSrv { stride: used.stride, elements },
-                // 只开放已证明内层字段不会跨界的顶点只读访问。堆中的完整 SRV
-                // 使用真实元素数做越界检查，与不带长度的根描述符不同。
-                (ResourceType::Srv, None) if !write && native.stage == HwStage::Vs =>
-                    StaticViewAccess::StructuredSrvDescriptor { stride: used.stride },
-                (ResourceType::Uav, Some(elements)) if native.stage == HwStage::Cs
-                    && elements.checked_mul(used.stride).is_some_and(|bytes| bytes <= 65536) =>
+                ResourceType::Uav if native.stage == HwStage::Cs =>
                     StaticViewAccess::StructuredUav { stride: used.stride, elements, write },
                 _ => return Err(reject),
             }

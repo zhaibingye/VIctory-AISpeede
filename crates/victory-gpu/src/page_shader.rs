@@ -58,7 +58,7 @@ pub(crate) enum DescriptorSlotReason {
         groups_and_threads: Option<([u32; 3], [u32; 3])>,
     },
     UnsupportedAccess,
-    StructuredSrvDescriptorBudget,
+    ConstantTableDescriptorBudget,
     OutsideRangeOrConflictingView,
 }
 
@@ -476,7 +476,7 @@ impl ShaderBindings {
                 |root| pipeline.compute && slots.iter().any(|s| {
                     s.slot.root == root && matches!(s.access, StaticViewAccess::RawUav { .. } | StaticViewAccess::StructuredUav { .. } | StaticViewAccess::TextureWrite { .. })
                 }),
-                |root| slots.iter().any(|s| s.slot.root == root && matches!(s.access, StaticViewAccess::ConstantTable { .. })),
+                |root| slots.iter().any(|s| s.slot.root == root && matches!(s.access, StaticViewAccess::ConstantTable { .. } | StaticViewAccess::ConstantTableDescriptor)),
                 |slot| stage.root_cbvs.iter().any(|&(bound, _)| bound == slot),
                 |root| slots.iter().any(|s| s.slot.root == root && matches!(s.access, StaticViewAccess::RootSrv { .. })),
             )? {
@@ -526,7 +526,7 @@ impl ShaderBindings {
                                     reason(DescriptorSlotReason::UnsupportedTextureWrite { title_format, view_format, view_dimension, phase })
                                 })?)
                             }
-                            StaticViewAccess::ConstantTable { .. } => {
+                            StaticViewAccess::ConstantTable { .. } | StaticViewAccess::ConstantTableDescriptor => {
                                 let (start, end) = crate::descriptor::host::paged_table_constant_range(&actual)
                                     .ok_or(buffer)?;
                                 ClosedView::TableConstant(BoundedBufferView::new(start, end, false)
@@ -538,8 +538,7 @@ impl ShaderBindings {
                                 ClosedView::Raw(BoundedBufferView::new(start, end, false)
                                     .ok_or(buffer)?)
                             }
-                            StaticViewAccess::StructuredSrv { stride, .. }
-                            | StaticViewAccess::StructuredSrvDescriptor { stride } => {
+                            StaticViewAccess::StructuredSrv { stride, .. } => {
                                 let (start, end) = crate::descriptor::host::paged_structured_srv_range(&actual, stride)
                                     .ok_or(buffer)?;
                                 ClosedView::Structured(BoundedBufferView::new(start, end, false).ok_or(buffer)?, stride)
@@ -584,11 +583,11 @@ impl ShaderBindings {
                         {
                             view.allow_access(0, elements.checked_mul(stride).ok_or(reject)?, false).ok_or(reject)?;
                         }
-                        (Some(ClosedView::Structured(view, actual)), StaticViewAccess::StructuredSrvDescriptor { stride })
-                            if *actual == stride && !view.unordered() =>
+                        (Some(ClosedView::TableConstant(view)), StaticViewAccess::ConstantTableDescriptor)
+                            if !view.unordered() =>
                         {
-                            view.allow_complete_structured_read(stride)
-                                .ok_or(reason(DescriptorSlotReason::StructuredSrvDescriptorBudget))?;
+                            view.allow_complete_constant_read()
+                                .ok_or(reason(DescriptorSlotReason::ConstantTableDescriptorBudget))?;
                         }
                         (Some(ClosedView::Structured(view, actual)), StaticViewAccess::StructuredUav { stride, elements, write })
                             if *actual == stride && view.unordered() =>

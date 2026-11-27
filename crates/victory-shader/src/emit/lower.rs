@@ -9062,9 +9062,22 @@ impl<'a> Lower<'a> {
             let table = used.is_some_and(|u| u.root == RootType::Table);
             let byte = match index {
                 Some(i) => {
-                    let sixteen = self.s.m.i32(16);
-                    let rows = self.s.m.bin(c, Bin::Mul, i, sixteen);
-                    self.s.m.bin(c, Bin::Add, rows, off)
+                    use super::page_tables::{CONSTANT_ROW_BYTES, CONSTANT_TABLE_MAX_BYTES, constant_row_addressing};
+                    let stride = self.s.m.i32(CONSTANT_ROW_BYTES);
+                    let rows = self.s.m.bin(c, Bin::Mul, i, stride);
+                    let byte = self.s.m.bin(c, Bin::Add, rows, off);
+                    if table && matches!(src, Source::Loaded { .. }) && !store && atomic.is_none()
+                        && sub.is_none() && constant_row_addressing(*offset, 4 * count, *soffset, *idxen, *offen)
+                    {
+                        // 无符号比较也排除负索引。先限制行号，防止乘加回绕到
+                        // 一个有效常量；64 KiB 起点必在完整合法 CBV 之外。
+                        let limit = self.s.m.i32(CONSTANT_TABLE_MAX_BYTES);
+                        let row_limit = self.s.m.i32(CONSTANT_TABLE_MAX_BYTES / CONSTANT_ROW_BYTES);
+                        let outside = self.s.m.cmp(c, pred::IUGE, i, row_limit);
+                        self.s.m.select(c, outside, limit, byte)
+                    } else {
+                        byte
+                    }
                 }
                 None => off,
             };

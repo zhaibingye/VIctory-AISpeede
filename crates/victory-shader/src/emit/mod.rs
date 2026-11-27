@@ -218,7 +218,7 @@ mod waterfall_tests;
 mod wave;
 
 mod page_tables;
-pub use page_tables::{BufferOperandEvidence, StaticTextureSlot, StaticViewAccess, StaticViewSlot, StaticViewFailure, TableSlotFailure, StaticViewReport, direct_dispatch_view_report, static_view_report, static_texture_slots, static_view_slots};
+pub use page_tables::{CONSTANT_TABLE_MAX_BYTES, BufferOperandEvidence, StaticTextureSlot, StaticViewAccess, StaticViewSlot, StaticViewFailure, TableSlotFailure, StaticViewReport, direct_dispatch_view_report, static_view_report, static_texture_slots, static_view_slots};
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
