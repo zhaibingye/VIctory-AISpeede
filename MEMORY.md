@@ -15,6 +15,8 @@
 
 - `267f353` 仍复现同一首错；DirectStorage 未记录直接物理页写入，却观测到 9,896 次未归属的裸 VA 写入。这不是排除 DirectStorage 的证据。后续 `[VNME_DSTORAGE_VA_WRITE_HISTORY]` 将写前/写后目标页身份与 VA 范围独立比较：映射快照有采样限额，相同端点不证明中途未重绑。`[VNME_PREFIX_BYTE_INVENTORY]` 对照首错前已编码的 GPU 字节写入计划，不把未提交的命令说成已写入。
 
+- `20d0ad1` 自行等开场帧计数稳定并确认游戏窗口在前台后发一次 Enter，复现同一首错。DirectStorage 的 9,894 次裸地址写入没有候选 VA 重叠，保留的 1,655 个 section 候选页也无命中；360 次采样不完整，不能排除盲区。未提交前缀声明 10 个脏页，也没有命中目标。下一步优先追目标创建、XMem 绑定/重绑与首次 RTV/SRV 用途，查清是否漏掉应有的可证明初始化；不凭未匹配推断为零初始化。
+
 ## 最小验证
 
 - 使用仓库锁定的 Rust、Windows x64 MSVC、`--locked --features paged-title,diagnostics,blake3/pure`。新增诊断的定向测试过滤 `page_resource::native_history_tests`、`page_queue::copy_prefix_`；内容顺序的实像素测试为 `page_draw::paged_title_partial_color_clear_observes_submission_order`，仅相关改动时重跑。
