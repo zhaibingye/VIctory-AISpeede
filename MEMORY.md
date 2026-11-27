@@ -20,6 +20,8 @@
 - `df5dcfd` 的 `[VNME_RTV_ORIGIN]` 确认为地址式创建，初始增强布局码 6，优化清除值存在，宿主无已知前代；`[VNME_XMEM_SECTION_HISTORY]` 的 510 个活跃页均匹配同一新绑定的 section，无相关解绑记录。`0x470` 在失败 draw 前同录制调用过一次，但 ABI 和语义未证实，不读取未知参数。桌面 D3D12 的布局枚举只供对照，不能把优化清除值解释为写像素。
 - 无前台时可在诊断构建使用连续重叠的 `VICTORY_KEYS` 定时区间合成一次 A 长按；本地在输入轮询开始后 65–66.1 秒成功触发同一首错。未发出输入或仅停在开始画面不算实机通过。
 
+- `7174c48` 证实实际 PSO 的 RGB/Alpha 都是 `ADD(SRC_ALPHA, INV_SRC_ALPHA)`，不是可以删掉的旧色依赖。`9e65b0d` 的一次性只读探针完整观测到目标 510 个 CPU 页均为零（无内容或指纹落盘），仅代表 CPU 当前读值。`e61c206` 显示前缀 8/10 两个颜色清除及 12/13 两个绘制都写别的默认私有堆对象（格式 28，而目标为 29），6 的 compute 输出不同且失败时物理页交集为零。不能按尺寸移交。下一步应从可信物理节的初始字节、物理写入时序和可验证的数据平面转换构建可独立回归的字节兼容路径，不从零观测直接推导清屏。
+
 ## 最小验证
 
 - 使用仓库锁定的 Rust、Windows x64 MSVC、`--locked --features paged-title,diagnostics,blake3/pure`。新增诊断的定向测试过滤 `page_resource::native_history_tests`、`page_queue::copy_prefix_`；内容顺序的实像素测试为 `page_draw::paged_title_partial_color_clear_observes_submission_order`，仅相关改动时重跑。
