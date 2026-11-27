@@ -497,6 +497,7 @@ impl ClosedDraw {
             DrawCall::Indirect(_) => ("间接", None),
         };
         tracing::info!(slot, kind, ?count, topology = self.topology.0, samples = target.samples,
+            reads_old_color = self.color_destination_reads & (1 << slot) != 0,
             depth_stencil_tests = self.depth_tests, viewport_contains_target_rect, scissor_contains_target_rect,
             "缺少旧内容的绘制状态：范围允许覆盖并不证明实际写满");
     }

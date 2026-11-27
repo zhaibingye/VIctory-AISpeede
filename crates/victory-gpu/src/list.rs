@@ -1727,6 +1727,8 @@ fn enhanced_group_headers(
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CandidateTextureBarrier {
+    pub(crate) sync: [u32; 2],
+    pub(crate) access: [u32; 2],
     pub(crate) before: u32,
     pub(crate) after: u32,
     pub(crate) range: [u32; 6],
@@ -1737,6 +1739,8 @@ pub(crate) struct CandidateTextureBarrier {
 const _: () = {
     use windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_BARRIER as Desktop;
     assert!(std::mem::size_of::<Desktop>() == 64);
+    assert!(offset_of!(Desktop, SyncBefore) == 0 && offset_of!(Desktop, SyncAfter) == 4);
+    assert!(offset_of!(Desktop, AccessBefore) == 8 && offset_of!(Desktop, AccessAfter) == 12);
     assert!(offset_of!(Desktop, LayoutBefore) == 16 && offset_of!(Desktop, LayoutAfter) == 20);
     assert!(offset_of!(Desktop, pResource) == 24 && offset_of!(Desktop, Subresources) == 32);
     assert!(offset_of!(Desktop, Flags) == 56);
@@ -1747,6 +1751,7 @@ fn desktop_texture_candidate(bytes: &[u8; 64]) -> (usize, CandidateTextureBarrie
     let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
     let object = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
     (object, CandidateTextureBarrier {
+        sync: [word(0), word(4)], access: [word(8), word(12)],
         before: word(16), after: word(20), range: std::array::from_fn(|i| word(32 + 4 * i)), flags: word(56),
     })
 }
@@ -1823,12 +1828,13 @@ fn enhanced_texture_coverage_separates_read_failure_from_missing_identity() {
 #[test]
 fn desktop_texture_candidate_keeps_layout_range_and_flags_separate() {
     let mut bytes = [0u8; 64];
-    for (i, offset) in [16, 20, 32, 36, 40, 44, 48, 52, 56].into_iter().enumerate() {
+    for (i, offset) in [0, 4, 8, 12, 16, 20, 32, 36, 40, 44, 48, 52, 56].into_iter().enumerate() {
         bytes[offset..offset + 4].copy_from_slice(&(i as u32 + 10).to_le_bytes());
     }
     bytes[24..32].copy_from_slice(&0x1234u64.to_le_bytes());
     assert_eq!(desktop_texture_candidate(&bytes), (0x1234, CandidateTextureBarrier {
-        before: 10, after: 11, range: [12, 13, 14, 15, 16, 17], flags: 18,
+        sync: [10, 11], access: [12, 13],
+        before: 14, after: 15, range: [16, 17, 18, 19, 20, 21], flags: 22,
     }));
 }
 
