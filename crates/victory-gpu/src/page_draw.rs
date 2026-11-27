@@ -836,6 +836,76 @@ fn paged_title_explicit_discard_then_draw_and_full_clear() {
     check_paged_title_pixels(false, false, false, true, true);
 }
 
+#[cfg(all(test, feature = "diagnostics", feature = "paged-title"))]
+#[test]
+fn paged_title_partial_color_clear_observes_submission_order() {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SAMPLE_DESC};
+
+    let host = crate::host::host().expect("D3D12 宿主");
+    let heap = crate::memory::heap().unwrap();
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 4, Height: 4, DepthOrArraySize: 1, MipLevels: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        ..Default::default()
+    };
+    let mut texture = None::<ID3D12Resource>;
+    // 安全：独立 4×4 颜色目标，尚无有效像素。
+    unsafe { host.device.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+    ) }.unwrap();
+    let copy = Arc::new(HostTexture::new(texture.unwrap(), 0, Vec::new()));
+    let target = ColorTarget::capture_candidate(copy.clone(), None).unwrap();
+
+    // 先录制局部使用者，再录制整面生产者；录制不会发布像素或权限。
+    let partial = host.new_list().unwrap();
+    partial.record_page_clear(ColorClear {
+        target: target.clone(), color: [0., 0., 1., 1.],
+        rects: vec![RECT { left: 0, top: 0, right: 2, bottom: 4 }],
+    });
+    partial.record_page_barrier(crate::page_resource::PageBarrier::Texture(
+        copy.clone(), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
+    ));
+    partial.close();
+    let full = host.new_list().unwrap();
+    full.record_page_clear(ColorClear { target, color: [1., 0., 0., 1.], rects: Vec::new() });
+    full.close();
+    assert!(!ResourcePlan::default().authoritative(&copy));
+
+    let submit = |list: &HostList| host.execute_paged_title(
+        heap, &mut crate::title_backing::SubmissionBacking::default(), &[list],
+    );
+    assert!(matches!(submit(&partial),
+        Err(BatchError::Operation { phase: "encode", index: 0, operation: "color clear", cause })
+            if matches!(*cause, BatchError::TargetNotInitialized)
+    ));
+    assert!(!ResourcePlan::default().authoritative(&copy));
+    submit(&full).unwrap();
+    assert!(ResourcePlan::default().authoritative(&copy));
+    submit(&partial).unwrap();
+
+    let read = host.new_list().unwrap();
+    let (readback, footprint) = crate::capture::read_back(&host.device, read.recording(), &copy.texture).unwrap();
+    read.close();
+    host.execute(&[&read]);
+    // 安全：拷贝已经完成。脚印包含四行四列 RGBA8。
+    unsafe {
+        let mut ptr = std::ptr::null_mut();
+        readback.Map(0, None, Some(&mut ptr)).unwrap();
+        for y in 0..4 {
+            let row = ptr.cast::<u8>().add(footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize);
+            for x in 0..4 {
+                let expected = if x < 2 { [0, 0, 255, 255] } else { [255, 0, 0, 255] };
+                assert_eq!(std::slice::from_raw_parts(row.add(x * 4), 4), &expected);
+            }
+        }
+        readback.Unmap(0, None);
+    }
+}
+
 #[cfg(all(test, feature = "diagnostics"))]
 fn compile_dxc_stage(source: &str, entry: &str, profile: &str) -> Vec<u8> {
     let dxc = std::env::var_os("VICTORY_PC_DXC").map(std::path::PathBuf::from)
