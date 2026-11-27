@@ -26,6 +26,8 @@
 
 - `page_resource.rs` 的 `record_write_at_with` 必须将“可能写共享后备”和“可发布整面原生颜色版本”分开。弃旧后只清半面是实际写入，但整面仍为 `Discarded`。`page_queue.rs` 在原生入队前检查本批及此前提交的未分类原生写；拒绝是保守冲突裁决，不是相交证明，更不是旧色生产者。回归 `page_queue::discarded_partial_color_clear_blocks_shared_texture_read` 覆盖本批反例。
 
+- 已完成 Fence 的物理页写回也不能按整页认领：`title_backing::merge_page` 只写提交前像与 GPU 回读的差异及显式覆盖的并集，即使两者分成很多段。整页读改写会回写未归 GPU 的间隙，既可能丢失并行 CPU 更新，也可能因间隙不可写而失败。`title_backing::writeback_tests` 用夹在可写片段之间的只读宿主页区分两条路径。只保证不触及间隙，不裁决 CPU/GPU 对同一字节的冲突。
+
 ## 已有的受限字节转换
 
 - `victory_formats::texture::copy_uniform_rx_rgba8_blocks` 只处理独立证明为无压缩主平面的 2D `SW_64KB_R_X`、单层单 mip、单采样、4 字节 texel。按 GFX10 addrlib 的块索引，128×128 个 texel 占一块，块内 XOR 不改变块号。逐块验证全部四字节字相同（含填充）即可恢复紧密行；不同块不必同色。`uniform_rx` 集成测试有六个异色块及末块单字节反例。这不是通用逐像素寻址，未接入生产；510 页的 CPU 零观测不能替代平面描述、提交时的权威快照或同步证明。

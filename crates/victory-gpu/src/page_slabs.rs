@@ -617,7 +617,6 @@ impl CapturedUploads {
         backing: &crate::title_backing::SubmissionBacking,
         page: PhysicalPage,
         gpu: &[u8],
-        scratch: &mut [u8],
         overwrites: &[std::ops::Range<usize>],
     ) -> bool {
         let Some(snapshot) = self.snapshots.get(&page) else {
@@ -627,7 +626,7 @@ impl CapturedUploads {
         let before = unsafe {
             std::slice::from_raw_parts(self.mapped.as_ptr().add(snapshot.offset), PAGE_BYTES as usize)
         };
-        backing.merge_page(snapshot.va as usize, page, before, gpu, scratch, overwrites)
+        backing.merge_page(snapshot.va as usize, page, before, gpu, overwrites)
     }
 }
 

@@ -25,6 +25,9 @@ pub use section_history::{note_xmem_section_mapping, prepare_xmem_section_histor
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 pub(crate) use section_history::trace_color_section_history;
 
+#[cfg(test)]
+mod writeback_tests;
+
 type Range = (usize, usize);
 pub type BackingPinner = fn(&[Range], &mut BackingPins);
 
@@ -176,51 +179,24 @@ impl SubmissionBacking {
         physical: PhysicalPage,
         before: &[u8],
         gpu: &[u8],
-        scratch: &mut [u8],
         overwrites: &[std::ops::Range<usize>],
     ) -> bool {
         const PAGE: usize = PAGE_BYTES as usize;
         if !va.is_multiple_of(PAGE)
-            || [before.len(), gpu.len(), scratch.len()] != [PAGE; 3]
+            || before.len() != PAGE
+            || gpu.len() != PAGE
             || self.pins.expected(va) != Some(physical)
         {
             return false;
         }
-        if before == gpu && overwrites.is_empty() {
+        if overwrites.is_empty() && before == gpu {
             return true;
         }
-        // Explicit copies, clears and markers commonly account for every
-        // changed byte. Publish their spans without reading or rewriting
-        // neighboring CPU bytes, even if they changed during retirement.
-        let exact_only = !overwrites.is_empty() && changes_contained(before, gpu, overwrites);
-        let mut mixed = [const { 0..0 }; SMALL_WRITEBACK];
-        let spans = if exact_only {
-            Some(overwrites)
-        } else {
-            sparse_writeback(before, gpu, overwrites, &mut mixed).map(|count| &mixed[..count])
-        };
         self.write_delta(va, PAGE, |target| {
-            if let Some(spans) = spans {
-                let _writing = target.original_va.then(|| crate::watch::writing(va, PAGE));
-                return spans.iter().all(|span| crate::host::write_mapped_exact(
-                    (target.address + span.start) as *mut u8, &gpu[span.clone()],
-                ));
-            }
-            if !crate::host::read_into(target.address as *const u8, scratch) {
-                return false;
-            }
-            let mut changed = merge_page_delta(scratch, before, gpu);
-            for span in overwrites {
-                let current = &mut scratch[span.clone()];
-                let result = &gpu[span.clone()];
-                changed |= current != result;
-                current.copy_from_slice(result);
-            }
-            if !changed {
-                return true;
-            }
             let _writing = target.original_va.then(|| crate::watch::writing(va, PAGE));
-            crate::host::write_mapped_exact(target.address as *mut u8, scratch)
+            visit_writeback_spans(before, gpu, overwrites, |span| {
+                crate::host::write_mapped_exact((target.address + span.start) as *mut u8, &gpu[span])
+            })
         })
         .unwrap_or(false)
     }
@@ -262,88 +238,51 @@ impl SubmissionBacking {
     }
 }
 
-/// The planner keeps these intervals sorted, nonempty and disjoint.
-fn changes_contained(before: &[u8], gpu: &[u8], overwrites: &[std::ops::Range<usize>]) -> bool {
-    let mut cursor = 0;
-    for span in overwrites {
-        debug_assert!(span.start >= cursor && span.start < span.end && span.end <= before.len());
-        if before[cursor..span.start] != gpu[cursor..span.start] { return false; }
-        cursor = span.end;
+/// Stream maximal GPU-owned runs. The planner supplies sorted, disjoint
+/// overwrites; only equal bytes *outside* them split a run.
+fn visit_writeback_spans(
+    before: &[u8],
+    gpu: &[u8],
+    overwrites: &[std::ops::Range<usize>],
+    mut visit: impl FnMut(std::ops::Range<usize>) -> bool,
+) -> bool {
+    let len = before.len();
+    if gpu.len() != len {
+        return false;
     }
-    before[cursor..] == gpu[cursor..]
-}
-
-/// Bound extra kernel copies for pages with fragmented shader writes.
-const SMALL_WRITEBACK: usize = 8;
-
-/// Combine declared intervals and observed differences. A gap is never
-/// included in a direct store just to stay under the syscall budget.
-fn sparse_writeback(
-    before: &[u8], gpu: &[u8], overwrites: &[std::ops::Range<usize>],
-    output: &mut [std::ops::Range<usize>],
-) -> Option<usize> {
-    let mut count = 0;
-    let mut next = overwrites.iter().peekable();
-    let mut at = 0;
-    while at < before.len() {
-        let end = if let Some(span) = next.next_if(|span| span.start == at) {
-            span.end
-        } else if before[at] != gpu[at] {
-            at + 1
-        } else {
-            at += 1;
-            continue;
-        };
-        if count > 0 && output[count - 1].end == at {
-            output[count - 1].end = end;
-        } else {
-            *output.get_mut(count)? = at..end;
-            count += 1;
+    let mut run_start = 0;
+    let mut skip_cpu = |gap: std::ops::Range<usize>| {
+        if run_start < gap.start && !visit(run_start..gap.start) {
+            return false;
         }
-        at = end;
+        run_start = gap.end;
+        true
+    };
+
+    let mut at = 0;
+    for span in overwrites.iter().cloned().chain(std::iter::once(len..len)) {
+        if span.start < at || span.start > span.end || span.end > len {
+            return false;
+        }
+        let gap = at..span.start;
+        if !gap.is_empty() {
+            // Explicit clears and copies often account for all differences.
+            // Compare the whole unclaimed gap before looking byte by byte.
+            if before[gap.clone()] == gpu[gap.clone()] {
+                if !skip_cpu(gap) {
+                    return false;
+                }
+            } else {
+                for i in gap {
+                    if before[i] == gpu[i] && !skip_cpu(i..i + 1) {
+                        return false;
+                    }
+                }
+            }
+        }
+        at = span.end;
     }
-    Some(count)
-}
-
-fn merge_page_delta(cpu: &mut [u8], before: &[u8], gpu: &[u8]) -> bool {
-    let mut changed = 0u8;
-    for ((current, &original), &result) in cpu.iter_mut().zip(before).zip(gpu) {
-        let mask = 0u8.wrapping_sub(u8::from(result != original));
-        let delta = (*current ^ result) & mask;
-        *current ^= delta;
-        changed |= delta;
-    }
-    changed != 0
-}
-
-#[cfg(test)]
-#[test]
-fn sparse_writeback_keeps_gaps_and_adjacent_writes_exact() {
-    let mut output = [0..0, 0..0];
-    assert_eq!(sparse_writeback(&[0; 8], &[0, 1, 0, 0, 0, 0, 1, 0], &[2..3], &mut output), Some(2));
-    assert_eq!(output, [1..3, 6..7]);
-    assert_eq!(sparse_writeback(&[0; 8], &[0, 1, 0, 1, 0, 1, 0, 0], &[], &mut output), None);
-}
-
-#[cfg(test)]
-#[test]
-fn exact_overwrites_require_all_other_bytes_to_match() {
-    let before = [1, 2, 3, 4, 5, 6];
-    let gpu = [1, 9, 3, 4, 8, 6];
-    assert!(changes_contained(&before, &gpu, &[1..2, 4..5]));
-    assert!(!changes_contained(&before, &gpu, &[1..2]));
-    assert!(!changes_contained(&before, &gpu, &[4..5]));
-}
-
-#[cfg(test)]
-#[test]
-fn physical_page_delta_preserves_unwritten_cpu_bytes() {
-    let baseline = [0xa0, 0xa0, 0xa0, 0xa0];
-    let result = [0xa0, 0x77, 0xa0, 0x10];
-    let mut cpu = [0x11, 0x22, 0x33, 0x10];
-    assert!(merge_page_delta(&mut cpu, &baseline, &result));
-    assert_eq!(cpu, [0x11, 0x77, 0x33, 0x10]);
-    assert!(!merge_page_delta(&mut cpu, &baseline, &result));
+    run_start == len || visit(run_start..len)
 }
 
 #[cfg(test)]
@@ -410,15 +349,14 @@ fn captured_page_snapshot_and_merge_use_original_section() {
     assert!(before.iter().all(|&byte| byte == 0x11));
     let mut gpu = before.clone();
     gpu[2] = 0x77;
-    let mut scratch = vec![0; PAGE];
     section.lock().unwrap()[1] = 0xab;
-    assert!(!submission.merge_page(VA, replacement, &before, &gpu, &mut scratch, &[]));
-    assert!(submission.merge_page(VA, first, &before, &gpu, &mut scratch, &[]));
+    assert!(!submission.merge_page(VA, replacement, &before, &gpu, &[]));
+    assert!(submission.merge_page(VA, first, &before, &gpu, &[]));
     assert_eq!(&section.lock().unwrap()[..4], &[0x11, 0xab, 0x77, 0x11]);
 
     // A GPU overwrite equal to its before-image still owns that byte;
     // the neighboring CPU byte was not part of the operation.
-    assert!(submission.merge_page(VA, first, &before, &before, &mut scratch, &[2..3]));
+    assert!(submission.merge_page(VA, first, &before, &before, &[2..3]));
     assert_eq!(&section.lock().unwrap()[..4], &[0x11, 0xab, 0x11, 0x11]);
 }
 

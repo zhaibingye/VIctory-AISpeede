@@ -1936,17 +1936,13 @@ impl SubmittedRender<'_> {
                 readback
             };
             let snapshots = self.uploads.expect("dirty leaf requires an uploaded page");
-            let _scratch_charge = HostBudget::process()
-                .reserve_ram(PAGE_BYTES)
-                .unwrap_or_else(|_| fail(format_args!("没有足够的系统内存用于 VNME 的回写暂存")));
-            let mut scratch = vec![0; PAGE_BYTES as usize];
             #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
             let mut observed_writes = crate::page_inventory::enabled()
                 .then(|| Vec::with_capacity(dirty.len().min(ByteWriteHistory::MAX_BATCH_PAGES)));
             for (i, (page, _, _)) in batch.pages().filter(|(id, _, _)| dirty.contains(id)).enumerate() {
                 let bytes = readback.bytes(i);
                 let overwrites = self.targets.guest_overwrites(page);
-                if !snapshots.merge(backing, page, bytes, &mut scratch, overwrites) {
+                if !snapshots.merge(backing, page, bytes, overwrites) {
                     fail(format_args!("VNME 无法回写物理页 {}", page.number()));
                 }
                 let gpu_digest = blake3::hash(bytes);
