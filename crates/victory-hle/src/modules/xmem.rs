@@ -1004,6 +1004,13 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    // `runs` has released the page-table lock and pinned the resolved sections.
+    // Claim every destination together, before copying even the first run.
+    #[cfg(feature = "paged-title")]
+    let _writer = (!data.is_empty()).then(|| {
+        let destinations: Vec<_> = runs.iter().map(|(slice, n)| (slice.page(0), *n)).collect();
+        victory_memory::physical::access::writing(&destinations)
+    });
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -1029,6 +1036,8 @@ pub(crate) struct PageWindow {
     len: usize,
     /// Stable backing identity, even if the title releases its page numbers.
     run: (Slice, usize),
+    #[cfg(feature = "paged-title")]
+    _writer: Option<victory_memory::physical::access::Writer>,
 }
 
 impl Drop for PageWindow {
@@ -1069,6 +1078,8 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         within: offset % PAGE,
         len,
         run: (slice.clone(), *n),
+        #[cfg(feature = "paged-title")]
+        _writer: (len != 0).then(|| victory_memory::physical::access::writing(&[(slice.page(0), *n)])),
     })
 }
 
@@ -1440,6 +1451,9 @@ pub(crate) fn module() -> HleModule {
         ],
     }
 }
+
+#[cfg(all(test, feature = "paged-title"))]
+mod snapshot_tests;
 
 #[cfg(test)]
 mod tests {

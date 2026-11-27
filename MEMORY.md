@@ -30,6 +30,8 @@
 
 ## 共享字节读取的生产门禁
 
+- `CapturedUploads::stage` 在拷入第一张页之前，以 `physical::access::try_snapshot` 一次登记整批固定的 section 页，持有到最后一页拷完。`PageWindow` 和 `write_physical` 使用相同物理身份登记完整写窗口；写者等待已有快照退出，新快照遇到相交写者在入队前报 `PhysicalWriterDuringSnapshot`。同址换节不冲突；不能用逐页加锁代替整批保护，否则跨页写的两侧可被拷成两个版本。此协议不覆盖裸 VA、任意来宾 CPU 或原生 GPU 写，不证明 R_X 平面或 draw 15 的旧色。对照见 `xmem::snapshot_tests` 和 `page_queue::paged_copy_snapshot_rejects_physical_writer_before_enqueue`。
+
 - `page_resource.rs` 的 `record_write_at_with` 必须将“可能写共享后备”和“可发布整面原生颜色版本”分开。弃旧后只清半面是实际写入，但整面仍为 `Discarded`。`page_queue.rs` 在原生入队前检查本批及此前提交的未分类原生写；拒绝是保守冲突裁决，不是相交证明，更不是旧色生产者。回归 `page_queue::discarded_partial_color_clear_blocks_shared_texture_read` 覆盖本批反例。
 
 - 共享体纹理 UAV 虽是输出，`ShaderTextureUav::prepare` 仍要从固定页预填充整面，以保留着色器未写的 texel。它与共享 SRV 同走 `SharedTextureBytes::gather_into`：逐有效区间验证独立后备，登记共享读取，交给提交门禁检查未分类原生写者。`verify_shared_volume` 只检查本条派发的视图与范围，不能代替这两项。`page_uav::prefill_tests` 有同页双 VA 不同宿主对象、后续 W 分片来源未证的反例。这条规则不为 R_X 颜色目标提供旧色。

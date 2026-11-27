@@ -2279,6 +2279,27 @@ fn paged_buffer_copy_gathers_overlapping_physical_aliases() {
     assert_eq!(&section.lock().unwrap()[..6], &[10, 10, 20, 30, 40, 50]);
 }
 
+#[cfg(all(test, feature = "paged-title"))]
+#[test]
+fn paged_copy_snapshot_rejects_physical_writer_before_enqueue() {
+    use victory_memory::physical::{PageNumbers, access::writing};
+    const VA: usize = PAGE_BYTES as usize;
+    let host = crate::host::host().expect("D3D12 renderer host");
+    let heap = crate::memory::heap().unwrap();
+    let id = PageNumbers::default().allocate(1024).unwrap().offset(1022);
+    let (mut backing, section) = crate::title_backing::test_capture(id, &[VA]);
+    section.lock().unwrap()[..2].copy_from_slice(&[31, 47]);
+    let copy = || GuestCopy::new(VA + 1, VA, 1).unwrap();
+    let writer = writing(&[(id, 1)]);
+    let result = host.execute_paged_copies(heap, &mut backing, &[copy()]);
+    assert!(matches!(result, Err(BatchError::PhysicalWriterDuringSnapshot)), "{result:?}");
+    assert_eq!(&section.lock().unwrap()[..2], &[31, 47]);
+    drop(writer);
+    let _other_writer = writing(&[(id.offset(1), 1)]);
+    host.execute_paged_copies(heap, &mut backing, &[copy()]).unwrap();
+    assert_eq!(&section.lock().unwrap()[..2], &[31, 31]);
+}
+
 #[cfg(test)]
 #[test]
 fn paged_buffer_copy_rejects_self_aliased_destination_before_submitting_prefix() {

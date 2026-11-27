@@ -303,6 +303,8 @@ pub(crate) enum BatchError {
     Range(u64, u64),
     NotCaptured(u64),
     OverlappingCopyDestination,
+    #[cfg(feature = "paged-title")]
+    PhysicalWriterDuringSnapshot,
     Native(Error),
     Table(BindError),
 }
@@ -561,6 +563,11 @@ impl CapturedUploads {
             .ok_or_else(|| BatchError::Native(Error::from(E_OUTOFMEMORY)))?;
         let mapped = std::ptr::NonNull::new(data)
             .ok_or_else(|| BatchError::Native(Error::from(E_INVALIDARG)))?;
+        // Hold one claim until the last page is staged. Per-page guards could
+        // splice the before and after halves of one cross-page physical write.
+        #[cfg(feature = "paged-title")]
+        let _snapshot = victory_memory::physical::access::try_snapshot(batch.pages.keys().copied())
+            .map_err(|_| BatchError::PhysicalWriterDuringSnapshot)?;
         let mut snapshots = BTreeMap::new();
         for (i, (id, va, _)) in batch.pages().enumerate() {
             let offset = i * PAGE;

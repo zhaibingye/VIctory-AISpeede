@@ -1,5 +1,7 @@
 //! Physical allocations and alias identity, independent of host address.
 
+pub mod access;
+
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
