@@ -270,12 +270,37 @@ impl ResourcePlan {
     }
 
     pub(crate) fn record_color_write(&mut self, copy: &Arc<HostTexture>, sub: ColorSubresource) -> Result<(), BatchError> {
-        self.record_write_at(copy, sub.authority())
+        self.record_write_at_with(copy, sub.authority(), false)
+    }
+
+    /// 明确弃旧可用于写入门槛，不等价于初始化。只支持无可观察字节后备的整资源。
+    #[cfg(feature = "paged-title")]
+    #[allow(dead_code, reason = "等待来宾弃旧事件得到验证，禁止由候选诊断自动进入")]
+    pub(crate) fn record_discarded_color(&mut self, copy: &Arc<HostTexture>, sub: ColorSubresource) -> Result<(), BatchError> {
+        let key = Self::key(copy);
+        if sub.is_scoped() || copy.has_pointer_exposure() || copy.uses_unproven_alias_backing()
+            || copy.exact_committed_bytes().is_some()
+            || copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
+        {
+            return Err(BatchError::unsupported_texture_map("无法证明弃旧范围和内容后备"));
+        }
+        let version = Version::successor(self.version(copy), Representation::Discarded, copy.byte_observation())
+            .ok_or_else(|| BatchError::Native(windows::Win32::Foundation::E_FAIL.into()))?;
+        self.pending.insert((key, None), (copy.clone(), version));
+        self.refreshed.remove(&key);
+        self.ordered_color_initialized.remove(&key);
+        Ok(())
+    }
+
+    #[cfg(feature = "paged-title")]
+    #[allow(dead_code, reason = "只供以后通过验证的弃旧写入使用")]
+    pub(crate) fn color_is_discarded(&self, copy: &Arc<HostTexture>, sub: ColorSubresource) -> bool {
+        !sub.is_scoped() && self.version(copy).is_some_and(|v| v.representation == Representation::Discarded)
     }
 
     /// 只承认这个批次内已编码的整张写入，不依赖上一个 Fence 或旧标记。
     pub(crate) fn record_full_color_write(&mut self, copy: &Arc<HostTexture>, sub: ColorSubresource) -> Result<(), BatchError> {
-        self.record_color_write(copy, sub)?;
+        self.record_write_at(copy, sub.authority())?;
         #[cfg(feature = "paged-title")]
         if !sub.is_scoped() && self.ordered_color_backing.contains(&Self::key(copy)) {
             self.ordered_color_initialized.insert(Self::key(copy));
@@ -308,6 +333,17 @@ impl ResourcePlan {
     }
 
     fn record_write_at(&mut self, copy: &Arc<HostTexture>, subresource: Option<u32>) -> Result<(), BatchError> {
+        self.record_write_at_with(copy, subresource, true)
+    }
+
+    fn record_write_at_with(
+        &mut self, copy: &Arc<HostTexture>, subresource: Option<u32>, full_if_discarded: bool,
+    ) -> Result<(), BatchError> {
+        let old = self.version_at(copy, subresource);
+        // 局部（或覆盖范围未获证明的）绘制不能发布整面内容。
+        if !full_if_discarded && old.is_some_and(|v| v.representation == Representation::Discarded) {
+            return Ok(());
+        }
         #[cfg(feature = "paged-title")]
         if !self.unclassified_native_write {
             // 默认系统堆块不能与固定的 XMem 节或独立虚拟内存保留区共享同一个后备。
@@ -321,7 +357,7 @@ impl ResourcePlan {
             self.trace_writers.insert(Self::key(copy), copy.candidate_guest_span);
         }
         let version = Version::successor(
-            self.version_at(copy, subresource), Representation::NativeGpu, copy.byte_observation(),
+            old, Representation::NativeGpu, copy.byte_observation(),
         ).ok_or_else(|| BatchError::Native(windows::Win32::Foundation::E_FAIL.into()))?;
         self.pending.insert((Self::key(copy), subresource), (copy.clone(), version));
         Ok(())
@@ -429,7 +465,7 @@ impl ResourcePlan {
             copy.native_authority.lock().unwrap_or_else(|e| e.into_inner()).insert(subresource, complete);
             if subresource.is_none() {
                 // Never advertise a partial native texture as whole.
-                copy.host_written.store(true, Ordering::Release);
+                copy.host_written.store(version.representation == Representation::NativeGpu, Ordering::Release);
             }
         }
     }
@@ -472,6 +508,17 @@ fn ordered_color_requires_full_write_to_same_native_object_in_current_batch() {
     let mut tail = SubmittedTail::default();
     plan.advance_submitted_tail(&mut tail);
     assert!(!ResourcePlan::after(&tail).has_ordered_color_write(&target));
+    plan.record_discarded_color(&target, sub).unwrap();
+    assert!(plan.color_is_discarded(&target, sub));
+    assert!(!plan.authoritative(&target) && !plan.has_ordered_color_write(&target));
+    assert!(plan.authoritative(&other) && plan.has_ordered_color_write(&other));
+    plan.record_color_write(&target, sub).unwrap();
+    assert!(!plan.authoritative(&target));
+    plan.advance_submitted_tail(&mut tail);
+    let after = ResourcePlan::after(&tail);
+    assert!(after.color_is_discarded(&target, sub) && !after.authoritative(&target));
+    plan.record_full_color_write(&target, sub).unwrap();
+    assert!(plan.authoritative(&target) && plan.has_ordered_color_write(&target));
 }
 
 /// Include possible compatible ranges before page admission. An earlier

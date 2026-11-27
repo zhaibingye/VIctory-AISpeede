@@ -5,6 +5,8 @@ use crate::coherence::Fence;
 pub enum Representation {
     CompatibleBytes,
     NativeGpu,
+    /// 游戏明确允许丢弃旧内容，但尚未证明任何可读取的新像素。
+    Discarded,
 }
 
 /// Monotonic evidence about bytes that escape the native representation.
