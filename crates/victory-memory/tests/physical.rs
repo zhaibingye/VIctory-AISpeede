@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use victory_memory::{
     PAGE_BYTES,
-    budget::{Pool, RAM_LIMIT},
-    physical::{Aliases, PageNumbers, HostBudget},
+    budget::{BudgetProfile, Headroom, HostPressure, NoSpace, Pool, RAM_LIMIT},
+    physical::{Aliases, BackingPins, PageNumbers, HostBudget},
 };
 
 #[test]
@@ -94,6 +94,65 @@ fn graphics_ram_and_guest_backing_compete_for_one_pool() {
     assert_eq!(budget.used(Pool::Ram), RAM_LIMIT - PAGE_BYTES);
     drop(guest);
     assert_eq!(budget.used(Pool::Ram), 0);
+}
+
+#[test]
+fn host_pressure_reduces_admission_without_releasing_in_flight_backing() {
+    const GIB: u64 = 1 << 30;
+    let budget = HostBudget::default();
+    let reserve = Headroom { physical_ram: 2 * GIB, commit: GIB / 2, local: GIB / 4 };
+    let initial = HostPressure {
+        physical_ram: 16 * GIB,
+        available_ram: 13 * GIB,
+        available_commit: 16 * GIB,
+        managed_ram: 0,
+        local_capacity: 6 * GIB,
+        local_budget: 6 * GIB,
+        local_observed_use: 0,
+        managed_local: 0,
+    };
+    let limits = budget.refresh_pressure(reserve, BudgetProfile::Auto, || Some(initial)).unwrap();
+    assert_eq!(limits.ram.hard, 11 * GIB);
+    assert_eq!(limits.local.hard, 6 * GIB - GIB / 4);
+    let ram = Arc::new(budget.reserve_ram(5 * GIB).unwrap());
+    let local = Arc::new(budget.reserve_local(4 * GIB, 0, 6 * GIB, reserve.local).unwrap());
+    // 来宾视图释放后，在途命令仍持有两份后备。
+    let mut ids = PageNumbers::default();
+    let mut in_flight = BackingPins::default();
+    in_flight.keep(ids.allocate(1).unwrap(), &ram);
+    in_flight.keep(ids.allocate(1).unwrap(), &local);
+    drop((ram, local));
+
+    let pressured = HostPressure {
+        available_ram: 2 * GIB,
+        available_commit: GIB / 4,
+        local_budget: 3 * GIB + 3 * GIB / 4,
+        local_observed_use: 4 * GIB + GIB / 2,
+        ..initial
+    };
+    let tight = budget.refresh_pressure(reserve, BudgetProfile::Auto, || Some(pressured)).unwrap();
+    assert_eq!(tight.ram.hard, 5 * GIB);
+    assert_eq!(tight.local.hard, 3 * GIB);
+    assert!(budget.refresh_pressure(reserve, BudgetProfile::Auto, || None).is_none());
+    assert_eq!(budget.pool_state(Pool::Ram), (5 * GIB, tight.ram));
+    assert_eq!(budget.pool_state(Pool::Local), (4 * GIB, tight.local));
+    assert_eq!(budget.reserve_ram(PAGE_BYTES).err(), Some(NoSpace {
+        pool: Pool::Ram, shortfall: PAGE_BYTES,
+    }));
+    let next_local = budget.reserve_local(
+        PAGE_BYTES, pressured.local_observed_use, pressured.local_budget, reserve.local,
+    );
+    assert_eq!(next_local.err(), Some(NoSpace { pool: Pool::Local, shortfall: PAGE_BYTES }));
+
+    // 只有对应提交完成、最后一份租约释放后才回收；回暖后重新开放准入。
+    drop(in_flight);
+    assert_eq!(budget.used(Pool::Ram), 0);
+    assert_eq!(budget.used(Pool::Local), 0);
+    let recovered = HostPressure { available_ram: 7 * GIB, ..initial };
+    let limits = budget.refresh_pressure(reserve, BudgetProfile::Auto, || Some(recovered)).unwrap();
+    assert_eq!(limits.ram.hard, 5 * GIB);
+    assert!(budget.reserve_ram(5 * GIB).is_ok());
+    assert!(budget.reserve_local(4 * GIB, 0, 6 * GIB, reserve.local).is_ok());
 }
 
 #[test]
