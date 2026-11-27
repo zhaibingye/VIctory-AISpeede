@@ -2120,6 +2120,51 @@ fn barrier<'a>(
     }
 }
 
+#[cfg(all(test, feature = "paged-title"))]
+#[test]
+fn discarded_partial_color_clear_blocks_shared_texture_read() {
+    use crate::page_draw::{ColorClear, ColorTarget};
+    use crate::page_resource::{ColorSubresource, PageBarrier};
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SAMPLE_DESC};
+
+    let host = crate::host::host().expect("D3D12 宿主");
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 4, Height: 4, DepthOrArraySize: 1, MipLevels: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        ..Default::default()
+    };
+    let mut texture = None::<ID3D12Resource>;
+    // 安全：独立的 4×4 颜色目标，描述符与资源类型匹配。
+    unsafe { host.device.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+    ) }.unwrap();
+    let copy = std::sync::Arc::new(crate::resource::HostTexture::new(texture.unwrap(), 0, Vec::new()));
+    let discard = PageBarrier::whole_color_discard(copy.clone()).unwrap();
+    let sub = ColorSubresource::capture(desc, 0).unwrap();
+    let clear = ColorClear {
+        target: ColorTarget::capture_candidate(copy.clone(), Default::default()).unwrap(),
+        color: [0., 0., 1., 1.], rects: vec![RECT { left: 0, top: 0, right: 2, bottom: 4 }],
+    };
+    let result = host.execute_paged_work(crate::memory::heap().unwrap(), &mut SubmissionBacking::default(),
+        &[], WriteSet::Declared, |list, _, batch, _, _, plan| {
+            discard.encode(list, plan)?;
+            assert!(!plan.unclassified_native_write, "弃旧本身不是原生写入");
+            clear.encode(host, list, batch, plan)?;
+            assert!(plan.color_is_discarded(&copy, sub));
+            assert!(!plan.authoritative(&copy), "局部清除不能发布整面版本");
+            // 提供共享读取一侧的标记，让实际提交门禁判断当前批次的写入。
+            plan.section_texture_read = true;
+            Ok(BTreeSet::new())
+        });
+    assert!(matches!(result, Err(BatchError::UnclassifiedSharedTextureWriter { current_submission: true, .. })),
+        "即使其他测试已提交原生写入，也必须识别本批次的局部写入：{result:?}");
+}
+
 #[cfg(test)]
 #[test]
 fn paged_direct_queue_merges_only_marked_physical_pages() {

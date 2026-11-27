@@ -630,16 +630,16 @@ impl ResourcePlan {
             // 即使局部写入不能发布内容版本，已编码的原生操作仍是盘点候选。
             self.inventory_writers.register(copy);
         }
-        // 局部（或覆盖范围未获证明的）绘制不能发布整面内容。
-        if !full_if_discarded && old.is_some_and(|v| v.representation == Representation::Discarded) {
-            return Ok(());
-        }
         #[cfg(feature = "paged-title")]
         if !self.unclassified_native_write {
             // 默认系统堆块不能与固定的 XMem 节或独立虚拟内存保留区共享同一个后备。
             self.unclassified_native_write = !copy.began_on_private_heap
                 || copy.candidate_guest_span.is_none_or(|(start, end)|
                     !crate::title_backing::is_private_heap_span(start as usize, end as usize));
+        }
+        // 弃旧后的局部写也可能写到物理别名；只跳过整面版本发布，不跳过共享读取门禁。
+        if !full_if_discarded && old.is_some_and(|v| v.representation == Representation::Discarded) {
+            return Ok(());
         }
 
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
