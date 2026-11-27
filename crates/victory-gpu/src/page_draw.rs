@@ -1084,10 +1084,56 @@ float4 opaque_with_holes(float4 pos : SV_Position) : SV_Target0 {
     #[derive(Clone, Copy)]
     enum Producer {
         None,
+        NoneWithPrewrittenBacking,
         Partial,
         Full,
         FullAfterReader,
         OtherTarget,
+    }
+
+    // One 64 KiB block covers the complete 4×4 guest default R_X main plane.
+    // A real pagefile view tests creation against live bytes; it is not an
+    // XMem allocation or a proof about the guest's compression metadata.
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+        PAGE_READWRITE, UnmapViewOfFile,
+    };
+    const BLOCK: usize = 64 * 1024;
+    struct SectionView(MEMORY_MAPPED_VIEW_ADDRESS);
+    impl SectionView {
+        fn new() -> Self {
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+            // SAFETY: create a private pagefile section and map exactly one block.
+            unsafe {
+                let handle = CreateFileMappingW(
+                    windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                    std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null(),
+                );
+                assert!(!handle.is_null());
+                let section = OwnedHandle::from_raw_handle(handle);
+                let view = MapViewOfFile(section.as_raw_handle(), FILE_MAP_WRITE, 0, 0, BLOCK);
+                assert!(!view.Value.is_null());
+                Self(view)
+            }
+        }
+        fn bytes(&self) -> &[u8] {
+            // SAFETY: the view remains mapped for BLOCK bytes; no client of the
+            // view is active when this synthetic backing is inspected.
+            unsafe { std::slice::from_raw_parts(self.0.Value.cast(), BLOCK) }
+        }
+        fn fill(&mut self, pixel: [u8; 4]) {
+            // SAFETY: the new view is writable and exclusively owned here.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(self.0.Value.cast(), BLOCK) };
+            for word in bytes.chunks_exact_mut(4) {
+                word.copy_from_slice(&pixel);
+            }
+        }
+    }
+    impl Drop for SectionView {
+        fn drop(&mut self) {
+            // SAFETY: this view was mapped once and the fixture owns it.
+            unsafe { UnmapViewOfFile(self.0) };
+        }
     }
 
     #[repr(C)]
@@ -1115,13 +1161,17 @@ float4 opaque_with_holes(float4 pos : SV_Position) : SV_Target0 {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             ..Default::default()
         };
-        let va = 0x5100_0000u64 + match producer {
-            Producer::None => 0,
-            Producer::Partial => 1,
-            Producer::Full => 2,
-            Producer::FullAfterReader => 3,
-            Producer::OtherTarget => 4,
-        } * 0x1_0000;
+        let mut section = SectionView::new();
+        assert!(section.bytes().iter().all(|&byte| byte == 0));
+        let initial_word = if matches!(producer, Producer::NoneWithPrewrittenBacking | Producer::Full) {
+            // Distinct from the blue creation hint; fill padding as well.
+            let red = [255, 0, 0, 255];
+            section.fill(red);
+            red
+        } else {
+            [0; 4]
+        };
+        let va = section.0.Value as u64;
         let null = std::ptr::null();
         let blue = D3D12_CLEAR_VALUE {
             Format: desc.Format,
@@ -1134,7 +1184,7 @@ float4 opaque_with_holes(float4 pos : SV_Position) : SV_Target0 {
         ), S_OK);
         let copy = resource::host_copy(object).expect("按地址资源的宿主颜色对象");
         assert!(copy.uses_unproven_alias_backing());
-        assert!(copy.candidate_guest_span.is_some());
+        assert_eq!(copy.candidate_guest_span, Some((va, va + BLOCK as u64)));
         assert!(copy.compatible_texture_source().is_none(), "不能把默认 R_X 当作线性来源");
         assert!(copy.current_native_generation(), "夹具必须保留当前原生代");
         let mut other = null;
@@ -1156,6 +1206,10 @@ float4 opaque_with_holes(float4 pos : SV_Position) : SV_Target0 {
         let other_rtv = other_rtv.as_mut_ptr() as u64;
         descriptor::create_rtv(null, object, null.cast(), rtv);
         descriptor::create_rtv(null, other, null.cast(), other_rtv);
+        assert!(section.bytes().chunks_exact(4).all(|word| word == initial_word),
+            "地址式资源和 RTV 创建都不能改写已映射的来宾字节");
+        assert!(!ResourcePlan::default().authoritative(&copy),
+            "初始布局、优化清除值和映射字节不能发布原生整面版本");
         let target = ColorTarget::capture_candidate(
             copy.clone(), descriptor::rtv_record(rtv).unwrap().desc(),
         ).unwrap();
@@ -1184,7 +1238,7 @@ float4 opaque_with_holes(float4 pos : SV_Position) : SV_Target0 {
             Producer::Full => clear(guest_list, rtv, background, 0, null.cast()),
             Producer::Partial => clear(guest_list, rtv, background, 1, (&raw const half).cast()),
             Producer::OtherTarget => clear(guest_list, other_rtv, background, 0, null.cast()),
-            Producer::None | Producer::FullAfterReader => {}
+            Producer::None | Producer::NoneWithPrewrittenBacking | Producer::FullAfterReader => {}
         }
         // Reproduce only the known transition shape; the reader is synthetic
         // and the untranslated slot has no verified ABI to replay here.
@@ -1294,7 +1348,7 @@ float4 opaque_with_holes(float4 pos : SV_Position) : SV_Target0 {
                 format: 29, ..
             })
     ), "不同目的描述符的对照首错不匹配：{error:?}");
-    for producer in [Producer::None, Producer::FullAfterReader] {
+    for producer in [Producer::None, Producer::NoneWithPrewrittenBacking, Producer::FullAfterReader] {
         let error = run(producer, &translucent, &red).expect_err("缺失或后置生产者必须拒绝旧色读取");
         assert!(matches!(error,
             BatchError::Operation { phase: "encode", index: 1, operation: "draw", ref cause }
