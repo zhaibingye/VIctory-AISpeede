@@ -1116,6 +1116,12 @@ fn ordered_color_disjoint(
     pins: &BackingPins, (start, end): (u64, u64), ordinary: &BTreeSet<PhysicalPage>,
     other_writes: impl Iterator<Item = ((u64, u64), bool)>,
 ) -> std::result::Result<bool, BatchError> {
+    // Candidate ranges are normally checked while the resource is captured,
+    // but this helper is the final physical-identity gate. Never let an
+    // empty or inverted range become a vacuous disjointness proof.
+    if start >= end {
+        return Ok(false);
+    }
     let own = physical_footprint(pins, &[(start, end)])?;
     if own.len() as u64 != end.div_ceil(PAGE_BYTES) - start / PAGE_BYTES
         || !own.is_disjoint(ordinary)
@@ -1123,6 +1129,9 @@ fn ordered_color_disjoint(
         return Ok(false);
     }
     for ((a, b), private_heap) in other_writes {
+        if a >= b {
+            return Ok(false);
+        }
         if start < b && a < end
             || !private_heap && !own.is_disjoint(&physical_footprint(pins, &[(a, b)])?)
         {
@@ -1130,6 +1139,38 @@ fn ordered_color_disjoint(
         }
     }
     Ok(true)
+}
+
+#[cfg(all(test, feature = "paged-title"))]
+#[test]
+fn ordered_color_disjoint_requires_complete_physical_destination() {
+    let mut pins = BackingPins::default();
+    let physical = victory_memory::physical::PageNumbers::default().allocate(6).unwrap();
+    let page = PAGE_BYTES as usize;
+    let span = |n: u64| (n * PAGE_BYTES, (n + 1) * PAGE_BYTES);
+    // The destination covers two VA pages with a fixed, consecutive physical
+    // identity. A writer on another physical page is disjoint and is safe;
+    // a writer on either destination page is not.
+    pins.remember(page, 3 * page, Some(physical));
+    pins.remember(3 * page, 4 * page, Some(physical.offset(2)));
+    pins.remember(4 * page, 5 * page, Some(physical.offset(3)));
+    let empty = BTreeSet::new();
+    let destination = (PAGE_BYTES, 3 * PAGE_BYTES);
+
+    assert!(ordered_color_disjoint(&pins, destination, &empty, [(span(3), false)].into_iter()).unwrap(),
+        "a fixed destination and an entirely different physical page are disjoint");
+    assert!(!ordered_color_disjoint(&pins, destination, &empty, [(span(1), false)].into_iter()).unwrap(),
+        "an alias of the first destination page must reject");
+    assert!(!ordered_color_disjoint(&pins, destination, &empty, [(span(2), false)].into_iter()).unwrap(),
+        "an alias of the second destination page must reject");
+    assert!(!ordered_color_disjoint(&pins, destination, &[physical.offset(1)].into(), std::iter::empty()).unwrap(),
+        "an ordinary operation sharing a destination page must reject");
+    assert!(ordered_color_disjoint(&pins, destination, &empty, [(span(5), false)].into_iter()).is_err(),
+        "an uncaptured writer page cannot be treated as disjoint");
+    assert!(!ordered_color_disjoint(&pins, (PAGE_BYTES, PAGE_BYTES), &empty, std::iter::empty()).unwrap(),
+        "an empty destination is not a physical proof");
+    assert!(!ordered_color_disjoint(&pins, (3 * PAGE_BYTES, PAGE_BYTES), &empty, std::iter::empty()).unwrap(),
+        "an inverted destination is not a physical proof");
 }
 
 #[cfg(all(test, feature = "paged-title"))]

@@ -981,6 +981,234 @@ fn paged_title_partial_color_clear_observes_submission_order() {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics", feature = "paged-title"))]
+#[test]
+fn paged_title_blended_draw_requires_preceding_full_native_color_producer() {
+    use crate::object::{IUNKNOWN, S_OK, This};
+    use crate::resource;
+    use windows::Win32::Graphics::Direct3D::{
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, Fxc::D3DCompile, ID3DBlob,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    };
+    use windows::core::s;
+
+    let host = crate::host::host().expect("D3D12 宿主（可用 VICTORY_D3D12_WARP=1 选择 WARP）");
+    let heap = crate::memory::heap().unwrap();
+    let source = r#"
+float4 vertex(uint id : SV_VertexID) : SV_Position {
+    float2 p[3] = { float2(-1, -1), float2(-1, 3), float2(3, -1) };
+    return float4(p[id], 0, 1);
+}
+float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
+"#;
+    let compile = |entry| {
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the HLSL source and entry point remain live for the call.
+        unsafe {
+            D3DCompile(source.as_ptr().cast(), source.len(), s!("page_draw_blend"), None, None,
+                entry, s!("vs_5_0"), 0, 0, &mut code, None).unwrap();
+        }
+        code.unwrap()
+    };
+    let vs = compile(s!("vertex"));
+    let ps = {
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the HLSL source and entry point remain live for the call.
+        unsafe {
+            D3DCompile(source.as_ptr().cast(), source.len(), s!("page_draw_blend"), None, None,
+                s!("pixel"), s!("ps_5_0"), 0, 0, &mut code, None).unwrap();
+        }
+        code.unwrap()
+    };
+    let (root, pso) = unsafe {
+        let mut serialized: Option<ID3DBlob> = None;
+        D3D12SerializeRootSignature(
+            &D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: 0,
+                pParameters: std::ptr::null(),
+                NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+            },
+            D3D_ROOT_SIGNATURE_VERSION_1,
+            &mut serialized,
+            None,
+        ).unwrap();
+        let serialized = serialized.unwrap();
+        let bytes = std::slice::from_raw_parts(
+            serialized.GetBufferPointer().cast::<u8>(), serialized.GetBufferSize(),
+        );
+        let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            SrcBlend: D3D12_BLEND_SRC_ALPHA,
+            DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            // Preserve the destination alpha; only RGB consumes old color.
+            SrcBlendAlpha: D3D12_BLEND_ZERO,
+            DestBlendAlpha: D3D12_BLEND_ONE,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            ..Default::default()
+        };
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+            VS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: vs.GetBufferPointer(), BytecodeLength: vs.GetBufferSize(),
+            },
+            PS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: ps.GetBufferPointer(), BytecodeLength: ps.GetBufferSize(),
+            },
+            BlendState: blend,
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+            InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: std::ptr::null(), NumElements: 0,
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            RTVFormats: [DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN,
+                DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+                DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN],
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let pso: ID3D12PipelineState = host.device.CreateGraphicsPipelineState(&desc).unwrap();
+        let _ = std::mem::ManuallyDrop::into_inner(desc.pRootSignature);
+        (root, pso)
+    };
+
+    #[derive(Clone, Copy)]
+    enum Producer {
+        None,
+        Partial,
+        Full,
+        FullAfterReader,
+    }
+
+    let run = |producer| {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let va = 0x5100_0000u64 + match producer {
+            Producer::None => 0,
+            Producer::Partial => 1,
+            Producer::Full => 2,
+            Producer::FullAfterReader => 3,
+        } * 0x1_0000;
+        let mut object: This = std::ptr::null();
+        // SAFETY: the synthetic resource uses an aligned, linear guest VA and
+        // a matching render-target description; no process memory is read.
+        assert_eq!(
+            resource::create_at_address(
+                std::ptr::null(), va, (&raw const desc).cast(), 0,
+                std::ptr::null(), &IUNKNOWN, &mut object,
+            ),
+            S_OK,
+        );
+        let copy = resource::host_copy(object).expect("按地址资源的宿主颜色对象");
+        assert!(copy.uses_unproven_alias_backing());
+        assert!(copy.candidate_guest_span.is_some());
+        assert!(copy.current_native_generation(), "夹具必须保留当前原生代");
+        let target = ColorTarget::capture_candidate(copy.clone(), RtvDescription::default()).unwrap();
+        let list = host.new_list().unwrap();
+        let draw = {
+            let mut draw = ClosedDraw::from_proven_native(
+                pso.clone(), root.clone(), target.clone(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                D3D12_VIEWPORT { Width: 4.0, Height: 4.0, MaxDepth: 1.0, ..Default::default() },
+                RECT { left: 0, top: 0, right: 4, bottom: 4 }, Vec::new(),
+                DrawCall::Direct { vertices: 3, instances: 1, first: 0, first_instance: 0 },
+            );
+            // A non-zero blend factor is not enough to identify a consumer;
+            // this bit is the translated PSO's destination-read admission.
+            draw.color_destination_reads = 1;
+            draw
+        };
+        let full = || ColorClear {
+            target: target.clone(), color: [1., 0., 0., 1.], rects: Vec::new(),
+        };
+        let partial = || ColorClear {
+            target: target.clone(), color: [1., 0., 0., 1.],
+            rects: vec![RECT { left: 0, top: 0, right: 2, bottom: 4 }],
+        };
+        match producer {
+            Producer::Full => {
+                list.record_page_clear(full());
+                list.record_page_draw(draw);
+            }
+            Producer::Partial => {
+                list.record_page_clear(partial());
+                list.record_page_draw(draw);
+            }
+            Producer::None => list.record_page_draw(draw),
+            Producer::FullAfterReader => {
+                list.record_page_draw(draw);
+                list.record_page_clear(full());
+            }
+        }
+        list.close();
+        let result = host.execute_paged_title(
+            heap, &mut crate::title_backing::SubmissionBacking::default(), &[&list],
+        );
+        if let Err(error) = result {
+            resource::resource_release(object);
+            return Err(error);
+        }
+        assert!(ResourcePlan::default().authoritative(&copy),
+            "成功的前置整面写入应发布 NativeGpu 版本");
+        let read = host.new_list().unwrap();
+        let (readback, footprint) = crate::capture::read_back(&host.device, read.recording(), &copy.texture).unwrap();
+        read.close();
+        host.execute(&[&read]);
+        // SAFETY: the readback list has completed before the mapped bytes are
+        // inspected; the footprint bounds the selected 4×4 RGBA8 texel.
+        let pixel = unsafe {
+            let mut ptr = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut ptr)).unwrap();
+            let row = ptr.cast::<u8>().add(
+                footprint.Offset as usize + 2 * footprint.Footprint.RowPitch as usize,
+            );
+            let pixel: [u8; 4] = std::slice::from_raw_parts(row.add(2 * 4), 4).try_into().unwrap();
+            readback.Unmap(0, None);
+            pixel
+        };
+        resource::resource_release(object);
+        Ok(pixel)
+    };
+
+    let blended = run(Producer::Full).expect("完整原生生产者后混合绘制应入队");
+    // The green source is alpha-blended with the red clear. Both channels
+    // must survive; a source-only path would have no red contribution.
+    assert!(blended[0] > 0 && blended[1] > 0, "blend did not consume the old red color: {blended:?}");
+    assert_eq!(blended[2], 0);
+    assert_eq!(blended[3], 255);
+
+    for producer in [Producer::None, Producer::Partial, Producer::FullAfterReader] {
+        let error = run(producer).expect_err("缺失、局部或后置生产者必须拒绝旧色读取");
+        assert!(matches!(error,
+            BatchError::Operation { phase: "encode", ref cause, .. }
+                if matches!(cause.as_ref(), BatchError::MissingTextureContent { .. } | BatchError::TargetNotInitialized)
+        ), "unexpected old-color admission result: {error:?}");
+    }
+}
+
 #[cfg(all(test, feature = "diagnostics"))]
 fn compile_dxc_stage(source: &str, entry: &str, profile: &str) -> Vec<u8> {
     let dxc = std::env::var_os("VICTORY_PC_DXC").map(std::path::PathBuf::from)
