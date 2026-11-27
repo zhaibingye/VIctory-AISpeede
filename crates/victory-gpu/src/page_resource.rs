@@ -276,7 +276,7 @@ impl ResourcePlan {
     fn record_write_at(&mut self, copy: &Arc<HostTexture>, subresource: Option<u32>) -> Result<(), BatchError> {
         #[cfg(feature = "paged-title")]
         if !self.unclassified_native_write {
-            // 私有堆的当前有效分配不能是单独固定的 XMem section 页。
+            // 默认系统堆块不能与固定的 XMem 节或独立虚拟内存保留区共享同一个后备。
             self.unclassified_native_write = !copy.began_on_private_heap
                 || copy.candidate_guest_span.is_none_or(|(start, end)|
                     !crate::title_backing::is_private_heap_span(start as usize, end as usize));

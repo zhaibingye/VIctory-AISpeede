@@ -243,8 +243,8 @@ impl Aliases {
 pub struct BackingPins {
     sections: BTreeMap<PhysicalPage, Arc<dyn Any + Send + Sync>>,
     // Aligned half-open VA runs from the first observation in this
-    // submission. None describes a run without XMem backing.
-    mappings: BTreeMap<usize, (usize, Option<PhysicalPage>)>,
+    // submission. Also retains whether a private run has its own reservation.
+    mappings: BTreeMap<usize, (usize, Option<PhysicalPage>, bool)>,
 }
 
 impl BackingPins {
@@ -264,11 +264,17 @@ impl BackingPins {
     /// Capture only previously unseen addresses. If a queue chunk sees a
     /// remap, it must not retarget pending writebacks from an earlier chunk.
     pub fn remember(&mut self, start: usize, end: usize, first: Option<PhysicalPage>) {
+        self.remember_with_origin(start, end, first, false);
+    }
+
+    pub fn remember_with_origin(
+        &mut self, start: usize, end: usize, first: Option<PhysicalPage>, own_reservation: bool,
+    ) {
         const PAGE: usize = PAGE_BYTES as usize;
         debug_assert!(start.is_multiple_of(PAGE) && end.is_multiple_of(PAGE));
         let mut at = start;
         while at < end {
-            if let Some((_, &(previous_end, _))) = self.mappings.range(..=at).next_back()
+            if let Some((_, &(previous_end, ..))) = self.mappings.range(..=at).next_back()
                 && at < previous_end
             {
                 at = previous_end;
@@ -277,7 +283,7 @@ impl BackingPins {
             let to = self.mappings.range(at..).next()
                 .map_or(end, |(&next, _)| end.min(next));
             let page = first.map(|p| p.offset((at - start) / PAGE));
-            self.mappings.insert(at, (to, page));
+            self.mappings.insert(at, (to, page, own_reservation));
             at = to;
         }
     }
@@ -285,13 +291,18 @@ impl BackingPins {
     /// End of the current run (clipped to `end`) and the first page at
     /// `address`. Holes are also returned so a caller can make progress.
     pub fn run_at(&self, address: usize, end: usize) -> (usize, Option<PhysicalPage>) {
-        if let Some((&start, &(limit, first))) = self.mappings.range(..=address).next_back()
+        let (limit, page, _) = self.run_with_origin(address, end);
+        (limit, page)
+    }
+
+    pub fn run_with_origin(&self, address: usize, end: usize) -> (usize, Option<PhysicalPage>, bool) {
+        if let Some((&start, &(limit, first, own_reservation))) = self.mappings.range(..=address).next_back()
             && address < limit
         {
-            return (limit.min(end), first.map(|p| p.offset((address - start) / PAGE_BYTES as usize)));
+            return (limit.min(end), first.map(|p| p.offset((address - start) / PAGE_BYTES as usize)), own_reservation);
         }
         let limit = self.mappings.range(address..).next().map_or(end, |(&next, _)| end.min(next));
-        (limit, None)
+        (limit, None, false)
     }
 
     /// 以固定的物理页覆盖半开区间。任何空洞都会使证明失败；不退回虚拟地址。
@@ -342,4 +353,18 @@ fn physical_runs_keep_first_backing_and_never_fill_a_hole() {
     ]));
     assert_eq!(pins.physical_runs(page * 4, page * 5 + 1), None);
     assert_eq!(pins.physical_runs(page, page), None);
+}
+
+
+#[cfg(test)]
+#[test]
+fn a_reused_address_cannot_upgrade_the_captured_backing_origin() {
+    let va = PAGE_BYTES as usize;
+    let mut pins = BackingPins::default();
+    let old = PhysicalPage::private(0).unwrap();
+    let other = PhysicalPage::private(1).unwrap();
+    pins.remember(va, va * 2, Some(old));
+    pins.remember_with_origin(va, va * 3, Some(other), true);
+    assert_eq!(pins.run_with_origin(va, va * 3), (va * 2, Some(old), false));
+    assert_eq!(pins.run_with_origin(va * 2, va * 3), (va * 3, Some(other.offset(1)), true));
 }

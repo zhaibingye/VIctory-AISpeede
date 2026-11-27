@@ -147,16 +147,19 @@ pub(crate) fn activate_private_ram_budget() -> Result<(), victory_memory::budget
 }
 
 fn note_private_commit(pages: &mut VirtualPages, at: *mut c_void, bytes: usize, kind: u32) {
-    if at.is_null() || kind & MEM_COMMIT == 0 {
+    if at.is_null() || kind & (MEM_RESERVE | MEM_COMMIT) == 0 || kind & MEM_RESERVE_PLACEHOLDER != 0 {
         return;
     }
     let mut info = MEMORY_BASIC_INFORMATION::default();
     // SAFETY: querying the successful allocation writes one local record.
     let found = unsafe { VirtualQueryEx(GetCurrentProcess(), at, &mut info, size_of_val(&info)) };
-    if found != 0 && info.State == MEM_COMMIT
-        && info.Type == windows_sys::Win32::System::Memory::MEM_PRIVATE
-    {
-        pages.committed(info.AllocationBase as usize, at as usize, bytes);
+    if found == 0 || info.Type != windows_sys::Win32::System::Memory::MEM_PRIVATE { return; }
+    let allocation = info.AllocationBase as usize;
+    if kind & MEM_RESERVE != 0 && allocation == at as usize {
+        pages.reserved(allocation);
+    }
+    if kind & MEM_COMMIT != 0 && info.State == MEM_COMMIT {
+        pages.committed(allocation, at as usize, bytes);
     }
 }
 
@@ -621,7 +624,7 @@ fn remember_private(
     let mut at = start;
     while at < end {
         let (next, page) = private.run_at(at, end);
-        pins.remember(at, next, page);
+        pins.remember_with_origin(at, next, page, private.has_own_reservation(at));
         at = next;
     }
 }
@@ -1480,6 +1483,7 @@ mod tests {
         pin_backing(&[(va, va + 2 * PAGE)], &mut before);
         let original = before.expected(va).unwrap();
         assert!(original.is_private());
+        assert!(before.run_with_origin(va, va + PAGE).2);
         let adjacent = before.expected(va + PAGE).unwrap();
         assert_ne!(original, adjacent);
         let granule = (va + 4096) as *mut c_void;
@@ -1489,6 +1493,7 @@ mod tests {
         pin_backing(&[(va, va + 2 * PAGE)], &mut after);
         let fresh = after.expected(va).unwrap();
         assert!(fresh.is_private() && fresh != original);
+        assert!(after.run_with_origin(va, va + PAGE).2);
         assert_eq!(after.expected(va + PAGE), Some(adjacent));
         read_backing_runs(va, va + PAGE, &before, &mut |_, at, len, same| {
             assert_eq!(at, None, "do not return bytes of the replacement page");
@@ -1504,6 +1509,7 @@ mod tests {
         let mut released = BackingPins::default();
         pin_backing(&[(va, va + PAGE)], &mut released);
         assert_ne!(released.expected(va), Some(fresh));
+        assert!(!released.run_with_origin(va, va + PAGE).2);
     }
 
     #[test]

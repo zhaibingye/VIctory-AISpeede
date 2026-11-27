@@ -253,7 +253,7 @@ impl PageSlabs {
 /// the physical page is pinned and transferred only once.
 pub(crate) struct PinnedBatch {
     pages: BTreeMap<PhysicalPage, (u64, PinnedPage)>,
-    aliases: BTreeMap<u64, PhysicalPage>,
+    aliases: BTreeMap<u64, (PhysicalPage, bool)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -353,16 +353,16 @@ impl PinnedBatch {
             }
             let mut va = start & !(PAGE_BYTES - 1);
             while va < end {
-                let (stop, physical) = backing.run_at(va as usize, end as usize);
+                let (stop, physical, own_reservation) = backing.run_with_origin(va as usize, end as usize);
                 let physical = physical.ok_or(BatchError::NotCaptured(va))?;
                 for (i, addr) in (va..stop as u64).step_by(PAGE_BYTES as usize).enumerate() {
-                    aliases.insert(addr, physical.offset(i));
+                    aliases.insert(addr, (physical.offset(i), own_reservation));
                 }
                 va = stop as u64;
             }
         }
         let mut pages = BTreeMap::new();
-        for (&va, &id) in &aliases {
+        for (&va, &(id, _)) in &aliases {
             use std::collections::btree_map::Entry;
             if let Entry::Vacant(slot) = pages.entry(id) {
                 match slabs.pin(host, id) {
@@ -412,7 +412,21 @@ impl PinnedBatch {
     }
 
     pub(crate) fn pinned_at(&self, va: u64) -> Option<&PinnedPage> {
-        self.pinned(*self.aliases.get(&(va & !(PAGE_BYTES - 1)))?)
+        self.pinned(self.aliases.get(&(va & !(PAGE_BYTES - 1)))?.0)
+    }
+
+    /// 仅准入已固定的节页或独立保留区，普通私有页号本身不是分配证明。
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn verify_independent_texture_backing(&self, (start, end): (u64, u64)) -> std::result::Result<(), BatchError> {
+        if start >= end || end > ADDRESS_LIMIT { return Err(BatchError::Range(start, end)); }
+        let first = start & !(PAGE_BYTES - 1);
+        for va in (first..end).step_by(PAGE_BYTES as usize) {
+            let &(page, own_reservation) = self.aliases.get(&va).ok_or(BatchError::NotCaptured(va))?;
+            if page.is_private() && !own_reservation {
+                return Err(BatchError::unsupported_texture_map("二维纹理的私有页未证明来自独立保留区"));
+            }
+        }
+        Ok(())
     }
 
     /// 只使用本次提交固定的物理身份；跨页时分别保留每页内的有效区间。
@@ -445,7 +459,7 @@ impl PinnedBatch {
     ) -> std::result::Result<BoundLeaves, BatchError> {
         let mut leaves = BTreeMap::new();
         let mut pairs = BTreeMap::new();
-        for (&va, &physical) in &self.aliases {
+        for (&va, &(physical, _)) in &self.aliases {
             let pin = &self.pages[&physical].1;
             use std::collections::btree_map::Entry;
             let pair = match pairs.entry(pin.slab()) {

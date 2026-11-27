@@ -378,10 +378,7 @@ impl TextureInput {
                     return Err(BatchError::unsupported_texture_map(reason));
                 }
                 for span in input.ranges() {
-                    batch.for_each_physical_span(span, |page, _| {
-                        if page.is_private() { return Err(BatchError::unsupported_texture_map("共享二维纹理的来宾范围包含私有页")); }
-                        Ok(())
-                    })?;
+                    batch.verify_independent_texture_backing(span)?;
                 }
                 plan.section_texture_read = true;
                 plan.transition_texture(list, copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;

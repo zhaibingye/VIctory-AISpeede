@@ -1,7 +1,7 @@
 //! Lifetime identities for ordinary title virtual allocations. The host
 //! can commit/decommit individual 4 KiB units. Admit only complete 64 KiB
 //! pages, and never let a recommit at the same VA reuse an identity.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{PAGE_BYTES, physical::PhysicalPage};
 
@@ -18,6 +18,7 @@ struct Slot {
 #[derive(Default)]
 pub struct VirtualPages {
     pages: BTreeMap<usize, Slot>,
+    reservations: BTreeSet<usize>,
     next: usize,
     committed_bytes: u64,
 }
@@ -58,6 +59,18 @@ impl VirtualPages {
 
     pub fn page(&self, address: usize) -> Option<PhysicalPage> {
         self.pages.get(&(address & !(PAGE - 1)))?.id
+    }
+
+    /// 只标记明确由运行时新建的独立虚拟内存保留区，而不是现成堆上的提交。
+    pub fn reserved(&mut self, allocation: usize) {
+        self.released(allocation);
+        self.reservations.insert(allocation);
+    }
+
+    pub fn has_own_reservation(&self, address: usize) -> bool {
+        self.pages.get(&(address & !(PAGE - 1))).is_some_and(|slot| {
+            slot.id.is_some() && self.reservations.contains(&slot.allocation)
+        })
     }
 
     /// Runs of private backing, or gaps. A known private ID spans one
@@ -152,6 +165,7 @@ impl VirtualPages {
 
     /// Host-confirmed MEM_RELEASE of the whole allocation.
     pub fn released(&mut self, allocation: usize) {
+        self.reservations.remove(&allocation);
         self.pages.retain(|_, slot| {
             if slot.allocation != allocation {
                 return true;
@@ -171,6 +185,27 @@ fn bits(base: usize, start: usize, end: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_reservation_is_not_inferred_from_commit_and_does_not_survive_release() {
+        let mut v = VirtualPages::default();
+        let va = PAGE;
+        v.committed(va, va, PAGE);
+        let unproven = v.page(va).unwrap();
+        assert!(!v.has_own_reservation(va));
+        v.reserved(va);
+        assert_eq!(v.page(va), None);
+        v.committed(va, va, PAGE);
+        assert_ne!(v.page(va), Some(unproven));
+        assert!(v.has_own_reservation(va));
+        v.decommitted(va, PAGE);
+        assert!(!v.has_own_reservation(va));
+        v.committed(va, va, PAGE);
+        assert!(v.has_own_reservation(va));
+        v.released(va);
+        v.committed(va, va, PAGE);
+        assert!(!v.has_own_reservation(va));
+    }
 
     #[test]
     fn private_commit_preflight_counts_only_new_granules() {
