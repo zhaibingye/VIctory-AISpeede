@@ -942,6 +942,13 @@ impl HostTexture {
         )
     }
 
+    /// 查找键记录的来宾布局线索；不表示实际 RTV 后备或可逐像素寻址。
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn diagnostic_guest_swizzle(&self) -> Option<u32> {
+        self.candidate_guest_span?;
+        self.address_identity_key.map(|key| key.swizzle)
+    }
+
     pub(crate) fn uses_unproven_alias_backing(&self) -> bool {
         use victory_memory::authority::ByteExposure::*;
         self.byte_exposure.load(std::sync::atomic::Ordering::Acquire)

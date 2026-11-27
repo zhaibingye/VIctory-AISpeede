@@ -30,9 +30,9 @@ struct ColorVersionTrace {
 /// 仅用于诊断已完成的 GPU 写入。记录的是可能与共享字节相交的页，
 /// 不是最新版本；写回、CPU 再写和未完成的批次都不由这张表裁决。
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-#[derive(Default)]
-struct NativeWriteTrace {
-    pages: std::collections::BTreeSet<PhysicalPage>,
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct NativeWriteTrace {
+    pub(crate) pages: std::collections::BTreeSet<PhysicalPage>,
     without_layout: usize,
     without_mapping: usize,
     known_private_heap: usize,
@@ -158,11 +158,23 @@ impl NativeWriterCandidates {
             }
         }
     }
+
+    fn same_complete_candidates(&self, other: &Self) -> bool {
+        self.skipped_registrations == 0 && other.skipped_registrations == 0
+            && self.objects.len() == other.objects.len()
+            && self.objects.iter().zip(&other.objects).all(|(a, b)| {
+                let (key, (object, span)) = a;
+                let (other_key, (other_object, other_span)) = b;
+                key == other_key && span == other_span && object.ptr_eq(other_object)
+            })
+    }
 }
 
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 struct CompletedNativeWrites {
-    fence: Fence,
+    oldest_fence: Fence,
+    newest_fence: Fence,
+    fence_count: usize,
     candidates: NativeWriterCandidates,
     physical: NativeWriteTrace,
 }
@@ -172,6 +184,7 @@ struct CompletedNativeWrites {
 struct NativeWriteHistory {
     completed: VecDeque<CompletedNativeWrites>,
     pages: usize,
+    evicted_groups: usize,
     evicted_fences: usize,
 }
 
@@ -181,7 +194,10 @@ static NATIVE_WRITE_HISTORY: std::sync::LazyLock<std::sync::Mutex<NativeWriteHis
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 #[derive(Default)]
 struct NativeHistoryComparison {
+    retained_fences: usize,
+    retained_summary_candidates: usize,
     retained_candidates: usize,
+    retained_pages_with_repeats: usize,
     skipped_registrations: usize,
     same_object_candidates: usize,
     candidate_va_overlaps: usize,
@@ -198,17 +214,43 @@ struct NativeHistoryComparison {
 
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 impl NativeWriteHistory {
-    const MAX_FENCES: usize = 128;
+    const MAX_GROUPS: usize = 128;
 
-    fn publish(&mut self, record: CompletedNativeWrites) {
-        let pages = record.physical.pages.len();
-        while self.completed.len() >= Self::MAX_FENCES || self.pages + pages > NativeWriteTrace::MAX_PAGES {
+    fn publish(&mut self, fence: Fence, candidates: NativeWriterCandidates, physical: NativeWriteTrace) {
+        // 只比较捕获时的批次页集合，不证明单个对象的映射相同。
+        // 缺失或截断的捕获不去重；已知私有堆按类别归组后仍标记物理覆盖不全。
+        if !physical.incomplete()
+            && let Some(index) = self.completed.iter().rposition(|entry| {
+                candidates.same_complete_candidates(&entry.candidates) && physical == entry.physical
+            })
+        {
+            let old = self.completed.remove(index).unwrap();
+            self.completed.push_back(CompletedNativeWrites {
+                oldest_fence: old.oldest_fence.min(fence), newest_fence: old.newest_fence.max(fence),
+                fence_count: old.fence_count.saturating_add(1), ..old
+            });
+            return;
+        }
+
+        let pages = physical.pages.len();
+        // 按组最近出现的顺序淘汰，而非按首次出现的 Fence。
+        while self.completed.len() >= Self::MAX_GROUPS || self.pages + pages > NativeWriteTrace::MAX_PAGES {
             let Some(old) = self.completed.pop_front() else { break; };
             self.pages -= old.physical.pages.len();
-            self.evicted_fences = self.evicted_fences.saturating_add(1);
+            self.evicted_groups = self.evicted_groups.saturating_add(1);
+            self.evicted_fences = self.evicted_fences.saturating_add(old.fence_count);
         }
         self.pages += pages;
-        self.completed.push_back(record);
+        self.completed.push_back(CompletedNativeWrites {
+            oldest_fence: fence, newest_fence: fence, fence_count: 1, candidates, physical,
+        });
+    }
+
+    fn fence_range(&self) -> (Option<u64>, Option<u64>) {
+        (
+            self.completed.iter().map(|entry| entry.oldest_fence.0).min(),
+            self.completed.iter().map(|entry| entry.newest_fence.0).max(),
+        )
     }
 
     fn compare(
@@ -220,32 +262,39 @@ impl NativeWriteHistory {
             physical_incomplete: self.evicted_fences != 0 || target_physical.incomplete() || target_physical.known_private_heap != 0,
             ..Default::default()
         };
-        for CompletedNativeWrites { candidates, physical, .. } in &self.completed {
+        for CompletedNativeWrites { candidates, physical, fence_count, .. } in &self.completed {
+            // 既有计数仍按所代表的 Fence 计算；另报实际保留的摘要大小。
+            let add = |total: &mut usize, count: usize| {
+                *total = total.saturating_add(count.saturating_mul(*fence_count));
+            };
             let mut all_va_disjoint = candidates.skipped_registrations == 0;
-            result.retained_candidates += candidates.objects.len();
-            result.skipped_registrations = result.skipped_registrations.saturating_add(candidates.skipped_registrations);
+            result.retained_summary_candidates += candidates.objects.len();
+            add(&mut result.retained_fences, 1);
+            add(&mut result.retained_candidates, candidates.objects.len());
+            add(&mut result.retained_pages_with_repeats, physical.pages.len());
+            add(&mut result.skipped_registrations, candidates.skipped_registrations);
             for (object, span) in candidates.objects.values() {
-                result.same_object_candidates += usize::from(same_object(object));
+                add(&mut result.same_object_candidates, usize::from(same_object(object)));
                 match (target_span, *span) {
                     (Some((a, b)), Some((c, d))) if a < d && c < b => {
-                        result.candidate_va_overlaps += 1;
+                        add(&mut result.candidate_va_overlaps, 1);
                         all_va_disjoint = false;
                     },
                     (Some(_), Some(_)) => {},
                     _ => {
-                        result.unknown_candidate_va += 1;
+                        add(&mut result.unknown_candidate_va, 1);
                         all_va_disjoint = false;
                     },
                 }
             }
             if !physical.pages.is_disjoint(&target_physical.pages) {
-                result.physical_overlap_fences += 1;
-                result.physical_overlap_va_disjoint_fences += usize::from(all_va_disjoint);
+                add(&mut result.physical_overlap_fences, 1);
+                add(&mut result.physical_overlap_va_disjoint_fences, usize::from(all_va_disjoint));
             }
-            result.writer_without_layout += physical.without_layout;
-            result.writer_without_mapping += physical.without_mapping;
-            result.writer_default_private_heap += physical.known_private_heap;
-            result.writer_over_capture_limit += physical.over_capture_limit;
+            add(&mut result.writer_without_layout, physical.without_layout);
+            add(&mut result.writer_without_mapping, physical.without_mapping);
+            add(&mut result.writer_default_private_heap, physical.known_private_heap);
+            add(&mut result.writer_over_capture_limit, physical.over_capture_limit);
             result.physical_incomplete |= physical.incomplete() || physical.known_private_heap != 0;
         }
         result.va_incomplete |= result.unknown_candidate_va != 0 || result.skipped_registrations != 0;
@@ -334,11 +383,10 @@ impl ResourcePlan {
         ColorVersionTrace { completed, submitted }
     }
 
-    /// 仅在缺失颜色内容时核对对象换代和已完成的历史写入候选；不据此移交像素。
+    /// 仅在缺失颜色内容时核对对象换代；不据此移交像素。
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     pub(crate) fn trace_color_predecessor(&self, target: &Arc<HostTexture>, index: u32) {
         if !crate::page_inventory::enabled() { return; }
-        Self::trace_color_native_history(target, index);
         let Some(weak) = &target.diagnostic_predecessor else {
             tracing::info!(subresource = index, target_whole = ?self.color_version_trace(target, None),
                 target_scoped = ?self.color_version_trace(target, Some(index)), "颜色目标溯源：未记录同键前代");
@@ -360,23 +408,27 @@ impl ResourcePlan {
     }
 
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-    fn trace_color_native_history(target: &Arc<HostTexture>, index: u32) {
-        if !tracing::enabled!(tracing::Level::INFO) { return; }
+    pub(crate) fn trace_color_native_history(target: &Arc<HostTexture>, index: u32) -> Option<NativeWriteTrace> {
+        if !crate::page_inventory::enabled() || !tracing::enabled!(tracing::Level::INFO) { return None; }
         // 历史身份在提交前捕获；失败时只查询当前目标，不能重新解释历史 VA。
         let span = target.candidate_guest_span;
         let target_physical = NativeWriteTrace::capture(std::iter::once(span), Some(NativeWriterCandidates::CAPTURE_PAGES));
         let target_object = Arc::downgrade(target);
-        let (summary, retained_fences, evicted_fences, oldest_fence, newest_fence, retained_pages) = {
+        let (summary, retained_groups, evicted_groups, evicted_fences, (oldest_fence, newest_fence), retained_summary_pages) = {
             let history = NATIVE_WRITE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
             (
                 history.compare(span, &target_physical, |writer| writer.ptr_eq(&target_object)),
-                history.completed.len(), history.evicted_fences,
-                history.completed.front().map(|entry| entry.fence.0),
-                history.completed.back().map(|entry| entry.fence.0), history.pages,
+                history.completed.len(), history.evicted_groups, history.evicted_fences, history.fence_range(), history.pages,
             )
         };
+        let retained_fences = summary.retained_fences;
+        // 只计已发布此诊断的提交，不代表所有 GPU 提交。
+        let completed_fences = retained_fences.saturating_add(evicted_fences);
+        let private_pages = target_physical.pages.iter().filter(|page| page.is_private()).count();
         tracing::info!(
             subresource = index, retained_fences, evicted_fences, oldest_fence = ?oldest_fence, newest_fence = ?newest_fence,
+            retained_groups, evicted_groups, completed_fences,
+            retained_summary_candidates = summary.retained_summary_candidates,
             retained_candidates = summary.retained_candidates, skipped_writer_registrations = summary.skipped_registrations,
             same_object_candidates = summary.same_object_candidates,
             candidate_va = native_history_finding(summary.candidate_va_overlaps, summary.va_incomplete),
@@ -384,13 +436,18 @@ impl ResourcePlan {
             physical = native_history_finding(summary.physical_overlap_fences, summary.physical_incomplete),
             physical_overlap_fences = summary.physical_overlap_fences,
             physical_overlap_va_disjoint_fences = summary.physical_overlap_va_disjoint_fences,
-            target_pages = target_physical.pages.len(), retained_pages_with_repeats = retained_pages,
+            target_pages = target_physical.pages.len(), target_tracked_private_vm_pages = private_pages,
+            target_section_pages = target_physical.pages.len() - private_pages,
+            guest_layout_swizzle_hint = ?target.diagnostic_guest_swizzle(),
+            target_native_private_heap_at_creation = target.began_on_private_heap,
+            retained_summary_pages, retained_pages_with_repeats = summary.retained_pages_with_repeats,
             target_without_layout = target_physical.without_layout, target_without_mapping = target_physical.without_mapping,
             target_default_private_heap = target_physical.known_private_heap, target_over_capture_limit = target_physical.over_capture_limit,
             writer_without_layout = summary.writer_without_layout, writer_without_mapping = summary.writer_without_mapping,
             writer_default_private_heap = summary.writer_default_private_heap, writer_over_capture_limit = summary.writer_over_capture_limit,
             "[VNME_NATIVE_WRITE_HISTORY] 颜色目标溯源：已发布完成 Fence 的原生写入候选（整资源估算，不含尚未发布的 Fence；不证明同分配代、字节写入或像素有效）"
         );
+        Some(target_physical)
     }
 
     pub(crate) fn authoritative(&self, copy: &Arc<HostTexture>) -> bool {
@@ -677,9 +734,7 @@ impl ResourcePlan {
         }
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
         if let Some(physical) = self.inventory_capture {
-            NATIVE_WRITE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).publish(CompletedNativeWrites {
-                fence: submitted, candidates: self.inventory_writers, physical,
-            });
+            NATIVE_WRITE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).publish(submitted, self.inventory_writers, physical);
         }
 
         #[cfg(feature = "paged-title")]
@@ -835,12 +890,13 @@ mod native_history_tests {
     use super::*;
     use victory_memory::physical::PageNumbers;
 
-    fn record(fence: u64, span: Option<(u64, u64)>, physical: NativeWriteTrace) -> CompletedNativeWrites {
-        CompletedNativeWrites {
-            fence: Fence(fence),
-            candidates: NativeWriterCandidates { objects: [(0, (Weak::new(), span))].into(), ..Default::default() },
-            physical,
-        }
+    fn candidates(key: usize, span: Option<(u64, u64)>) -> NativeWriterCandidates {
+        // 合成身份，不需要创建宿主设备或提交 GPU 命令。
+        NativeWriterCandidates { objects: [(key, (Weak::new(), span))].into(), ..Default::default() }
+    }
+
+    fn publish(history: &mut NativeWriteHistory, fence: u64, span: Option<(u64, u64)>, physical: NativeWriteTrace) {
+        history.publish(Fence(fence), candidates(0, span), physical);
     }
 
     #[test]
@@ -849,9 +905,9 @@ mod native_history_tests {
         let target = NativeWriteTrace { pages: [first].into(), ..Default::default() };
         let mut history = NativeWriteHistory::default();
         // 紧邻的 VA 不相交，但提交记录中已识别到相同物理页。
-        history.publish(record(1, Some((0x20000, 0x30000)), NativeWriteTrace { pages: [first].into(), ..Default::default() }));
+        publish(&mut history, 1, Some((0x20000, 0x30000)), NativeWriteTrace { pages: [first].into(), ..Default::default() });
         // VA 相同不能证明是同一个后备：写入时记录的是另一个页。
-        history.publish(record(2, Some((0x10000, 0x20000)), NativeWriteTrace { pages: [first.offset(1)].into(), ..Default::default() }));
+        publish(&mut history, 2, Some((0x10000, 0x20000)), NativeWriteTrace { pages: [first.offset(1)].into(), ..Default::default() });
         let summary = history.compare(Some((0x10000, 0x20000)), &target, |_| false);
         assert_eq!(summary.candidate_va_overlaps, 1);
         assert_eq!(summary.physical_overlap_fences, 1);
@@ -863,9 +919,9 @@ mod native_history_tests {
     fn private_heap_and_missing_capture_are_not_negative_physical_evidence() {
         let target = NativeWriteTrace { known_private_heap: 1, ..Default::default() };
         let mut history = NativeWriteHistory::default();
-        history.publish(record(1, Some((0x10000, 0x20000)), NativeWriteTrace { known_private_heap: 1, ..Default::default() }));
-        history.publish(record(2, None, NativeWriteTrace { without_layout: 1, ..Default::default() }));
-        history.publish(record(3, Some((0x20000, 0x90000)), NativeWriteTrace { over_capture_limit: 1, ..Default::default() }));
+        publish(&mut history, 1, Some((0x10000, 0x20000)), NativeWriteTrace { known_private_heap: 1, ..Default::default() });
+        publish(&mut history, 2, None, NativeWriteTrace { without_layout: 1, ..Default::default() });
+        publish(&mut history, 3, Some((0x20000, 0x90000)), NativeWriteTrace { over_capture_limit: 1, ..Default::default() });
         let summary = history.compare(Some((0x10000, 0x20000)), &target, |_| false);
         assert_eq!(summary.candidate_va_overlaps, 1);
         assert_eq!(summary.unknown_candidate_va, 1);
@@ -877,18 +933,83 @@ mod native_history_tests {
     }
 
     #[test]
-    fn evicted_fences_mark_both_comparisons_incomplete() {
+    fn repeated_private_candidates_preserve_earlier_distinct_evidence() {
+        let first = PageNumbers::default().allocate(1).unwrap();
+        let target = NativeWriteTrace { pages: [first].into(), ..Default::default() };
+        let private = || NativeWriteTrace { known_private_heap: 1, ..Default::default() };
+        let mut history = NativeWriteHistory::default();
+        let target_span = Some((0x10000, 0x20000));
+        let repeated_span = Some((0x20000, 0x30000));
+        publish(&mut history, 1, repeated_span, private());
+        history.publish(Fence(2), candidates(1, target_span), NativeWriteTrace { pages: [first].into(), ..Default::default() });
+        let repeats = NativeWriteHistory::MAX_GROUPS; // 此前每个 Fence 单独占用该上限。
+        for i in 0..repeats {
+            publish(&mut history, i as u64 + 3, repeated_span, private());
+        }
+        assert_eq!(history.completed.len(), 2);
+        assert_eq!(history.evicted_groups, 0);
+        assert_eq!(history.evicted_fences, 0);
+        assert_eq!(history.fence_range(), (Some(1), Some(repeats as u64 + 2)));
+        assert_eq!(history.pages, 1);
+        let summary = history.compare(target_span, &target, |_| false);
+        assert_eq!(summary.retained_fences, repeats + 2);
+        assert_eq!(summary.retained_summary_candidates, 2);
+        assert_eq!(summary.retained_candidates, repeats + 2);
+        assert_eq!(summary.candidate_va_overlaps, 1);
+        assert_eq!(summary.physical_overlap_fences, 1);
+        assert_eq!(summary.writer_default_private_heap, repeats + 1);
+        assert!(!summary.va_incomplete && summary.physical_incomplete);
+    }
+
+    #[test]
+    fn identical_candidates_with_changed_physical_pages_stay_separate() {
         let first = PageNumbers::default().allocate(2).unwrap();
+        let capture = |page| NativeWriteTrace { pages: [page].into(), ..Default::default() };
+        let mut history = NativeWriteHistory::default();
+        let span = Some((0x10000, 0x20000));
+        publish(&mut history, 1, span, capture(first));
+        publish(&mut history, 2, span, capture(first.offset(1)));
+        publish(&mut history, 3, span, capture(first));
+        assert_eq!(history.completed.len(), 2);
+        assert_eq!(history.pages, 2);
+        let summary = history.compare(span, &capture(first), |_| false);
+        assert_eq!(summary.retained_fences, 3);
+        assert_eq!(summary.retained_pages_with_repeats, 3);
+        assert_eq!(summary.candidate_va_overlaps, 3);
+        assert_eq!(summary.physical_overlap_fences, 2);
+        assert_eq!(history.compare(span, &capture(first.offset(1)), |_| false).physical_overlap_fences, 1);
+        assert!(!summary.va_incomplete && !summary.physical_incomplete);
+    }
+
+    #[test]
+    fn incomplete_candidate_lists_or_captures_are_not_compacted() {
+        let mut history = NativeWriteHistory::default();
+        let span = Some((0x10000, 0x20000));
+        for fence in [1, 3] {
+            publish(&mut history, fence, span, NativeWriteTrace { without_mapping: 1, ..Default::default() });
+            let mut writers = candidates(0, span);
+            writers.skipped_registrations = 1;
+            history.publish(Fence(fence + 1), writers, NativeWriteTrace { known_private_heap: 1, ..Default::default() });
+        }
+        assert_eq!(history.completed.len(), 4);
+    }
+
+    #[test]
+    fn evicted_fences_mark_both_comparisons_incomplete() {
+        let first = PageNumbers::default().allocate(NativeWriteHistory::MAX_GROUPS + 1).unwrap();
         let target = NativeWriteTrace { pages: [first].into(), ..Default::default() };
         let mut history = NativeWriteHistory::default();
-        history.publish(record(1, Some((0x10000, 0x20000)), NativeWriteTrace { pages: [first].into(), ..Default::default() }));
-        for i in 0..NativeWriteHistory::MAX_FENCES {
-            history.publish(record(i as u64 + 2, Some((0x20000, 0x30000)), NativeWriteTrace {
-                pages: [first.offset(1)].into(), ..Default::default()
-            }));
+        for fence in 1..=2 {
+            publish(&mut history, fence, Some((0x10000, 0x20000)), NativeWriteTrace { pages: [first].into(), ..Default::default() });
         }
-        assert_eq!(history.evicted_fences, 1);
-        assert_eq!(history.pages, NativeWriteHistory::MAX_FENCES);
+        for i in 0..NativeWriteHistory::MAX_GROUPS {
+            publish(&mut history, i as u64 + 3, Some((0x20000, 0x30000)), NativeWriteTrace {
+                pages: [first.offset(i + 1)].into(), ..Default::default()
+            });
+        }
+        assert_eq!(history.evicted_groups, 1);
+        assert_eq!(history.evicted_fences, 2);
+        assert_eq!(history.pages, NativeWriteHistory::MAX_GROUPS);
         let summary = history.compare(Some((0x10000, 0x20000)), &target, |_| false);
         assert_eq!(summary.candidate_va_overlaps, 0);
         assert_eq!(summary.physical_overlap_fences, 0);

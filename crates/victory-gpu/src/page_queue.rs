@@ -298,6 +298,28 @@ fn copy_prefix_va(
 }
 
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+fn inventory_page_addresses((start, end): (u64, u64), remaining: &mut u64) -> Option<impl Iterator<Item = usize> + use<>> {
+    if start >= end { return None; }
+    let (first, last) = (start / PAGE_BYTES, (end - 1) / PAGE_BYTES);
+    *remaining = remaining.checked_sub(last - first + 1)?;
+    Some((first..=last).map(|page| (page * PAGE_BYTES) as usize))
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+fn inventory_page_ids(pins: &BackingPins, addresses: impl Iterator<Item = usize>) -> (BTreeSet<PhysicalPage>, usize) {
+    let mut pages = BTreeSet::new();
+    let mut unmapped = 0;
+    for address in addresses {
+        if let Some(page) = pins.expected(address) {
+            pages.insert(page);
+        } else {
+            unmapped += 1;
+        }
+    }
+    (pages, unmapped)
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 struct CopyPrefixPages {
     target_pages: BTreeSet<PhysicalPage>,
     complete: bool,
@@ -308,14 +330,10 @@ struct CopyPrefixPages {
 impl CopyPrefixPages {
     fn new(pins: &BackingPins, target: (u64, u64)) -> Self {
         let mut result = Self { target_pages: BTreeSet::new(), complete: true, remaining: 4096 };
-        if let Some(pages) = Self::pages(target, &mut result.remaining) {
-            for va in pages {
-                if let Some(page) = pins.expected(va) {
-                    result.target_pages.insert(page);
-                } else {
-                    result.complete = false;
-                }
-            }
+        if let Some(addresses) = inventory_page_addresses(target, &mut result.remaining) {
+            let (pages, unmapped) = inventory_page_ids(pins, addresses);
+            result.target_pages = pages;
+            result.complete = unmapped == 0;
         } else {
             result.complete = false;
         }
@@ -323,18 +341,11 @@ impl CopyPrefixPages {
     }
 
     // 每次失败共享查页预算；只读本提交首次捕获，不查询当前或写入时的 VA。
-    fn pages((start, end): (u64, u64), remaining: &mut u64) -> Option<impl Iterator<Item = usize> + use<>> {
-        if start >= end { return None; }
-        let (first, last) = (start / PAGE_BYTES, (end - 1) / PAGE_BYTES);
-        *remaining = remaining.checked_sub(last - first + 1)?;
-        Some((first..=last).map(|page| (page * PAGE_BYTES) as usize))
-    }
-
     // 部分已固定的页仍可报告共页；排除共页需要两边都已完整捕获。
     fn shares_page(&mut self, pins: &BackingPins, destination: (u64, u64)) -> Option<bool> {
         if self.target_pages.is_empty() { return None; }
         let mut complete = self.complete;
-        for va in Self::pages(destination, &mut self.remaining)? {
+        for va in inventory_page_addresses(destination, &mut self.remaining)? {
             match pins.expected(va) {
                 Some(page) if self.target_pages.contains(&page) => return Some(true),
                 None => complete = false,
@@ -450,6 +461,151 @@ fn copy_prefix_reports_only_observable_page_relations() {
     assert_eq!(complete.shares_page(&pins, span(3)), Some(true));
 }
 
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ByteWriteKind {
+    DeclaredWithoutExact,
+    ShaderBitmap,
+    ExactPartialPage,
+    ExactWholePage,
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+impl ByteWriteKind {
+    fn classify(overwrites: &[std::ops::Range<usize>], shader_bitmap: bool) -> Self {
+        // 计划中的确切区间已合并。这里只分类，不保存区间或推断像素覆盖。
+        match overwrites {
+            [span] if span.start == 0 && span.end == PAGE_BYTES as usize => Self::ExactWholePage,
+            [] if shader_bitmap => Self::ShaderBitmap,
+            [] => Self::DeclaredWithoutExact,
+            _ => Self::ExactPartialPage,
+        }
+    }
+}
+
+// 只保存页身份及计数。枚举的四类互斥；第五项另计 GPU 页映像与提交前摘要不同。
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+type ByteWriteCounts = [usize; 5];
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[derive(Default)]
+struct ByteWriteHistory {
+    pages: BTreeMap<PhysicalPage, (usize, ByteWriteCounts)>,
+    by_recency: BTreeSet<(usize, PhysicalPage)>,
+    retired_dirty_batches: usize,
+    skipped_dirty_page_events: usize,
+    evicted_page_entries: usize,
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+static BYTE_WRITE_HISTORY: std::sync::LazyLock<std::sync::Mutex<ByteWriteHistory>> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+impl ByteWriteHistory {
+    const MAX_PAGES: usize = 32_768;
+    const MAX_BATCH_PAGES: usize = 8_192;
+
+    fn publish(
+        &mut self, observations: Vec<(PhysicalPage, ByteWriteKind, bool)>, skipped: usize, capacity: usize,
+    ) {
+        self.retired_dirty_batches = self.retired_dirty_batches.saturating_add(1);
+        self.skipped_dirty_page_events = self.skipped_dirty_page_events.saturating_add(skipped);
+        let now = self.retired_dirty_batches;
+        for (page, kind, digest_differs) in observations {
+            let (last, counts) = self.pages.entry(page).or_default();
+            self.by_recency.remove(&(*last, page));
+            *last = now;
+            let count = &mut counts[kind as usize];
+            *count = count.saturating_add(1);
+            counts[4] = counts[4].saturating_add(usize::from(digest_differs));
+            self.by_recency.insert((now, page));
+        }
+        // 容量按不同页计；同一页的重复写回不会挤掉别页。
+        while self.pages.len() > capacity {
+            let (_, page) = self.by_recency.pop_first().expect("indexed history page");
+            self.pages.remove(&page);
+            self.evicted_page_entries = self.evicted_page_entries.saturating_add(1);
+        }
+    }
+
+    fn compare(&self, target: &BTreeSet<PhysicalPage>) -> (usize, ByteWriteCounts) {
+        let mut matched = 0;
+        let mut totals: ByteWriteCounts = [0; 5];
+        for page in target {
+            if let Some((_, counts)) = self.pages.get(page) {
+                matched += 1;
+                for (total, &count) in totals.iter_mut().zip(counts) {
+                    *total = total.saturating_add(count);
+                }
+            }
+        }
+        (matched, totals)
+    }
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+fn trace_byte_write_history(index: usize, slot: usize, subresource: u32, target_pages: &BTreeSet<PhysicalPage>) {
+    // 与原生写入历史比较共用同一份失败时的页身份，不再次捕获目标 VA。
+    let (matched, [declared, bitmap, exact_partial, exact_whole, different_digest], retained, batches, skipped, evicted) = {
+        let history = BYTE_WRITE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+        let (matched, counts) = history.compare(target_pages);
+        (matched, counts, history.pages.len(), history.retired_dirty_batches, history.skipped_dirty_page_events, history.evicted_page_entries)
+    };
+    tracing::info!(
+        index, slot, subresource,
+        target_mapped_page_ids = target_pages.len(), target_matched_page_ids = matched,
+        target_unmatched_mapped_page_ids = target_pages.len() - matched,
+        matched_declared_without_exact_events = declared, matched_shader_bitmap_events = bitmap,
+        matched_exact_partial_page_events = exact_partial, matched_exact_whole_page_events = exact_whole,
+        matched_different_before_gpu_digest_events = different_digest,
+        retained_page_ids = retained, retired_dirty_batches = batches, skipped_dirty_page_events = skipped,
+        evicted_page_entries = evicted, retained_page_limit = ByteWriteHistory::MAX_PAGES,
+        per_batch_page_event_limit = ByteWriteHistory::MAX_BATCH_PAGES,
+        "[VNME_BYTE_WRITE_HISTORY] 颜色目标溯源：已过 Fence 且合并成功的分页 GPU 字节写回候选（整资源估算范围；不含仅原生纹理、CPU 写或在途工作；未匹配不排除来源；共页和摘要差异不证明目标字节相交、当前内容或旧像素）"
+    );
+}
+
+#[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+#[test]
+fn byte_write_history_distinguishes_exact_coverage_from_dirty_sources() {
+    use ByteWriteKind::*;
+    assert_eq!(ByteWriteKind::classify(&[], false), DeclaredWithoutExact);
+    assert_eq!(ByteWriteKind::classify(&[], true), ShaderBitmap);
+    assert_eq!(ByteWriteKind::classify(&[7..8, 10..20], false), ExactPartialPage);
+    let whole = 0..PAGE_BYTES as usize;
+    assert_eq!(ByteWriteKind::classify(std::slice::from_ref(&whole), false), ExactWholePage);
+}
+
+#[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+#[test]
+fn byte_write_history_keeps_repeated_pages_and_reports_incomplete_retention() {
+    use ByteWriteKind::*;
+    let a = victory_memory::physical::PageNumbers::default().allocate(3).unwrap();
+    let (b, c) = (a.offset(1), a.offset(2));
+    let mut history = ByteWriteHistory::default();
+    history.publish(vec![(a, DeclaredWithoutExact, true), (b, ShaderBitmap, false)], 0, 2);
+    history.publish(vec![(a, ExactPartialPage, false)], 0, 2);
+    history.publish(vec![(c, ExactWholePage, false)], 1, 2);
+    assert_eq!(history.pages.len(), 2);
+    assert_eq!(history.retired_dirty_batches, 3);
+    assert_eq!(history.evicted_page_entries, 1);
+    assert_eq!(history.skipped_dirty_page_events, 1);
+    assert_eq!(history.compare(&[b].into()), (0, [0; 5]));
+    assert_eq!(history.compare(&[a, b, c].into()), (2, [1, 0, 1, 1, 1]));
+
+    let page = PAGE_BYTES as usize;
+    let mut pins = BackingPins::default();
+    pins.remember(page, 2 * page, Some(a));
+    pins.remember(3 * page, 4 * page, Some(a)); // 别名只计一个已识别页。
+    let mut budget = 3;
+    let addresses = inventory_page_addresses((PAGE_BYTES + 1, 4 * PAGE_BYTES - 1), &mut budget).unwrap();
+    let (target, unmapped) = inventory_page_ids(&pins, addresses);
+    assert_eq!(budget, 0);
+    assert_eq!(unmapped, 1);
+    assert_eq!(target.len(), 1);
+    assert_eq!(history.compare(&target), (1, [1, 0, 1, 0, 1]));
+}
+
 /// 只在颜色目标缺少内容的失败路径上回查，不把候选写入当作权威。
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 fn trace_missing_color(
@@ -464,6 +620,9 @@ fn trace_missing_color(
     let Some((target, bound_subresource)) = draw.color_binding(slot) else { return; };
     if subresource != bound_subresource { return; }
     draw.trace_color_coverage_inputs(slot);
+    if let Some(capture) = crate::page_resource::ResourcePlan::trace_color_native_history(target, subresource) {
+        trace_byte_write_history(index, slot, subresource, &capture.pages);
+    }
     plan.trace_color_predecessor(target, subresource);
 
     let mut mentions = 0usize;
@@ -1603,6 +1762,8 @@ impl SubmittedRender<'_> {
             .unwrap_or_else(|e| fail(format_args!("VNME 原生渲染 Fence 失败：{e}")));
         let fence_observed = wait_started.map(|_| std::time::Instant::now());
         let mut dirty = self.declared_dirty;
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        let shader_bitmap = self.tracking.is_some();
         if let Some(tracking) = self.tracking {
             // SAFETY: the fence has completed, and the retained list
             // exclusively owns this submission's bitmap mapping.
@@ -1637,12 +1798,32 @@ impl SubmittedRender<'_> {
                 .reserve_ram(PAGE_BYTES)
                 .unwrap_or_else(|_| fail(format_args!("没有足够的系统内存用于 VNME 的回写暂存")));
             let mut scratch = vec![0; PAGE_BYTES as usize];
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            let mut observed_writes = crate::page_inventory::enabled()
+                .then(|| Vec::with_capacity(dirty.len().min(ByteWriteHistory::MAX_BATCH_PAGES)));
             for (i, (page, _, _)) in batch.pages().filter(|(id, _, _)| dirty.contains(id)).enumerate() {
                 let bytes = readback.bytes(i);
-                if !snapshots.merge(backing, page, bytes, &mut scratch, self.targets.guest_overwrites(page)) {
+                let overwrites = self.targets.guest_overwrites(page);
+                if !snapshots.merge(backing, page, bytes, &mut scratch, overwrites) {
                     fail(format_args!("VNME 无法回写物理页 {}", page.number()));
                 }
-                digests.insert(page, blake3::hash(bytes));
+                let gpu_digest = blake3::hash(bytes);
+                let _before_digest = digests.insert(page, gpu_digest);
+                #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+                if let Some(writes) = &mut observed_writes
+                    && writes.len() < ByteWriteHistory::MAX_BATCH_PAGES
+                {
+                    // 复用既有摘要，不再扫描字节。不比较合并后的 CPU 内容。
+                    writes.push((page, ByteWriteKind::classify(overwrites, shader_bitmap),
+                        _before_digest.is_some_and(|before| before != gpu_digest)));
+                }
+            }
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            if let Some(writes) = observed_writes {
+                // 只有所有页的 merge 都成功后才发布该批候选。
+                let skipped = dirty.len() - writes.len();
+                BYTE_WRITE_HISTORY.lock().unwrap_or_else(|e| e.into_inner())
+                    .publish(writes, skipped, ByteWriteHistory::MAX_PAGES);
             }
         }
         // Native readiness is not guest byte visibility. Publish the
