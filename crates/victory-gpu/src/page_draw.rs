@@ -984,13 +984,14 @@ fn paged_title_partial_color_clear_observes_submission_order() {
 #[cfg(all(test, feature = "diagnostics", feature = "paged-title"))]
 #[test]
 fn paged_title_blended_draw_requires_preceding_full_native_color_producer() {
-    use crate::object::{IUNKNOWN, S_OK, This};
-    use crate::resource;
+    use crate::object::{HRESULT, IUNKNOWN, S_OK, This, slot};
+    use crate::{descriptor, list, resource};
     use windows::Win32::Graphics::Direct3D::{
-        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, Fxc::D3DCompile, ID3DBlob,
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, Fxc::D3DCompile, ID3DBlob,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_UNKNOWN,
+        DXGI_SAMPLE_DESC,
     };
     use windows::core::s;
 
@@ -998,7 +999,7 @@ fn paged_title_blended_draw_requires_preceding_full_native_color_producer() {
     let heap = crate::memory::heap().unwrap();
     let source = r#"
 float4 vertex(uint id : SV_VertexID) : SV_Position {
-    float2 p[3] = { float2(-1, -1), float2(-1, 3), float2(3, -1) };
+    float2 p[4] = { float2(-1, -1), float2(-1, 1), float2(1, -1), float2(1, 1) };
     return float4(p[id], 0, 1);
 }
 float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
@@ -1047,9 +1048,8 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
             SrcBlend: D3D12_BLEND_SRC_ALPHA,
             DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
             BlendOp: D3D12_BLEND_OP_ADD,
-            // Preserve the destination alpha; only RGB consumes old color.
-            SrcBlendAlpha: D3D12_BLEND_ZERO,
-            DestBlendAlpha: D3D12_BLEND_ONE,
+            SrcBlendAlpha: D3D12_BLEND_SRC_ALPHA,
+            DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
             BlendOpAlpha: D3D12_BLEND_OP_ADD,
             RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
             ..Default::default()
@@ -1075,7 +1075,7 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
             },
             PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             NumRenderTargets: 1,
-            RTVFormats: [DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN,
+            RTVFormats: [DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_UNKNOWN,
                 DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
                 DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN],
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
@@ -1092,6 +1092,14 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
         Partial,
         Full,
         FullAfterReader,
+        OtherTarget,
+    }
+
+    #[repr(C)]
+    struct GuestTextureBarrierGroup {
+        kind: u32,
+        count: u32,
+        payload: *const u8,
     }
 
     let run = |producer| {
@@ -1101,9 +1109,9 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
             Height: 4,
             DepthOrArraySize: 1,
             MipLevels: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             ..Default::default()
         };
@@ -1112,65 +1120,127 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
             Producer::Partial => 1,
             Producer::Full => 2,
             Producer::FullAfterReader => 3,
+            Producer::OtherTarget => 4,
         } * 0x1_0000;
-        let mut object: This = std::ptr::null();
-        // SAFETY: the synthetic resource uses an aligned, linear guest VA and
-        // a matching render-target description; no process memory is read.
-        assert_eq!(
-            resource::create_at_address(
-                std::ptr::null(), va, (&raw const desc).cast(), 0,
-                std::ptr::null(), &IUNKNOWN, &mut object,
-            ),
-            S_OK,
-        );
+        let null = std::ptr::null();
+        let blue = D3D12_CLEAR_VALUE {
+            Format: desc.Format,
+            Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0., 0., 1., 1.] },
+        };
+        let mut object: This = null;
+        assert_eq!(resource::create_at_address(
+            null, va, (&raw const desc).cast(), D3D12_BARRIER_LAYOUT_SHADER_RESOURCE.0 as u32,
+            (&raw const blue).cast(), &IUNKNOWN, &mut object,
+        ), S_OK);
         let copy = resource::host_copy(object).expect("按地址资源的宿主颜色对象");
         assert!(copy.uses_unproven_alias_backing());
         assert!(copy.candidate_guest_span.is_some());
+        assert!(copy.compatible_texture_source().is_none(), "不能把默认 R_X 当作线性来源");
         assert!(copy.current_native_generation(), "夹具必须保留当前原生代");
-        let target = ColorTarget::capture_candidate(copy.clone(), RtvDescription::default()).unwrap();
-        let list = host.new_list().unwrap();
+        let mut other = null;
+        let same_size_unorm = D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_R8G8B8A8_UNORM, ..desc };
+        let private_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT, CreationNodeMask: 1, VisibleNodeMask: 1,
+            ..Default::default()
+        };
+        assert_eq!(resource::create_committed(
+            null, (&raw const private_heap).cast(), 0, (&raw const same_size_unorm).cast(),
+            0, null.cast(), &IUNKNOWN, &mut other,
+        ), S_OK);
+        let other_copy = resource::host_copy(other).unwrap();
+        assert!(!other_copy.uses_unproven_alias_backing());
+        assert!(!Arc::ptr_eq(&copy, &other_copy));
+        let mut rtv = [0u64; 14];
+        let mut other_rtv = [0u64; 14];
+        let rtv = rtv.as_mut_ptr() as u64;
+        let other_rtv = other_rtv.as_mut_ptr() as u64;
+        descriptor::create_rtv(null, object, null.cast(), rtv);
+        descriptor::create_rtv(null, other, null.cast(), other_rtv);
+        let target = ColorTarget::capture_candidate(
+            copy.clone(), descriptor::rtv_record(rtv).unwrap().desc(),
+        ).unwrap();
+        let mut allocator = null;
+        let mut guest_list = null;
+        assert_eq!(list::create_allocator(null, 0, &IUNKNOWN, &mut allocator), S_OK);
+        assert_eq!(list::create_list(null, 0, 0, allocator, null, &IUNKNOWN, &mut guest_list), S_OK);
+        let list = list::host_list(guest_list).unwrap();
         let draw = {
             let mut draw = ClosedDraw::from_proven_native(
-                pso.clone(), root.clone(), target.clone(), D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                pso.clone(), root.clone(), target, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
                 D3D12_VIEWPORT { Width: 4.0, Height: 4.0, MaxDepth: 1.0, ..Default::default() },
                 RECT { left: 0, top: 0, right: 4, bottom: 4 }, Vec::new(),
-                DrawCall::Direct { vertices: 3, instances: 1, first: 0, first_instance: 0 },
+                DrawCall::Direct { vertices: 4, instances: 1, first: 0, first_instance: 0 },
             );
             // A non-zero blend factor is not enough to identify a consumer;
             // this bit is the translated PSO's destination-read admission.
             draw.color_destination_reads = 1;
             draw
         };
-        let full = || ColorClear {
-            target: target.clone(), color: [1., 0., 0., 1.], rects: Vec::new(),
-        };
-        let partial = || ColorClear {
-            target: target.clone(), color: [1., 0., 0., 1.],
-            rects: vec![RECT { left: 0, top: 0, right: 2, bottom: 4 }],
-        };
-        match producer {
-            Producer::Full => {
-                list.record_page_clear(full());
-                list.record_page_draw(draw);
-            }
-            Producer::Partial => {
-                list.record_page_clear(partial());
-                list.record_page_draw(draw);
-            }
-            Producer::None => list.record_page_draw(draw),
-            Producer::FullAfterReader => {
-                list.record_page_draw(draw);
-                list.record_page_clear(full());
-            }
-        }
-        list.close();
-        let result = host.execute_paged_title(
-            heap, &mut crate::title_backing::SubmissionBacking::default(), &[&list],
+        let clear = slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const list::Rect)>(
+            guest_list, 52 * size_of::<usize>(),
         );
-        if let Err(error) = result {
-            resource::resource_release(object);
-            return Err(error);
+        let red = [1., 0., 0., 1.];
+        let half = RECT { left: 0, top: 0, right: 2, bottom: 4 };
+        match producer {
+            Producer::Full => clear(guest_list, rtv, &red, 0, null.cast()),
+            Producer::Partial => clear(guest_list, rtv, &red, 1, (&raw const half).cast()),
+            Producer::OtherTarget => clear(guest_list, other_rtv, &red, 0, null.cast()),
+            Producer::None | Producer::FullAfterReader => {}
         }
+        // Reproduce only the known transition shape; the reader is synthetic
+        // and the untranslated slot has no verified ABI to replay here.
+        let mut barrier = [0u8; 64];
+        for (offset, word) in [
+            (0, D3D12_BARRIER_SYNC_ALL_SHADING.0 as u32),
+            (4, D3D12_BARRIER_SYNC_RENDER_TARGET.0 as u32),
+            (8, D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32),
+            (12, D3D12_BARRIER_ACCESS_RENDER_TARGET.0 as u32),
+            (16, D3D12_BARRIER_LAYOUT_SHADER_RESOURCE.0 as u32),
+            (20, D3D12_BARRIER_LAYOUT_RENDER_TARGET.0 as u32),
+            (32, u32::MAX),
+        ] {
+            barrier[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        barrier[24..32].copy_from_slice(&(object as usize).to_le_bytes());
+        let group = GuestTextureBarrierGroup {
+            kind: D3D12_BARRIER_TYPE_TEXTURE.0 as u32,
+            count: 1,
+            payload: barrier.as_ptr(),
+        };
+        list::barrier_groups(guest_list, 1, (&raw const group).cast());
+        list.record_page_draw(draw);
+        if matches!(producer, Producer::FullAfterReader) {
+            clear(guest_list, rtv, &red, 0, null.cast());
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(guest_list, 0x48)(guest_list), S_OK);
+        if matches!(producer, Producer::Full | Producer::OtherTarget) {
+            use crate::{page_queue::PageOp, page_resource::PageBarrier};
+            let mut ops = Vec::new();
+            list.append_closed_page_ops(&mut ops).unwrap();
+            let [PageOp::Clear(cleared), PageOp::Barrier(transition), PageOp::Draw(reader)] = ops.as_slice()
+                else { panic!("应依序录制清除、屏障、绘制"); };
+            let expected_clear = if matches!(producer, Producer::Full) { &copy } else { &other_copy };
+            assert!(Arc::ptr_eq(&cleared.target.copy, expected_clear));
+            assert!(Arc::ptr_eq(&reader.targets[0].copy, &copy));
+            match transition.as_ref() {
+                PageBarrier::EnhancedUav { textures, .. } if crate::page_inventory::enabled() => {
+                    let [(identity, fields)] = textures.as_slice() else { panic!("目标屏障未匹配"); };
+                    assert!(Arc::ptr_eq(&identity.upgrade().unwrap(), &copy));
+                    assert_eq!((fields.before, fields.after, fields.flags), (6, 2, 0));
+                }
+                PageBarrier::Uav if !crate::page_inventory::enabled() => {}
+                _ => panic!("增强屏障降低路径不符"),
+            }
+        }
+        let result = host.execute_paged_title(
+            heap, &mut crate::title_backing::SubmissionBacking::default(), &[list],
+        );
+        for object in [guest_list, allocator] {
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(object, 0x10)(object), 0);
+        }
+        resource::resource_release(other);
+        resource::resource_release(object);
+        result?;
         assert!(ResourcePlan::default().authoritative(&copy),
             "成功的前置整面写入应发布 NativeGpu 版本");
         let read = host.new_list().unwrap();
@@ -1189,24 +1259,36 @@ float4 pixel() : SV_Target0 { return float4(0, 1, 0, 0.5); }
             readback.Unmap(0, None);
             pixel
         };
-        resource::resource_release(object);
         Ok(pixel)
     };
 
     let blended = run(Producer::Full).expect("完整原生生产者后混合绘制应入队");
-    // The green source is alpha-blended with the red clear. Both channels
-    // must survive; a source-only path would have no red contribution.
-    assert!(blended[0] > 0 && blended[1] > 0, "blend did not consume the old red color: {blended:?}");
-    assert_eq!(blended[2], 0);
-    assert_eq!(blended[3], 255);
+    // sRGB encodes 0.5 linear as about 188; alpha remains linear (0.75).
+    assert!((187..=189).contains(&blended[0]) && (187..=189).contains(&blended[1]),
+        "没有同时读到红色底图和绿色源：{blended:?}");
+    assert_eq!(blended[2], 0, "不能使用蓝色优化清除值");
+    assert!((190..=192).contains(&blended[3]), "Alpha 混合错误：{blended:?}");
 
-    for producer in [Producer::None, Producer::Partial, Producer::FullAfterReader] {
-        let error = run(producer).expect_err("缺失、局部或后置生产者必须拒绝旧色读取");
+    let error = run(Producer::OtherTarget).expect_err("改清另一张同尺寸的纹理必须拒绝");
+    assert!(matches!(error,
+        BatchError::Operation { phase: "encode", index: 2, operation: "draw", ref cause }
+            if matches!(cause.as_ref(), BatchError::MissingTextureContent {
+                usage: crate::page_slabs::TextureContentUse::ColorTarget { slot: 0, subresource: 0 },
+                format: 29, ..
+            })
+    ), "不同目的描述符的对照首错不匹配：{error:?}");
+    for producer in [Producer::None, Producer::FullAfterReader] {
+        let error = run(producer).expect_err("缺失或后置生产者必须拒绝旧色读取");
         assert!(matches!(error,
-            BatchError::Operation { phase: "encode", ref cause, .. }
-                if matches!(cause.as_ref(), BatchError::MissingTextureContent { .. } | BatchError::TargetNotInitialized)
-        ), "unexpected old-color admission result: {error:?}");
+            BatchError::Operation { phase: "encode", index: 1, operation: "draw", ref cause }
+                if matches!(cause.as_ref(), BatchError::MissingTextureContent { .. })
+        ), "旧色准入结果不匹配：{error:?}");
     }
+    let error = run(Producer::Partial).expect_err("局部清除也需要已有整面内容");
+    assert!(matches!(error,
+        BatchError::Operation { phase: "encode", index: 0, operation: "color clear", ref cause }
+            if matches!(cause.as_ref(), BatchError::TargetNotInitialized)
+    ), "局部清除首错不匹配：{error:?}");
 }
 
 #[cfg(all(test, feature = "diagnostics"))]

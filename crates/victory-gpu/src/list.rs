@@ -1702,7 +1702,7 @@ extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _referen
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+pub(crate) extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0 {
         #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
         if crate::page_inventory::enabled() && let Some(list) = host_list(this) {
