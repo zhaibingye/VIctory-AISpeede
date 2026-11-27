@@ -773,6 +773,44 @@ mod tests {
     }
 
     #[test]
+    fn copy_into_rejects_default_render_target_layout_without_writing() {
+        let mut d = desc(3840, 2160, 1, 29, 0);
+        d.flags = ALLOW_RENDER_TARGET;
+        let row = d.width as u32 * 4;
+        let depth = row * d.height;
+        let mut rows = vec![0x5a; depth as usize];
+        *rows.last_mut().unwrap() = 0x7b;
+
+        // 仅改布局作阳性对照，保持描述符其余字段与行距不变。
+        type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        for (mode, swizzle, expected) in [
+            (0, Swizzle::SW_64KB_R_X, E_NOTIMPL),
+            (ROW_MAJOR, Swizzle::LINEAR, S_OK),
+        ] {
+            d.layout = mode;
+            let c = create(&d);
+            let get: extern "system" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
+            let mut l = std::mem::MaybeUninit::<LayoutOut>::uninit();
+            assert_eq!(get(c, l.as_mut_ptr()), S_OK);
+            // SAFETY: layout initialized the whole output on success.
+            let l = unsafe { l.assume_init() };
+            assert_eq!((l.mips, l.planes, l.plane[0].element_bytes), (1, 1, 4));
+            assert_eq!(l.plane[0].mips[0].swizzle, swizzle.0);
+
+            let into: Into = slot(c, 8); // 0x40
+            let mut tiled = vec![0xa5; l.size as usize];
+            let hr = into(c, tiled.as_mut_ptr(), 0, 0, rows.as_ptr(), row, depth);
+            assert_eq!(release(c), 0);
+            assert_eq!(hr, expected);
+            if mode == 0 {
+                assert!(tiled.iter().all(|&byte| byte == 0xa5), "R_X destination changed");
+            } else {
+                assert!(tiled == rows, "row-major destination differs from the source");
+            }
+        }
+    }
+
+    #[test]
     fn bad_descriptions_fail() {
         let mut c = std::ptr::null_mut();
         let bad = desc(256, 256, 1, 0, 0x10a);

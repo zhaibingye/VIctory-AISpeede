@@ -81,3 +81,8 @@
 - `64dd795` 归档把实际宿主混合状态、单采样四顶点条带和覆盖目标的视口/裁剪绑定到失败 draw；不把附近的首次管线绑定和 shader 翻译记录绑定到该操作。即使知道实际 PS 的 `SV_Target0.a` 在签名中存在，也还没有各执行路径的输出值或覆盖证明。未确定 shader 翻译错误，不能根据时间邻近选 shader。
 - `page_draw::paged_title_blended_draw_requires_preceding_full_native_color_producer` 现在用同一混合状态、几何、视口/裁剪，分别在红/蓝两种经真实清除产生的底图上读回全部 16 个像素：Alpha 0.5 的整面输出受底图影响；Alpha 1 的整面输出独立于底图；同为 Alpha 1 但在 PS 丢弃右半时，右半仍依赖底图。该 WARP 对照不是来宾 shader 翻译测试，不提供实机数据，不改变门禁。`ClosedDraw::encode` 本就不把无混合读依赖等同于可凭空定义完整目标：普通无目标混合依赖的 draw 也只有在明确弃旧时才能跳过旧内容，且不能因此发布完整版本。
 - `8c7269a` 的一次性实机判别已把 PS 精确关联到失败的 `ClosedDraw`：用创建 PSO 的 DXIL 与重译结果逐字节比较，匹配后才分析最终 CFG。合成 0.5 / 1.0、未知值、弃像和错字节对照通过，但实机分类为 `Unknown`（并非 `UnverifiedDxil`）。门禁未改，首错仍是 draw 15 `MissingTextureContent`；没有证明真实 Alpha、覆盖率或翻译错误，也没有排除新的底图故障根因。不要只为扩充这个有限分类器而重跑；作为实验的代码已撤出生产树，实际构建保留可追溯提交。旧色路线仍需同一分配的独立内容契约，或能关联到实际目标和先后顺序的完整生产者。
+
+## XG CPU 复制不是已证明的 draw 15 底图来源
+
+- `modules::xg::tests::copy_into_rejects_default_render_target_layout_without_writing` 通过真实 HLE XG vtable 入口验证合成 3840×2160、format 29、单 mip 单层单采样、RT 默认布局：layout 返回 `SW_64KB_R_X`，有效 plane 0/subresource 0 的复制返回 `E_NOTIMPL`，目标逐字节保持原样。只改为显式 row-major 的阳性对照返回 `S_OK`，完整写入非零数据。排除的是**该布局、该入口的有效调用静默成功写入**，不是所有 CPU 写入。XG CPU 复制与 D3D12 命令列表的上传计数不是同一条路径。
+- `8c7269a` 和 `64dd795` 的实机归档至首次拒绝均无 XG copy-in/copy-out 失败告警。现有采集器的默认过滤会保留该告警，实跑记录同时有队列 DEBUG 和其他 HLE WARN；归档未固化有效过滤串，且传空指针/无效 plane 等入参会提前返回，不靠日志断言从未调用。没有证据把该入口的失败绑定到实际目标，也没有证据支持用合成描述符替代实际平面契约。不再就这项假设加探针或重跑；下一步须先找可归属到同一分配的创建/初始化契约，或具体有序像素生产操作。
