@@ -635,7 +635,7 @@ fn table_constant_dynamic_vector_does_not_wrap_or_read_past_the_view() {
             ud[u.index as usize] = match (u.root, u.index) {
                 (RootType::Table, 0) => 0,
                 (RootType::Constants, 1) => index,
-                (RootType::Table, 2) => 2,
+                (RootType::Table, 2) => 2 * 32, // 表根持有堆字节地址，不是槽号。
                 other => panic!("未知绑定 {other:?}"),
             };
         }
