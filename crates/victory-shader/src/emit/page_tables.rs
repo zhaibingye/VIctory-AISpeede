@@ -49,13 +49,36 @@ pub fn static_texture_slots(container: &[u8]) -> Result<Option<Vec<StaticTexture
     }))
 }
 
-/// 静态证据不完整时的原因。只保留指令助记符和维度，不输出着色器字节。
+/// 地址来源与静态上界的类别，不保留寄存器编号或计算出来的地址。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferOperandEvidence {
+    pub producer: &'static str,
+    pub bounded: bool,
+    pub bounded_at_access: bool,
+    pub aligned_dword_bound: bool,
+}
+
+/// 静态证据不完整时的原因。不输出着色器字节、资源内容或来宾地址。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticViewFailure {
     ParseOrAnalysis,
     NoNativeStage,
     DynamicSampler { operation: &'static str },
     UnsupportedAccess { operation: &'static str, image_dimension: Option<u8> },
+    UnsupportedBufferAccess {
+        operation: &'static str,
+        descriptor: &'static str,
+        indexed: bool,
+        vector_offset: bool,
+        immediate_aligned: bool,
+        scalar_offset: &'static str,
+        scalar_evidence: Option<BufferOperandEvidence>,
+        index_evidence: Option<BufferOperandEvidence>,
+        offset_evidence: Option<BufferOperandEvidence>,
+        typed: bool,
+        lds: bool,
+        tfe: bool,
+    },
     UnprovenRootView { operation: &'static str },
     UntracedSource { operation: &'static str },
     DivergentSource { operation: &'static str },
@@ -151,6 +174,9 @@ fn view_report(container: &[u8], direct: Option<[u32; 3]>) -> Result<StaticViewR
         } else if let Some(access) = bounded_raw_access(inst, &mut bounds) {
             AccessProof::Native(access)
         } else {
+            if let Some(reason) = buffer_access_evidence(inst, &mut bounds, (b, i), &descriptor.source) {
+                return rejected(reason);
+            }
             let image_dimension = match inst.fields {
                 Fields::Image { dim, .. } => Some(dim),
                 _ => None,
@@ -179,6 +205,49 @@ fn view_report(container: &[u8], direct: Option<[u32; 3]>) -> Result<StaticViewR
         slots.insert(view);
     }
     Ok(StaticViewReport::Proven(slots.into_iter().collect()))
+}
+
+fn buffer_access_evidence(
+    inst: &crate::ir::Inst, bounds: &mut crate::range::Ranges<'_>, site: (usize, usize), source: &Source,
+) -> Option<StaticViewFailure> {
+    let Fields::Buffer { addr, offset, soffset, idxen, offen, format, lds, tfe, .. } = &inst.fields
+        else { return None; };
+    let mut prove = |reg| {
+        let value = inst.read(reg)?;
+        Some(BufferOperandEvidence {
+            producer: bounds.value_source_at(value, site).0,
+            bounded: bounds.unsigned_upper_bound(value).is_some(),
+            bounded_at_access: bounds.unsigned_upper_bound_at(value, site).is_some(),
+            aligned_dword_bound: bounds.dword_offset_hi(value).is_some(),
+        })
+    };
+    let (index_evidence, offset_evidence) = if let Operand::Vector { reg, .. } = *addr {
+        (
+            idxen.then(|| prove(Reg::V(reg))).flatten(),
+            offen.then(|| reg.checked_add(u8::from(*idxen)).and_then(|r| prove(Reg::V(r)))).flatten(),
+        )
+    } else {
+        (None, None)
+    };
+    let (scalar_offset, scalar_evidence) = match *soffset {
+        Operand::Scalar { code: NULL, .. } | Operand::Const(128) => ("zero", None),
+        Operand::Const(code @ 129..=192) if (code - 128).is_multiple_of(4) => ("aligned_constant", None),
+        Operand::Const(_) => ("other_constant", None),
+        Operand::Scalar { code: code @ 0..=105, dwords: 1 } => ("scalar", prove(Reg::S(code))),
+        _ => ("other", None),
+    };
+    let descriptor = match source {
+        Source::Loaded { .. } => "scalar_load",
+        Source::Built { .. } => "built",
+        Source::Constant(_) => "constant",
+        Source::Fetched { .. } => "vector_load",
+        _ => "other",
+    };
+    Some(StaticViewFailure::UnsupportedBufferAccess {
+        operation: inst.name(), descriptor, indexed: *idxen, vector_offset: *offen,
+        immediate_aligned: offset.is_multiple_of(4), scalar_offset, scalar_evidence,
+        index_evidence, offset_evidence, typed: format.is_some(), lds: *lds, tfe: *tfe,
+    })
 }
 
 fn closed_image_read(operation: &str, dimension: u8) -> Option<StaticViewAccess> {
