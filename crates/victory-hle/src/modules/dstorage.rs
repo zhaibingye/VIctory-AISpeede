@@ -962,7 +962,14 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let result = fill(out);
+        // An error may have modified the destination, but there is no
+        // retained backing identity for this VA.
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if result.unwrap_or(len) != 0 {
+            victory_gpu::title_backing::note_dstorage_va_write();
+        }
+        return result.map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -976,7 +983,10 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let result = fill(window.bytes());
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        window.note_dstorage_fill(result.ok());
+        return result.map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
@@ -1527,6 +1537,37 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
     }
+
+    #[test]
+    fn an_in_place_fill_error_is_returned_after_a_partial_write() {
+        use crate::modules::xmem;
+        let (mut n, mut pages) = (1, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1
+        );
+        let mut r = request(
+            PAGE_DESTINATION,
+            pages.as_mut_ptr().cast(),
+            2,
+            std::ptr::null(),
+            0,
+            0,
+        );
+        r.page_offset = 5;
+        assert_eq!(
+            into_destination(&r, 2, |out| {
+                out[0] = 0x5a;
+                Err(INVALID_DATA)
+            }),
+            Err(INVALID_DATA)
+        );
+        let mut window = xmem::page_window(&pages, 5, 2).unwrap();
+        assert_eq!(&*window.bytes(), &[0x5a, 0]);
+        drop(window);
+        assert_eq!(xmem::XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+    }
+
     #[test]
     fn a_page_list_filled_after_its_request_starts() {
         use crate::modules::xmem;
@@ -1588,14 +1629,21 @@ mod tests {
         let plain = pattern(2 * PAGE + 100);
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
         // One allocation's pages in order (one window), then pages of two
-        // (through a buffer), both from 50 bytes into the first.
+        // (through a buffer), both from 50 bytes into the first. The stream
+        // ends short of the requested length in both cases.
+        let end = 50 + plain.len();
+        let tail = [0x5a; 32];
+        for page in [a[2], b[0]] {
+            let mut window = xmem::page_window(&[page], end % PAGE, tail.len()).unwrap();
+            window.bytes().copy_from_slice(&tail);
+        }
         let mut destinations = [a.clone(), vec![a[0], a[1], b[0]]];
         let (queue, array) = (new_queue(1), status_array(1));
         for pages in &mut destinations {
             let mut r = request(
                 ZLIB | PAGE_DESTINATION | MEMORY_SOURCE,
                 pages.as_mut_ptr().cast(),
-                plain.len(),
+                plain.len() + tail.len(),
                 packed.as_ptr().cast(),
                 0,
                 packed.len(),
@@ -1622,7 +1670,8 @@ mod tests {
             // SAFETY: all three pages are mapped read-write.
             let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 3 * PAGE) };
             assert!(seen[..50].iter().all(|&b| b == 0));
-            assert_eq!(seen[50..50 + plain.len()], plain);
+            assert_eq!(seen[50..end], plain);
+            assert_eq!(seen[end..end + tail.len()], tail);
             assert_eq!(
                 xmem::XMemMapPhysicalPages(mapped, 3, std::ptr::null()),
                 mapped

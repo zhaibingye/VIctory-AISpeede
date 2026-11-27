@@ -622,6 +622,7 @@ fn trace_missing_color(
     draw.trace_color_coverage_inputs(slot);
     if let Some(capture) = crate::page_resource::ResourcePlan::trace_color_native_history(target, subresource) {
         trace_byte_write_history(index, slot, subresource, &capture.pages);
+        crate::title_backing::trace_dstorage_write_history(index, slot, subresource, &capture.pages);
     }
     plan.trace_color_predecessor(target, subresource);
 

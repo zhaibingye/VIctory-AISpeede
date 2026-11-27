@@ -8,6 +8,13 @@ use victory_memory::{
     physical::{BackingPins, PhysicalPage},
 };
 
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+mod dstorage;
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+pub use dstorage::{note_dstorage_section_write, note_dstorage_va_write};
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+pub(crate) use dstorage::trace_dstorage_write_history;
+
 type Range = (usize, usize);
 pub type BackingPinner = fn(&[Range], &mut BackingPins);
 

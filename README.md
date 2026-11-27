@@ -146,6 +146,11 @@ victory config
 绑定或访问范围失败时会附带可取得的格式信息。重复条目合并计数，超限数量记入
 `dropped`。盘点不提交被拒绝的命令，也看不到游戏尚未执行到的路径。
 
+若首错是颜色目标 `MissingTextureContent`，一并查看 `[VNME_NATIVE_WRITE_HISTORY]`、
+`[VNME_BYTE_WRITE_HISTORY]`、`[VNME_DSTORAGE_WRITE_HISTORY]` 和 `[VNME_PREFIX_COPY_INVENTORY]`。
+这些字段区分已完成的原生写入候选、分页 GPU 写回、DirectStorage CPU 写入和失败批次的复制前缀。
+共页或一次写满页不证明纹理像素有效；未命中也不排除观察范围以外的写入。
+
 ### Windows 着色器验证
 
 着色器测试使用 `dxil.dll` 验证 Shader Model 6.6。较旧的 Windows SDK

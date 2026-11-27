@@ -602,6 +602,18 @@ impl Slice {
     fn page(&self, offset: usize) -> PhysicalPage {
         self.section.first.offset(self.index + offset)
     }
+
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    fn note_dstorage_write(&self, within: usize, len: usize, confirmed: bool) {
+        if len != 0 {
+            victory_gpu::title_backing::note_dstorage_section_write(
+                self.page(0),
+                within,
+                len,
+                confirmed,
+            );
+        }
+    }
 }
 
 impl Physical {
@@ -997,6 +1009,9 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        // This run was copied even if a later run fails to map.
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        slice.note_dstorage_write(within, k, true);
         (within, done) = (0, done + k);
     }
     report_written(&shown_at(&runs));
@@ -1024,6 +1039,16 @@ impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
         &mut self.view.bytes()[within..within + len]
+    }
+
+    /// 失败时解码器或读入操作可能已修改窗口内的部分字节。
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn note_dstorage_fill(&self, produced: Option<usize>) {
+        self.run.0.note_dstorage_write(
+            self.within,
+            produced.unwrap_or(self.len).min(self.len),
+            produced.is_some_and(|len| len <= self.len),
+        );
     }
 }
 

@@ -10,6 +10,10 @@
 # Build output
 /target/
 /tests/fixtures/*/target/
+/依赖/
+
+# 本地诊断日志可能包含地址和机器路径。
+*.log
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
