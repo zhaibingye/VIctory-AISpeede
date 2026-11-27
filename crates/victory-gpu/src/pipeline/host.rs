@@ -162,7 +162,11 @@ fn color_destination_reads(blend: &D3D12_BLEND_DESC, count: u32) -> u8 {
     let independent = blend.IndependentBlendEnable.as_bool();
     (0..count.min(8) as usize).fold(0, |slots, slot| {
         let desc = &blend.RenderTarget[if independent { slot } else { 0 }];
-        slots | (u8::from(desc.BlendEnable.as_bool() || desc.LogicOpEnable.as_bool()) << slot)
+        // 这四种逻辑运算的输出只取常量或源像素。其余运算以及混合保守地依赖目标。
+        // 不据此推断绘制覆盖率，也不因颜色独立而省略着色器执行。
+        let logic_reads = desc.LogicOpEnable.as_bool() && !matches!(desc.LogicOp,
+            D3D12_LOGIC_OP_CLEAR | D3D12_LOGIC_OP_SET | D3D12_LOGIC_OP_COPY | D3D12_LOGIC_OP_COPY_INVERTED);
+        slots | (u8::from(desc.BlendEnable.as_bool() || logic_reads) << slot)
     })
 }
 
@@ -184,7 +188,14 @@ fn color_write_slots_follow_effective_blend_descriptors() {
         blend.IndependentBlendEnable = false.into();
         assert_eq!(color_destination_reads(&blend, 3), 0);
         blend.RenderTarget[0].LogicOpEnable = true.into();
-        assert_eq!(color_destination_reads(&blend, 3), 0b111);
+        for op in [D3D12_LOGIC_OP_CLEAR, D3D12_LOGIC_OP_SET, D3D12_LOGIC_OP_COPY, D3D12_LOGIC_OP_COPY_INVERTED] {
+            blend.RenderTarget[0].LogicOp = op;
+            assert_eq!(color_destination_reads(&blend, 3), 0);
+        }
+        for op in [D3D12_LOGIC_OP_XOR, D3D12_LOGIC_OP_INVERT, D3D12_LOGIC_OP(-1)] {
+            blend.RenderTarget[0].LogicOp = op;
+            assert_eq!(color_destination_reads(&blend, 3), 0b111);
+        }
     }
 }
 
