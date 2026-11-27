@@ -529,7 +529,7 @@ impl Layout {
         }
     }
 
-    /// Whether [`Layout::offset`] and the copies work for this layout:
+    /// Whether [`Layout::offset`], [`Layout::tile`] and [`Layout::detile`] work for this layout:
     /// linear and the modes without pipe or bank XOR, single-sampled.
     ///
     /// shortcut: no addressing for the XOR modes (`_X`, `_T`) and MSAA;
@@ -729,6 +729,72 @@ impl Layout {
         }
         Ok(())
     }
+}
+
+/// Copies the visible four-byte texels of a single-mip, single-slice, single-sample
+/// 2D `SW_64KB_R_X` plane to tightly packed rows if each 64 KiB block is uniform.
+/// Blocks may differ from one another. The caller must establish that `data` starts
+/// at the plane base and is an authoritative, immutable snapshot of uncompressed
+/// main-plane texels whose interpretation does not depend on compression/clear metadata.
+/// Neither [`Layout`] nor byte uniformity proves those preconditions.
+///
+/// GFX10 addrlib's `ComputeThinBlockDimension` gives 128×128 texels per block here.
+/// AMD's [`ComputeSurfaceAddrFromCoordMacroTiled`](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10addrlib.cpp#L4736-L4804)
+/// selects the block by
+/// `(y / 128) * (pitch / 128) + x / 128`; the pipe/bank XOR affects the offset
+/// *within* its 64 KiB, not the block index or the byte order of a texel. If every
+/// four-byte word in that block is identical, its first word suffices for any texel.
+///
+/// Requires the entire padded input plane and at least `width * height * 4` output
+/// bytes. Ignores extra input and leaves extra output untouched. Returns
+/// [`Error::Unsupported`] for nonuniform blocks (even in padding) or out-of-scope
+/// descriptions. No error changes `rows`.
+pub fn copy_uniform_rx_rgba8_blocks(
+    layout: &Layout,
+    data: &[u8],
+    rows: &mut [u8],
+) -> Result<(), Error> {
+    const SIDE: usize = 128;
+    let d = &layout.desc;
+    if d.swizzle != Swizzle::SW_64KB_R_X
+        || d.dimension != Dimension::Tex2d
+        || d.depth != 1
+        || d.mips != 1
+        || d.samples != 1
+        || d.block != 1
+        || d.element_bytes != 4
+    {
+        return Err(Error::Unsupported);
+    }
+    // Layout fields are public: validate extents, pitch, plane size, tail/offset etc.
+    // together before relying on the one-mip geometry or using any length as an index.
+    if *layout != Layout::new(d)? {
+        return Err(Error::Invalid);
+    }
+    let plane_size = usize::try_from(layout.size).map_err(|_| Error::TooSmall)?;
+    let output_size = usize::try_from(u64::from(d.width) * u64::from(d.height) * 4)
+        .map_err(|_| Error::TooSmall)?;
+    let plane = data.get(..plane_size).ok_or(Error::TooSmall)?;
+    let rows = rows.get_mut(..output_size).ok_or(Error::TooSmall)?;
+
+    // The canonical plane is made up of complete blocks, including at the edges.
+    // Finish the proof on the whole snapshot before writing even the first row.
+    let words = plane.as_chunks::<4>().0;
+    let blocks = words.as_chunks::<{ SIDE * SIDE }>().0;
+    for block in blocks {
+        if block[1..].iter().any(|word| *word != block[0]) {
+            return Err(Error::Unsupported);
+        }
+    }
+
+    let blocks_per_row = layout.mips[0].pitch as usize / SIDE;
+    let pixels = rows.as_chunks_mut::<4>().0;
+    for (y, row) in pixels.chunks_exact_mut(d.width as usize).enumerate() {
+        for (bx, span) in row.chunks_mut(SIDE).enumerate() {
+            span.fill(blocks[(y / SIDE) * blocks_per_row + bx][0]);
+        }
+    }
+    Ok(())
 }
 
 /// Copy micro-tile runs inline at a known width, or use each run's length for N = 0.

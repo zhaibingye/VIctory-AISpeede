@@ -22,6 +22,10 @@
 
 - `7174c48` 证实实际 PSO 的 RGB/Alpha 都是 `ADD(SRC_ALPHA, INV_SRC_ALPHA)`，不是可以删掉的旧色依赖。`9e65b0d` 的一次性只读探针完整观测到目标 510 个 CPU 页均为零（无内容或指纹落盘），仅代表 CPU 当前读值。`e61c206` 显示前缀 8/10 两个颜色清除及 12/13 两个绘制都写别的默认私有堆对象（格式 28，而目标为 29），6 的 compute 输出不同且失败时物理页交集为零。不能按尺寸移交。下一步应从可信物理节的初始字节、物理写入时序和可验证的数据平面转换构建可独立回归的字节兼容路径，不从零观测直接推导清屏。
 
+## 已有的受限字节转换
+
+- `victory_formats::texture::copy_uniform_rx_rgba8_blocks` 只处理独立证明为无压缩主平面的 2D `SW_64KB_R_X`、单层单 mip、单采样、4 字节 texel。按 GFX10 addrlib 的块索引，128×128 个 texel 占一块，块内 XOR 不改变块号。逐块验证全部四字节字相同（含填充）即可恢复紧密行；不同块不必同色。`uniform_rx` 集成测试有六个异色块及末块单字节反例。这不是通用逐像素寻址，未接入生产；510 页的 CPU 零观测不能替代平面描述、提交时的权威快照或同步证明。
+
 ## 最小验证
 
 - 使用仓库锁定的 Rust、Windows x64 MSVC、`--locked --features paged-title,diagnostics,blake3/pure`。新增诊断的定向测试过滤 `page_resource::native_history_tests`、`page_queue::copy_prefix_`；内容顺序的实像素测试为 `page_draw::paged_title_partial_color_clear_observes_submission_order`，仅相关改动时重跑。
