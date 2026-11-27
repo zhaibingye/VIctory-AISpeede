@@ -157,6 +157,15 @@ fn color_write_slots(blend: &D3D12_BLEND_DESC, count: u32) -> u8 {
     })
 }
 
+#[cfg(feature = "paged-title")]
+fn color_destination_reads(blend: &D3D12_BLEND_DESC, count: u32) -> u8 {
+    let independent = blend.IndependentBlendEnable.as_bool();
+    (0..count.min(8) as usize).fold(0, |slots, slot| {
+        let desc = &blend.RenderTarget[if independent { slot } else { 0 }];
+        slots | (u8::from(desc.BlendEnable.as_bool() || desc.LogicOpEnable.as_bool()) << slot)
+    })
+}
+
 #[test]
 fn color_write_slots_follow_effective_blend_descriptors() {
     let mut blend = D3D12_BLEND_DESC::default();
@@ -168,6 +177,15 @@ fn color_write_slots_follow_effective_blend_descriptors() {
     assert_eq!(color_write_slots(&blend, 3), 0b011);
     assert_eq!(color_write_slots(&blend, 1), 0b001);
     assert_eq!(color_write_slots(&blend, 0), 0);
+    #[cfg(feature = "paged-title")]
+    {
+        blend.RenderTarget[1].BlendEnable = true.into();
+        assert_eq!(color_destination_reads(&blend, 3), 0b010);
+        blend.IndependentBlendEnable = false.into();
+        assert_eq!(color_destination_reads(&blend, 3), 0);
+        blend.RenderTarget[0].LogicOpEnable = true.into();
+        assert_eq!(color_destination_reads(&blend, 3), 0b111);
+    }
 }
 
 impl GraphicsState {
@@ -368,6 +386,8 @@ pub(crate) struct HostPipeline {
     pub(crate) closed_depth_format: Option<DXGI_FORMAT>,
     pub(crate) closed_samples: Option<DXGI_SAMPLE_DESC>,
     pub(crate) closed_color_writes: u8,
+    #[cfg(feature = "paged-title")]
+    pub(crate) closed_color_destination_reads: u8,
     /// Planes to which this host PSO can write: depth (1), stencil (2).
     pub(crate) closed_depth_writes: u32,
     pub(crate) closed_depth_tests: u32,
@@ -649,6 +669,8 @@ impl HostPipeline {
                 closed_depth_format: None,
                 closed_samples: None,
                 closed_color_writes: 0,
+                #[cfg(feature = "paged-title")]
+                closed_color_destination_reads: 0,
                 closed_depth_writes: 0,
                 closed_depth_tests: 0,
                 name: format!("{shaders:?}"),
@@ -689,6 +711,8 @@ impl HostPipeline {
                 closed_depth_format: None,
                 closed_samples: None,
                 closed_color_writes: 0,
+                #[cfg(feature = "paged-title")]
+                closed_color_destination_reads: 0,
                 closed_depth_writes: 0,
                 closed_depth_tests: 0,
                 name: format!("{shaders:?}"),
@@ -791,6 +815,8 @@ impl HostPipeline {
             closed_depth_format: (g.depth_format != DXGI_FORMAT_UNKNOWN).then_some(g.depth_format),
             closed_samples: Some(g.samples),
             closed_color_writes: color_write_slots(&desc.BlendState, g.targets.NumRenderTargets),
+            #[cfg(feature = "paged-title")]
+            closed_color_destination_reads: color_destination_reads(&desc.BlendState, g.targets.NumRenderTargets),
             closed_depth_tests: u32::from(g.depth.DepthEnable.as_bool())
                 | (u32::from(g.depth.StencilEnable.as_bool()) << 1),
             closed_depth_writes: u32::from(g.depth.DepthEnable.as_bool()

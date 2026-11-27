@@ -171,7 +171,11 @@ impl ColorClear {
         }) {
             return Err(BatchError::unsupported_texture_map("无法确认纹理映射"));
         }
-        if !self.replaces_all() {
+        #[cfg(feature = "paged-title")]
+        let discarded = initialized.color_is_discarded(&self.target.copy, self.target.sub);
+        #[cfg(not(feature = "paged-title"))]
+        let discarded = false;
+        if !self.replaces_all() && !discarded {
             initialized.require_color_subresource(host, list, batch, &self.target.copy, self.target.sub)?;
         }
         let texture = &self.target.copy.texture;
@@ -379,6 +383,8 @@ pub(crate) struct ClosedDraw {
     root: ID3D12RootSignature,
     targets: Vec<ColorTarget>,
     color_writes: u8,
+    #[cfg(feature = "paged-title")]
+    color_destination_reads: u8,
     depth: Option<DepthTarget>,
     depth_tests: u32,
     depth_writes: u32,
@@ -491,6 +497,8 @@ impl ClosedDraw {
         Self {
             pipeline, root, targets: vec![target], color_writes: 1, depth: None, depth_tests: 0, depth_writes: 0, stencil_ref: 0, topology, viewport, scissor, inputs, call,
             shader: ShaderBindings::default(),
+            #[cfg(feature = "paged-title")]
+            color_destination_reads: 0,
             blend_factor: [1.0; 4],
             sample: None,
         }
@@ -576,6 +584,8 @@ impl ClosedDraw {
         Ok(Self {
             pipeline: pipeline.pso.clone(), root: pipeline.root.clone(),
             targets, color_writes: pipeline.closed_color_writes,
+            #[cfg(feature = "paged-title")]
+            color_destination_reads: pipeline.closed_color_destination_reads,
             depth, depth_tests: pipeline.closed_depth_tests, depth_writes: pipeline.closed_depth_writes,
             stencil_ref, topology, viewport, scissor, inputs, call, shader,
             blend_factor: [1.0; 4],
@@ -639,6 +649,13 @@ impl ClosedDraw {
             target.validate_native()?;
             // 仍保留绑定与状态转换；全零颜色掩码既不消费底图，也不生成内容。
             if !self.writes_color(slot) { continue; }
+            #[cfg(feature = "paged-title")]
+            if self.color_destination_reads & (1 << slot) == 0
+                && initialized.color_is_discarded(&target.copy, target.sub)
+            {
+                // 游戏已明确弃旧；普通绘制仍不能声明全资源像素可读。
+                continue;
+            }
             initialized.require_color_subresource(host, list, batch, &target.copy, target.sub)
                 .map_err(|e| e.at_texture(crate::page_slabs::TextureContentUse::ColorTarget {
                     slot, subresource: target.sub.index,
@@ -738,31 +755,37 @@ impl ClosedDraw {
 #[cfg(all(test, feature = "diagnostics"))]
 #[test]
 fn paged_title_draw_reads_gpu_copied_vertices_and_renders_pixels() {
-    check_paged_title_pixels(false, false, false, true);
+    check_paged_title_pixels(false, false, false, true, false);
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
 #[test]
 fn paged_title_indirect_draw_reads_gpu_generated_records_and_count() {
-    check_paged_title_pixels(true, false, false, true);
+    check_paged_title_pixels(true, false, false, true, false);
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
 #[test]
 fn paged_title_draw_samples_texture_written_by_preceding_gpu_copy() {
-    check_paged_title_pixels(false, true, false, true);
+    check_paged_title_pixels(false, true, false, true, false);
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
 #[test]
 fn paged_title_draw_uses_relocated_texture_table_byte_base() {
-    check_paged_title_pixels(false, true, true, true);
+    check_paged_title_pixels(false, true, true, true, false);
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
 #[test]
 fn paged_title_draw_with_zero_color_mask_does_not_claim_attachment_contents() {
-    check_paged_title_pixels(false, false, false, false);
+    check_paged_title_pixels(false, false, false, false, false);
+}
+
+#[cfg(all(test, feature = "diagnostics", feature = "paged-title"))]
+#[test]
+fn paged_title_explicit_discard_then_draw_and_full_clear() {
+    check_paged_title_pixels(false, false, false, true, true);
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
@@ -788,7 +811,7 @@ fn compile_dxc_stage(source: &str, entry: &str, profile: &str) -> Vec<u8> {
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
-fn check_paged_title_pixels(indirect: bool, sampled: bool, relocated: bool, writes_color: bool) {
+fn check_paged_title_pixels(indirect: bool, sampled: bool, relocated: bool, writes_color: bool, discard: bool) {
     use victory_memory::{PAGE_BYTES, physical::PageNumbers};
     use windows::Win32::Graphics::Direct3D::{
         D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, Fxc::D3DCompile,
@@ -1012,7 +1035,7 @@ float4 pixel() : SV_Target0 {
         target.clone(), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32, Vec::new(),
     ));
     assert!(ColorTarget::capture(target_state.clone(), None).is_none());
-    target_state.host_written.store(writes_color, Ordering::Release);
+    target_state.host_written.store(writes_color && !discard, Ordering::Release);
     let color = ColorTarget::capture_candidate(target_state.clone(), None).unwrap();
     let title = host.new_list().unwrap();
     title.defer_copy(VA as *mut u8, (ALIAS + 32) as *const u8, 24);
@@ -1069,7 +1092,20 @@ float4 pixel() : SV_Target0 {
             0, [0.0f32, 1.0, 0.0, 1.0].into_iter().map(f32::to_bits).collect(), Vec::new(),
         ));
     }
+    #[cfg(feature = "paged-title")]
+    if discard {
+        title.record_page_barrier(crate::page_resource::PageBarrier::whole_color_discard(target_state.clone()).unwrap());
+    }
     title.record_page_draw(draw);
+    if discard {
+        title.record_page_clear(ColorClear {
+            target: ColorTarget::capture_candidate(target_state.clone(), None).unwrap(),
+            color: [0., 0., 1., 1.], rects: Vec::new(),
+        });
+        title.record_page_barrier(crate::page_resource::PageBarrier::Texture(
+            target_state.clone(), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
+        ));
+    }
     title.close();
     let previously_submitted = crate::draw::drawn();
     let stats = host.execute_paged_title(heap, &mut backing, &[&title]).unwrap();
@@ -1088,7 +1124,7 @@ float4 pixel() : SV_Target0 {
         let mut ptr = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut ptr)).unwrap();
         let row = ptr.cast::<u8>().add(footprint.Offset as usize + 2 * footprint.Footprint.RowPitch as usize);
-        let expected = if writes_color { [0, 255, 0, 255] } else { [255, 0, 0, 255] };
+        let expected = if discard { [0, 0, 255, 255] } else if writes_color { [0, 255, 0, 255] } else { [255, 0, 0, 255] };
         assert_eq!(std::slice::from_raw_parts(row.add(8), 4), &expected);
         readback.Unmap(0, None);
     }

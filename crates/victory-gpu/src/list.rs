@@ -1297,14 +1297,20 @@ unsafe impl Send for Upload {}
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
-/// 只为定位渲染目标首次使用记录被忽略的丢弃；不访问区域指针。
+/// 传统整面弃旧只支持可验证颜色资源，不访问可选区域指针。
 extern "system" fn discard_resource(this: This, resource: This, region: *const core::ffi::c_void) {
-    #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
-    if crate::page_inventory::enabled()
-        && let Some(list) = host_list(this)
+    #[cfg(all(windows, feature = "paged-title"))]
+    if let Some(list) = host_list(this)
         && let Some(copy) = crate::resource::host_copy(resource)
     {
-        list.note_page_discard(copy, region.is_null());
+        if region.is_null() && let Some(discard) = crate::page_resource::PageBarrier::whole_color_discard(copy.clone()) {
+            list.record_page_barrier(discard);
+        } else {
+            #[cfg(feature = "diagnostics")]
+            if crate::page_inventory::enabled() {
+                list.note_page_discard(copy, region.is_null());
+            }
+        }
     }
     let _ = (this, resource, region);
 }

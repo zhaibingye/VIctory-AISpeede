@@ -275,13 +275,9 @@ impl ResourcePlan {
 
     /// 明确弃旧可用于写入门槛，不等价于初始化。只支持无可观察字节后备的整资源。
     #[cfg(feature = "paged-title")]
-    #[allow(dead_code, reason = "等待来宾弃旧事件得到验证，禁止由候选诊断自动进入")]
     pub(crate) fn record_discarded_color(&mut self, copy: &Arc<HostTexture>, sub: ColorSubresource) -> Result<(), BatchError> {
         let key = Self::key(copy);
-        if sub.is_scoped() || copy.has_pointer_exposure() || copy.uses_unproven_alias_backing()
-            || copy.exact_committed_bytes().is_some()
-            || copy.sparse.is_some() || copy.twin.get().is_some_and(Option::is_some)
-        {
+        if !can_discard_color(copy, sub) {
             return Err(BatchError::unsupported_texture_map("无法证明弃旧范围和内容后备"));
         }
         let version = Version::successor(self.version(copy), Representation::Discarded, copy.byte_observation())
@@ -293,7 +289,6 @@ impl ResourcePlan {
     }
 
     #[cfg(feature = "paged-title")]
-    #[allow(dead_code, reason = "只供以后通过验证的弃旧写入使用")]
     pub(crate) fn color_is_discarded(&self, copy: &Arc<HostTexture>, sub: ColorSubresource) -> bool {
         !sub.is_scoped() && self.version(copy).is_some_and(|v| v.representation == Representation::Discarded)
     }
@@ -538,6 +533,8 @@ pub(crate) enum PageBarrier {
     Texture(Arc<HostTexture>, u32),
     NativeUav(Arc<HostTexture>),
     Uav,
+    #[cfg(feature = "paged-title")]
+    DiscardColor(Arc<HostTexture>, ColorSubresource),
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     EnhancedUav {
         counts_by_kind: [u64; 4], headers_skipped: u32,
@@ -545,7 +542,23 @@ pub(crate) enum PageBarrier {
     },
 }
 
+#[cfg(feature = "paged-title")]
+fn can_discard_color(copy: &HostTexture, sub: ColorSubresource) -> bool {
+    !sub.is_scoped() && !copy.has_pointer_exposure() && !copy.uses_unproven_alias_backing()
+        && copy.exact_committed_bytes().is_none()
+        && copy.sparse.is_none() && !copy.twin.get().is_some_and(Option::is_some)
+}
+
 impl PageBarrier {
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn whole_color_discard(copy: Arc<HostTexture>) -> Option<Self> {
+        // 安全：copy 保留在整个录制及执行期间。
+        let desc = unsafe { copy.texture.GetDesc() };
+        if !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) { return None; }
+        let sub = ColorSubresource::capture(desc, 0)?;
+        can_discard_color(&copy, sub).then_some(Self::DiscardColor(copy, sub))
+    }
+
     pub(crate) fn native_uav(list: &HostList, copy: &HostTexture) {
         // A title texture may still have accesses through canonical byte
         // pages or another native representation. A named host barrier is
@@ -583,6 +596,15 @@ impl PageBarrier {
             Self::Texture(copy, wanted) => resources.transition_texture(list, copy, *wanted),
             Self::NativeUav(copy) => { Self::native_uav(list, copy); Ok(()) }
             Self::Uav => { Self::emit_uav(list, None); Ok(()) }
+            #[cfg(feature = "paged-title")]
+            Self::DiscardColor(copy, sub) => {
+                resources.record_discarded_color(copy, *sub)?;
+                resources.transition_texture(list, copy, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32)?;
+                // 安全：精确整资源已转至 RENDER_TARGET，列表保留该资源。
+                list.keep(&copy.texture);
+                unsafe { list.recording().DiscardResource(&copy.texture, None) };
+                Ok(())
+            }
             #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
             Self::EnhancedUav { .. } => { Self::emit_uav(list, None); Ok(()) }
         }
