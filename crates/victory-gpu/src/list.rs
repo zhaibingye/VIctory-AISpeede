@@ -1682,9 +1682,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0 {
         #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
         if crate::page_inventory::enabled() && let Some(list) = host_list(this) {
-            // 安全：来宾方法签名约定 count 个 16 字节组头；只读有界组头的数值字段。
-            let (counts_by_kind, headers_skipped) = unsafe { enhanced_group_counts(count, _groups) };
-            let textures = enhanced_texture_candidates(count, _groups);
+            let (counts_by_kind, headers_skipped, textures) = enhanced_texture_candidates(count, _groups);
             list.record_page_barrier(crate::page_resource::PageBarrier::EnhancedUav {
                 counts_by_kind, headers_skipped, textures,
             });
@@ -1694,23 +1692,34 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
 }
 
-/// 类型 0/1/2 按 D3D12 标准分别对应全局、纹理和缓冲区。
-/// 这里记录原始类别，不读载荷指针，也不把类型 1 当成已证实丢弃。
+/// 组头与载荷地址均按值解析。载荷地址在经过内核检查前不可解引用。
 #[cfg(any(test, all(windows, feature = "paged-title", feature = "diagnostics")))]
-unsafe fn enhanced_group_counts(count: u32, groups: *const u8) -> ([u64; 4], u32) {
+fn enhanced_group_headers(
+    count: u32, base: usize, mut read: impl FnMut(usize, &mut [u8; 16]) -> bool,
+    mut visit: impl FnMut(u32, u32, usize),
+) -> ([u64; 4], u32) {
     const MAX_HEADERS: u32 = 64;
     let mut counts = [0; 4];
-    if groups.is_null() { return (counts, count); }
+    if base == 0 { return (counts, count); }
     let inspected = count.min(MAX_HEADERS);
+    let mut skipped = count - inspected;
     for index in 0..inspected as usize {
-        // 安全：调用者保证组头存在，每项前两个字段分别为类型和屏障数量。
-        let (kind, entries) = unsafe {
-            let at = groups.add(index * 16);
-            (at.cast::<u32>().read_unaligned(), at.add(4).cast::<u32>().read_unaligned())
+        let mut header = [0u8; 16];
+        let Some(address) = base.checked_add(index * header.len()) else {
+            skipped += 1;
+            continue;
         };
+        if !read(address, &mut header) {
+            skipped += 1;
+            continue;
+        }
+        let kind = u32::from_le_bytes(header[..4].try_into().unwrap());
+        let entries = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let payload = u64::from_le_bytes(header[8..].try_into().unwrap()) as usize;
         counts[kind.min(3) as usize] += u64::from(entries);
+        visit(kind, entries, payload);
     }
-    (counts, count - inspected)
+    (counts, skipped)
 }
 
 /// 桌面 SDK 形状下的候选字段。对象经登记核验，字段本身仍不是来宾 ABI 证明。
@@ -1744,31 +1753,29 @@ fn desktop_texture_candidate(bytes: &[u8; 64]) -> (usize, CandidateTextureBarrie
 
 #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
 fn enhanced_texture_candidates(count: u32, groups: *const u8)
-    -> Vec<(std::sync::Weak<crate::resource::HostTexture>, CandidateTextureBarrier)>
+    -> ([u64; 4], u32, Vec<(std::sync::Weak<crate::resource::HostTexture>, CandidateTextureBarrier)>)
 {
     let mut found = Vec::new();
-    if groups.is_null() { return found; }
     let mut remaining = 64u32;
-    for i in 0..count.min(64) {
-        let mut header = [0u8; 16];
-        if !crate::host::read_into(groups.wrapping_add(i as usize * 16), &mut header) { continue; }
-        if u32::from_le_bytes(header[..4].try_into().unwrap()) != 1 { continue; }
-        let entries = u32::from_le_bytes(header[4..8].try_into().unwrap()).min(remaining);
-        let payload = u64::from_le_bytes(header[8..].try_into().unwrap()) as usize;
-        remaining -= entries;
-        for j in 0..entries {
-            let Some(address) = payload.checked_add(j as usize * 64) else { break; };
-            let mut bytes = [0u8; 64];
-            // 内核检查可读性，不将候选指针作为 Rust 引用。
-            if payload == 0 || !crate::host::read_into(address as *const u8, &mut bytes) { break; }
-            let (object, fields) = desktop_texture_candidate(&bytes);
-            if let Some(identity) = crate::resource::known_texture_identity(object) {
-                found.push((identity, fields));
+    let (counts, skipped) = enhanced_group_headers(
+        count, groups as usize, |address, header| crate::host::read_into(address as *const u8, header),
+        |kind, entries, payload| {
+            if kind != 1 || payload == 0 { return; }
+            let entries = entries.min(remaining);
+            remaining -= entries;
+            for j in 0..entries {
+                let Some(address) = payload.checked_add(j as usize * 64) else { break; };
+                let mut bytes = [0u8; 64];
+                // 内核检查可读性，不将候选指针作为 Rust 引用。
+                if !crate::host::read_into(address as *const u8, &mut bytes) { break; }
+                let (object, fields) = desktop_texture_candidate(&bytes);
+                if let Some(identity) = crate::resource::known_texture_identity(object) {
+                    found.push((identity, fields));
+                }
             }
-        }
-        if remaining == 0 { break; }
-    }
-    found
+        },
+    );
+    (counts, skipped, found)
 }
 
 #[test]
@@ -1785,14 +1792,35 @@ fn desktop_texture_candidate_keeps_layout_range_and_flags_separate() {
 
 #[test]
 fn enhanced_group_inventory_counts_types_without_reading_payload() {
-    let mut groups = [[0u32; 4]; 65];
-    groups[0] = [1, 3, u32::MAX, u32::MAX];
-    groups[1] = [2, 5, u32::MAX, u32::MAX];
-    groups[2] = [u32::MAX, 2, 0, 0];
-    groups[64] = [1, 99, 0, 0];
-    // 安全：组头由测试持有；载荷故意无效，并且不应读取。
-    assert_eq!(unsafe { enhanced_group_counts(65, groups.as_ptr().cast()) }, ([0, 3, 5, 2], 1));
-    assert_eq!(unsafe { enhanced_group_counts(4, std::ptr::null()) }, ([0; 4], 4));
+    let mut visited = Vec::new();
+    let (counts, skipped) = enhanced_group_headers(65, 16, |address, header| {
+        let words: [u32; 4] = match address {
+            16 => [1, 3, u32::MAX, u32::MAX],
+            32 => [2, 5, u32::MAX, u32::MAX],
+            48 => [u32::MAX, 2, 0, 0],
+            64 => {
+                // 模拟部分复制后失败，不得信任残留字段。
+                header[..4].copy_from_slice(&1u32.to_le_bytes());
+                return false;
+            }
+            _ => [0; 4],
+        };
+        for (chunk, word) in header.chunks_exact_mut(4).zip(words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        true
+    }, |kind, entries, payload| {
+        if entries > 0 { visited.push((kind, entries, payload)); }
+    });
+    assert_eq!((counts, skipped), ([0, 3, 5, 2], 2));
+    assert_eq!(visited, [(1, 3, usize::MAX), (2, 5, usize::MAX), (u32::MAX, 2, 0)]);
+    assert_eq!(enhanced_group_headers(4, 0, |_, _| unreachable!(), |_, _, _| unreachable!()), ([0; 4], 4));
+    let mut reads = 0;
+    assert_eq!(enhanced_group_headers(2, usize::MAX - 15, |_, _| {
+        reads += 1;
+        true
+    }, |_, _, _| {}), ([0; 4], 1));
+    assert_eq!(reads, 1);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
