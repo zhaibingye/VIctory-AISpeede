@@ -22,6 +22,8 @@
 
 - `7174c48` 证实实际 PSO 的 RGB/Alpha 都是 `ADD(SRC_ALPHA, INV_SRC_ALPHA)`，不是可以删掉的旧色依赖。`9e65b0d` 的一次性只读探针完整观测到目标 510 个 CPU 页均为零（无内容或指纹落盘），仅代表 CPU 当前读值。`e61c206` 显示前缀 8/10 两个颜色清除及 12/13 两个绘制都写别的默认私有堆对象（格式 28，而目标为 29），6 的 compute 输出不同且失败时物理页交集为零。不能按尺寸移交。下一步应从可信物理节的初始字节、物理写入时序和可验证的数据平面转换构建可独立回归的字节兼容路径，不从零观测直接推导清屏。
 
+- `64dd795` 实跑归档中，891 个已完成 Fence 的 1,782 次原生写入候选均归类为默认图形堆；目标 510 个候选页属于同一 XMem section，记录内无同对象或 VA 重叠。这份历史没有完整的物理覆盖。独立核对表明，`CopyPageMappingsBatchX` 只复制 XMem 视图关系：登记页池不会导入分配，`map_alias` 只接收已登记的 section 源，目的必须能由 Windows 替换 placeholder。`xmem::tests::managed_xmem_alias_shares_section_not_live_private_memory` 在原生 Windows 证明同节两 VA 既被提交固定为同页又双向共享真实字节；活跃、64 KiB 对齐的默认图形堆没有 section 身份且不能当页池源，普通已提交私有目的也拒绝替换并保留旧字节。只排除已实现映射的直接共用字节，不排除间接复制、其他写入、漏译或游戏本应有而 VNME 尚未实现的语义。
+
 ## 开场 XMem 的宿主 RAM 准入
 
 - 原生 Windows `paged-title` 用 `SEC_RESERVE` 创建 section。`DeferredRam` 按 **section 内页号**预扣净新增 64 KiB 页；宿主提交失败退回新增额度，解绑单个 VA 不释放仍存活的 section。`xmem::tests::deferred_native_` 用真实重叠视图、只读视图提交失败、同 VA 换节后重试验证这些边界。拒绝日志的 `requested_mib` 是整段长度，不是净新增字节；不能据此断言重复计费。

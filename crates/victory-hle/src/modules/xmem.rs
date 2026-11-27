@@ -1824,6 +1824,70 @@ mod tests {
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
 
+    #[cfg(feature = "paged-title")]
+    #[test]
+    fn managed_xmem_alias_shares_section_not_live_private_memory() {
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::System::Memory::MEM_PRIVATE;
+        if on_wine() { return; } // Exercise the native Windows placeholder protocol.
+
+        let alloc_va = |kind| XMemVirtualAlloc(null_mut(), PAGE, MEM_RESERVE | kind, 0, PAGE_READWRITE);
+        let (pool, tiled, private) = (alloc_va(PAGES_64K), alloc_va(PAGES_64K), alloc_va(MEM_COMMIT));
+        assert!(!pool.is_null() && !tiled.is_null() && !private.is_null());
+        let pages = allocate(1);
+        assert_eq!(XMemMapPhysicalPages(pool, 1, pages.as_ptr()), pool);
+
+        const ATTR: u64 = (128 << 16) | (16 << ALIGNMENT_SHIFT);
+        let heap = XMemAllocDefault(PAGE, ATTR);
+        assert!(!heap.is_null() && (heap as usize).is_multiple_of(PAGE));
+        assert!(is_graphics_heap_span(heap as usize, heap as usize + PAGE));
+        assert_eq!(query(heap).host.Type, MEM_PRIVATE);
+        let copy = |from: *mut c_void| map_alias(tiled as u64, from as u64, PAGE as u64);
+        // Alignment is not enough to make the default graphics heap a pool source.
+        assert!(!copy(heap));
+        assert_eq!(query(tiled).host.State, MEM_RESERVE);
+        assert!(copy(pool));
+
+        // Check what the submission would pin, as well as actual shared bytes.
+        let ranges = [pool, tiled, heap, private].map(|at| (at as usize, at as usize + PAGE));
+        let mut pins = BackingPins::default();
+        pin_backing(&ranges, &mut pins);
+        let section_page = pins.expected(pool as usize).expect("mapped section backing");
+        assert!(pins.section::<Section>(section_page).is_some());
+        assert_eq!(pins.expected(tiled as usize), Some(section_page));
+        assert_eq!(pins.expected(heap as usize), None);
+        assert_ne!(pins.expected(private as usize), Some(section_page));
+        // SAFETY: all four pointers cover a live read-write byte.
+        unsafe {
+            heap.cast::<u8>().write_volatile(0x21);
+            pool.cast::<u8>().write_volatile(0x42);
+            assert_eq!(tiled.cast::<u8>().read_volatile(), 0x42);
+            tiled.cast::<u8>().write_volatile(0x68);
+            assert_eq!(pool.cast::<u8>().read_volatile(), 0x68);
+            assert_eq!(heap.cast::<u8>().read_volatile(), 0x21);
+            private.cast::<u8>().write_volatile(0x34);
+        }
+
+        // Exercise both destination paths on a whole private reservation,
+        // never on the host allocator's live heap block.
+        assert!(!map_alias(private as u64, pool as u64, PAGE as u64));
+        assert!(XMemMapPhysicalPages(private, 1, pages.as_ptr()).is_null());
+        let info = query(private).host;
+        assert_eq!(info.Type, MEM_PRIVATE);
+        assert_eq!(info.State, MEM_COMMIT);
+        // SAFETY: still the original committed private allocation.
+        assert_eq!(unsafe { private.cast::<u8>().read_volatile() }, 0x34);
+
+        XMemFreeDefault(heap, ATTR);
+        for at in [pool, tiled] {
+            assert_eq!(XMemMapPhysicalPages(at, 1, null()), at);
+            // SAFETY: now an unmapped, whole placeholder owned by this test.
+            assert_ne!(unsafe { VirtualFree(at, 0, MEM_RELEASE) }, 0);
+        }
+        assert_ne!(private_virtual_free(private, 0, MEM_RELEASE), 0);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
     #[test]
     fn physical_backing_survives_page_number_free_until_all_views_close() {
         let pages = allocate(1);
