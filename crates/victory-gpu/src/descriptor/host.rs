@@ -1142,6 +1142,23 @@ pub(crate) fn paged_structured_srv_range(view: &View, stride: u32) -> Option<(u6
     checked_buffer_view(*resource, buffer.FirstElement, buffer.NumElements, stride)
 }
 
+#[cfg(test)]
+#[test]
+fn paged_structured_srv_uses_the_real_first_record_and_bounds() {
+    let buffer = crate::resource::test_buffer(256);
+    let address = crate::resource::buffer_bytes(buffer).unwrap().0 as u64;
+    let view = |first, records, stride| View::Shader(buffer as usize, Some([
+        DXGI_FORMAT_UNKNOWN.0 as u32, D3D12_SRV_DIMENSION_BUFFER.0 as u32,
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0, first, 0, records, stride, 0, 0,
+    ]));
+    assert_eq!(paged_structured_srv_range(&view(1, 2, 64), 64), Some((address + 64, address + 192)));
+    assert_eq!(paged_structured_srv_range(&view(1, 2, 64), 32), None);
+    assert_eq!(paged_structured_srv_range(&view(3, 2, 64), 64), None);
+    assert_eq!(paged_structured_srv_range(&view(1, 0, 64), 64), None);
+    let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(buffer, 0x10);
+    assert_eq!(release(buffer), 0);
+}
+
 pub(crate) fn paged_structured_uav_range(view: &View, stride: u32) -> Option<(u64, u64)> {
     let View::Unordered(resource, 0, Some(words)) = view else { return None; };
     let desc = uav_desc(words);

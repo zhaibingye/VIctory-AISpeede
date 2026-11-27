@@ -653,3 +653,53 @@ fn table_constant_dynamic_vector_does_not_wrap_or_read_past_the_view() {
         assert_eq!(words[0][4], first[0], "静态读取必须使用同一常量表");
     }
 }
+
+#[test]
+fn scalar_structured_table_load_uses_byte_offsets_across_records() {
+    // 两个表分别绑定输入和输出。结构化输入每记录 64 字节，
+    // 标量读从第 60 字节开始，四个 dword 跨过记录边界。
+    const CODE: &[u32] = &[
+        0xBE84_0300, 0xBE85_0380, 0xF408_0202, 0xFA00_0000,
+        0xBE8C_0302, 0xBE8D_0380, 0xF408_0406, 0xFA00_0000,
+        0xBF8C_C07F,
+        0xF428_0504, 0xFA00_003C, // s_buffer_load_dwordx4 s[20:23], s[8:11], 60
+        0xBF8C_C07F,
+        0x7E04_0214, 0x7E06_0215, 0x7E08_0216, 0x7E0A_0217,
+        0xE078_0000, 0x8004_0200, // buffer_store_dwordx4 v[2:5], s[16:19], 0
+        0xBF81_0000,
+    ];
+    let shader = build(
+        CODE,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![
+            UsedResource { stride: 64, ..entry(ResourceType::Srv, 4, 0) },
+            entry(ResourceType::Uav, 4, 2),
+        ],
+        1,
+    );
+    // 对照槽与输入使用不同数据，防止错误重定位得到同样的结果。
+    let neighbor = [0xDEADu32; 32];
+    let data: Vec<u32> = (100..132).collect();
+    let views = [
+        View::Buffer { data: &neighbor, stride: Stride::Raw },
+        View::Buffer { data: &data, stride: Stride::Raw },
+        View::RawUav(4),
+    ];
+    let mut words = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        words[u.index as usize] = match (u.root, u.index) {
+            (RootType::Table, 0) => 32,
+            (RootType::Table, 2) => 64,
+            other => panic!("未知绑定 {other:?}"),
+        };
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).or_else(|_| Host::new(true)).expect("需要 SM 6.6 实机或 WARP");
+    let (root, pso) = host.compute_pipeline(&shader).expect("创建标量缓冲读取测试 PSO");
+    let actual = host.dispatch(
+        &root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(words))], views: &views, samplers: &[], groups: [1, 1, 1],
+        },
+    ).expect("运行标量缓冲读取测试");
+    assert_eq!(actual[0], [115, 116, 117, 118]);
+}
