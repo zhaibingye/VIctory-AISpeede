@@ -18,6 +18,13 @@ pub(crate) struct SubmittedTail {
     states: BTreeMap<usize, D3D12_RESOURCE_STATES>,
 }
 
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[derive(Debug, PartialEq, Eq)]
+struct ColorVersionTrace {
+    completed: Option<(Representation, u64, u64)>,
+    submitted: Option<(Representation, u64)>,
+}
+
 /// 仅用于诊断已完成的 GPU 写入。记录的是可能与共享字节相交的页，
 /// 不是最新版本；写回、CPU 再写和未完成的批次都不由这张表裁决。
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
@@ -167,6 +174,17 @@ impl ResourcePlan {
         self.version_at(copy, None)
     }
 
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    fn color_version_trace(&self, copy: &Arc<HostTexture>, subresource: Option<u32>) -> ColorVersionTrace {
+        let key = (Self::key(copy), subresource);
+        let completed = copy.native_authority.lock().unwrap_or_else(|e| e.into_inner())
+            .get(&subresource)
+            .map(|entry| (entry.version.representation, entry.version.number, entry.fence.0));
+        let submitted = self.inherited.versions.get(&key)
+            .map(|entry| (entry.representation, entry.number));
+        ColorVersionTrace { completed, submitted }
+    }
+
     /// 仅在缺失颜色内容时核对对象换代；不据此移交像素或判断物理别名。
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     pub(crate) fn trace_color_predecessor(&self, target: &Arc<HostTexture>, index: u32) {
@@ -179,21 +197,12 @@ impl ResourcePlan {
             tracing::info!(subresource = index, "颜色目标溯源：同键前代已释放");
             return;
         };
-        let describe = |copy: &Arc<HostTexture>, subresource| {
-            let key = (Self::key(copy), subresource);
-            let completed = copy.native_authority.lock().unwrap_or_else(|e| e.into_inner())
-                .get(&subresource)
-                .map(|entry| (entry.version.representation, entry.version.number, entry.fence.0));
-            let submitted = self.inherited.versions.get(&key)
-                .map(|entry| (entry.representation, entry.number));
-            (completed, submitted)
-        };
         tracing::info!(
             subresource = index,
-            predecessor_whole = ?describe(&prior, None),
-            predecessor_scoped = ?describe(&prior, Some(index)),
-            target_whole = ?describe(target, None),
-            target_scoped = ?describe(target, Some(index)),
+            predecessor_whole = ?self.color_version_trace(&prior, None),
+            predecessor_scoped = ?self.color_version_trace(&prior, Some(index)),
+            target_whole = ?self.color_version_trace(target, None),
+            target_scoped = ?self.color_version_trace(target, Some(index)),
             "颜色目标溯源：同键前代与当前对象（已完成版本及 Fence，已提交版本）"
         );
     }
@@ -498,8 +507,7 @@ impl ResourcePlan {
 }
 
 #[cfg(all(test, feature = "paged-title"))]
-#[test]
-fn ordered_color_requires_full_write_to_same_native_object_in_current_batch() {
+fn small_color_target() -> (Arc<HostTexture>, ColorSubresource) {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SAMPLE_DESC};
     let host = crate::host::host().expect("D3D12 宿主");
     let desc = D3D12_RESOURCE_DESC {
@@ -510,18 +518,20 @@ fn ordered_color_requires_full_write_to_same_native_object_in_current_batch() {
         Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
         ..Default::default()
     };
-    let make = || {
-        let mut texture = None::<ID3D12Resource>;
-        // 安全：结构与目标类型匹配；此测试只检查计划，不提交命令。
-        unsafe { host.device.CreateCommittedResource(
-            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-            D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
-        ) }.unwrap();
-        Arc::new(HostTexture::new(texture.unwrap(), 0, Vec::new()))
-    };
-    let target = make();
-    let other = make();
-    let sub = ColorSubresource::capture(desc, 0).unwrap();
+    let mut texture = None::<ID3D12Resource>;
+    // 安全：结构与目标类型匹配。以下测试只检查计划，不提交命令。
+    unsafe { host.device.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+    ) }.unwrap();
+    (Arc::new(HostTexture::new(texture.unwrap(), 0, Vec::new())), ColorSubresource::capture(desc, 0).unwrap())
+}
+
+#[cfg(all(test, feature = "paged-title"))]
+#[test]
+fn ordered_color_requires_full_write_to_same_native_object_in_current_batch() {
+    let (target, sub) = small_color_target();
+    let (other, _) = small_color_target();
     let mut plan = ResourcePlan::default();
     plan.ordered_color_backing.extend([ResourcePlan::key(&target), ResourcePlan::key(&other)]);
     assert!(!plan.has_ordered_color_write(&target));
@@ -545,6 +555,37 @@ fn ordered_color_requires_full_write_to_same_native_object_in_current_batch() {
     assert!(after.color_is_discarded(&target, sub) && !after.authoritative(&target));
     plan.record_full_color_write(&target, sub).unwrap();
     assert!(plan.authoritative(&target) && plan.has_ordered_color_write(&target));
+}
+
+#[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+#[test]
+fn color_provenance_separates_objects_and_submitted_from_completed() {
+    let (prior, sub) = small_color_target();
+    let (mut target, _) = small_color_target();
+    // 模拟同键换代；不修改全局资源表，也不把模拟版本提交给 GPU。
+    Arc::get_mut(&mut target).unwrap().diagnostic_predecessor = Some(Arc::downgrade(&prior));
+    let mut plan = ResourcePlan::default();
+    plan.record_full_color_write(&prior, sub).unwrap();
+    assert_eq!(plan.color_version_trace(&prior, None),
+        ColorVersionTrace { completed: None, submitted: None });
+    let version = plan.version(&prior).unwrap();
+    let mut tail = SubmittedTail::default();
+    plan.advance_submitted_tail(&mut tail);
+    let later = ResourcePlan::after(&tail);
+    assert_eq!(later.color_version_trace(&prior, None),
+        ColorVersionTrace { completed: None, submitted: Some((Representation::NativeGpu, 1)) });
+    let complete = version.complete(Fence(7), Fence(7)).unwrap();
+    prior.native_authority.lock().unwrap().insert(None, complete);
+    assert_eq!(ResourcePlan::default().color_version_trace(&prior, None),
+        ColorVersionTrace { completed: Some((Representation::NativeGpu, 1, 7)), submitted: None });
+    assert_eq!(later.color_version_trace(&prior, Some(0)),
+        ColorVersionTrace { completed: None, submitted: None });
+    assert!(!later.authoritative(&target));
+    assert_eq!(later.color_version_trace(&target, None),
+        ColorVersionTrace { completed: None, submitted: None });
+    drop(plan);
+    drop(prior);
+    assert!(target.diagnostic_predecessor.as_ref().unwrap().upgrade().is_none());
 }
 
 /// Include possible compatible ranges before page admission. An earlier
