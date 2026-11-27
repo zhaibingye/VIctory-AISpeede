@@ -9,6 +9,10 @@ use victory_memory::{
 };
 
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+mod color_bytes;
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+pub(crate) use color_bytes::trace_color_backing_bytes;
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 mod dstorage;
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 pub use dstorage::{DstorageVaWrite, note_dstorage_section_write, probe_dstorage_va_write};

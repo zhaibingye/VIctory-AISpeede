@@ -652,6 +652,49 @@ fn byte_write_history_keeps_repeated_pages_and_reports_incomplete_retention() {
     assert_eq!(history.compare(&target), (1, [1, 0, 1, 0, 1]));
 }
 
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+const PREFIX_OP_LIMIT: usize = 32;
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+fn prefix_operations(prefix: &[PageOp]) -> impl Iterator<Item = (usize, &'static str)> + '_ {
+    use crate::page_resource::PageBarrier;
+    let start = prefix.len().saturating_sub(PREFIX_OP_LIMIT);
+    prefix[start..].iter().enumerate().map(move |(offset, op)| {
+        // 只读枚举种类；区分同步、丢弃和显式复制/清除等命令，不解释绑定或载荷。
+        let kind = match op {
+            PageOp::Barrier(barrier) => match barrier.as_ref() {
+                PageBarrier::Texture(..) => "texture transition",
+                PageBarrier::NativeUav(_) => "native UAV barrier",
+                PageBarrier::Uav => "global UAV barrier",
+                PageBarrier::DiscardColor(..) => "color discard",
+                PageBarrier::EnhancedUav { .. } => "enhanced global UAV barrier",
+            },
+            _ => op.operation(),
+        };
+        (start + offset, kind)
+    })
+}
+
+#[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+#[test]
+fn prefix_operations_keep_order_and_bound_output() {
+    use std::sync::Arc;
+    let copy = PageOp::Copy(GuestCopy::new(9, 4, 5).unwrap());
+    let barrier = PageOp::Barrier(Arc::new(crate::page_resource::PageBarrier::EnhancedUav {
+        counts_by_kind: [0; 4], headers_skipped: 0, payload_coverage: [0; 4], textures: Vec::new(),
+    }));
+    let note = PageOp::DiscardNote { copy: std::sync::Weak::new(), whole: false };
+    assert_eq!(prefix_operations(&[]).count(), 0);
+    assert_eq!(prefix_operations(&[note, copy.clone(), barrier.clone()]).collect::<Vec<_>>(),
+        [(0, "discard note"), (1, "buffer copy"), (2, "enhanced global UAV barrier")]);
+    let mut prefix = vec![copy; PREFIX_OP_LIMIT + 1];
+    prefix.push(barrier);
+    let recent: Vec<_> = prefix_operations(&prefix).collect();
+    assert_eq!(recent.len(), PREFIX_OP_LIMIT);
+    assert_eq!(recent[0], (2, "buffer copy"));
+    assert_eq!(recent[PREFIX_OP_LIMIT - 1], (PREFIX_OP_LIMIT + 1, "enhanced global UAV barrier"));
+}
+
 /// 只在颜色目标缺少内容的失败路径上回查，不把候选写入当作权威。
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 fn trace_missing_color(
@@ -667,7 +710,8 @@ fn trace_missing_color(
     let Some((target, bound_subresource)) = draw.color_binding(slot) else { return; };
     if subresource != bound_subresource { return; }
     draw.trace_color_coverage_inputs(slot);
-    if let Some(capture) = crate::page_resource::ResourcePlan::trace_color_native_history(target, subresource) {
+    let capture = crate::page_resource::ResourcePlan::trace_color_native_history(target, subresource);
+    if let Some(capture) = &capture {
         // ClosedDraw::encode 的 ColorTarget 缺失检查不登记来宾覆盖，且早于
         // ShaderBindings::prepare 的 UAV dirty 登记。两份计划只来自成功编码的前缀。
         let counts = compare_prefix_byte_writes(&capture.pages, dirty, plan);
@@ -772,6 +816,14 @@ fn trace_missing_color(
     );
     if let Some(copies) = copies {
         copies.trace(index, slot, subresource);
+        let steps: Vec<_> = prefix_operations(&ops[..index]).collect();
+        tracing::info!(
+            index, slot, subresource, omitted_prefix_steps = index - steps.len(), op_index_and_kind = ?steps,
+            "[VNME_PREFIX_OP_INVENTORY] 颜色目标缺少内容：已编码但未提交的 PageOp 前缀（零基索引，含记录/保留项；种类不证明目标读写或旧像素）"
+        );
+    }
+    if let Some(capture) = capture {
+        crate::title_backing::trace_color_backing_bytes(index, slot, subresource, target.candidate_guest_span, &capture.pages);
     }
 }
 

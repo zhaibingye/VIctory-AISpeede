@@ -153,6 +153,10 @@ victory config
 已编码但未提交的复制和字节写入计划。共页、相同 VA 和一次写满页都不证明有效纹理像素；
 未命中也不排除观察范围以外的写入。
 
+另设 `VICTORY_VNME_PROBE_COLOR_BYTES=1` 可在首个相关拒绝处只读检查 CPU 后备：同时需要
+上述 inventory 开关，整段限 512 页，超限不采。`[VNME_COLOR_BACKING_BYTES]` 只报告可读、
+含非零和未观测的页数，不保存内容、不读取显存。即使所有页都可读，也不表示 CPU 持有最新像素。
+
 ### Windows 着色器验证
 
 着色器测试使用 `dxil.dll` 验证 Shader Model 6.6。较旧的 Windows SDK
