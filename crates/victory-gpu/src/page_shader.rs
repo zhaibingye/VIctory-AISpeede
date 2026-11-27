@@ -58,6 +58,7 @@ pub(crate) enum DescriptorSlotReason {
         groups_and_threads: Option<([u32; 3], [u32; 3])>,
     },
     UnsupportedAccess,
+    StructuredSrvDescriptorBudget,
     OutsideRangeOrConflictingView,
 }
 
@@ -537,7 +538,8 @@ impl ShaderBindings {
                                 ClosedView::Raw(BoundedBufferView::new(start, end, false)
                                     .ok_or(buffer)?)
                             }
-                            StaticViewAccess::StructuredSrv { stride, .. } => {
+                            StaticViewAccess::StructuredSrv { stride, .. }
+                            | StaticViewAccess::StructuredSrvDescriptor { stride } => {
                                 let (start, end) = crate::descriptor::host::paged_structured_srv_range(&actual, stride)
                                     .ok_or(buffer)?;
                                 ClosedView::Structured(BoundedBufferView::new(start, end, false).ok_or(buffer)?, stride)
@@ -581,6 +583,12 @@ impl ShaderBindings {
                             if *actual == stride && !view.unordered() =>
                         {
                             view.allow_access(0, elements.checked_mul(stride).ok_or(reject)?, false).ok_or(reject)?;
+                        }
+                        (Some(ClosedView::Structured(view, actual)), StaticViewAccess::StructuredSrvDescriptor { stride })
+                            if *actual == stride && !view.unordered() =>
+                        {
+                            view.allow_complete_structured_read(stride)
+                                .ok_or(reason(DescriptorSlotReason::StructuredSrvDescriptorBudget))?;
                         }
                         (Some(ClosedView::Structured(view, actual)), StaticViewAccess::StructuredUav { stride, elements, write })
                             if *actual == stride && view.unordered() =>

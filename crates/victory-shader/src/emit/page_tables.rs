@@ -32,6 +32,8 @@ pub enum StaticViewAccess {
     ConstantTable { offset: u32, bytes: u32 },
     RootSrv { bytes: u32 },
     StructuredSrv { stride: u32, elements: u32 },
+    /// 元素索引由完整的只读结构化描述符限制，绑定时不可裁剪视图。
+    StructuredSrvDescriptor { stride: u32 },
     StructuredUav { stride: u32, elements: u32, write: bool },
 }
 
@@ -380,7 +382,7 @@ enum AccessProof {
     Native(StaticViewAccess),
     ScalarBufferRead { offset: u32, bytes: u32 },
     TypedRead { immediate: u32, vector_hi: u32, footprint: super::lower::TypedLoadFootprint },
-    StructuredAccess { elements: u32, last_byte: u32, write: bool },
+    StructuredAccess { elements: Option<u32>, last_byte: u32, write: bool },
 }
 
 fn scalar_buffer_read_window(name: &str, offset: i32, scalar_hi: u32) -> Option<(u32, u32)> {
@@ -465,11 +467,13 @@ fn bounded_structured_access(
     if !offset.is_multiple_of(4) || !matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128)) {
         return None;
     }
-    let max_index = bounds.unsigned_upper_bound(inst.read(crate::ir::Reg::V(*reg))?)?;
+    let index = inst.read(Reg::V(*reg))?;
+    let elements = bounds.unsigned_upper_bound(index)
+        .and_then(|max_index| max_index.checked_add(1));
+    // 不为动态写入推测范围。只读候选仍必须通过描述符类型和字段范围证明。
+    if write && elements.is_none() { return None; }
     Some(AccessProof::StructuredAccess {
-        elements: max_index.checked_add(1)?,
-        last_byte: u32::from(*offset).checked_add(bytes)?,
-        write,
+        elements, last_byte: u32::from(*offset).checked_add(bytes)?, write,
     })
 }
 
@@ -557,11 +561,17 @@ fn proven_slot(
         AccessProof::StructuredAccess { elements, last_byte, write }
             if unique() && used.dwords == 4
                 && (4..=2048).contains(&used.stride) && used.stride.is_multiple_of(4)
-                && last_byte <= used.stride && elements.checked_mul(used.stride)? <= 65536 =>
+                && last_byte <= used.stride =>
         {
-            match used.kind {
-                ResourceType::Srv if !write => StaticViewAccess::StructuredSrv { stride: used.stride, elements },
-                ResourceType::Uav if native.stage == HwStage::Cs =>
+            match (used.kind, elements) {
+                (ResourceType::Srv, Some(elements)) if !write && elements.checked_mul(used.stride)? <= 65536 =>
+                    StaticViewAccess::StructuredSrv { stride: used.stride, elements },
+                // 只开放已证明内层字段不会跨界的顶点只读访问。堆中的完整 SRV
+                // 使用真实元素数做越界检查，与不带长度的根描述符不同。
+                (ResourceType::Srv, None) if !write && native.stage == HwStage::Vs =>
+                    StaticViewAccess::StructuredSrvDescriptor { stride: used.stride },
+                (ResourceType::Uav, Some(elements)) if native.stage == HwStage::Cs
+                    && elements.checked_mul(used.stride)? <= 65536 =>
                     StaticViewAccess::StructuredUav { stride: used.stride, elements, write },
                 _ => return None,
             }

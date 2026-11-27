@@ -495,6 +495,18 @@ impl BoundedBufferView {
         Some(())
     }
 
+    /// 保留原描述符的元素上限。超过单个闭合视图的预算时拒绝，不裁剪。
+    pub(crate) fn allow_complete_structured_read(&mut self, stride: u32) -> Option<()> {
+        const MAX_VIEW_BYTES: u64 = 64 * 1024;
+        let bytes = self.limit.checked_sub(self.start)?;
+        if self.unordered || stride == 0 || bytes > MAX_VIEW_BYTES
+            || !bytes.is_multiple_of(u64::from(stride))
+        {
+            return None;
+        }
+        self.allow_access(0, u32::try_from(bytes).ok()?, false)
+    }
+
     pub(crate) fn range(&self) -> (u64, u64) { (self.start, self.end) }
 
     pub(crate) fn prepare_uav(
@@ -535,4 +547,19 @@ impl BoundedBufferView {
             )
         })
     }
+}
+
+
+#[cfg(test)]
+#[test]
+fn full_structured_read_preserves_exact_descriptor_size_and_refuses_truncation() {
+    let mut view = BoundedBufferView::new(0x10004, 0x10004 + 16 * 11, false).unwrap();
+    view.allow_access(0, 16, false).unwrap();
+    assert_eq!(view.allow_complete_structured_read(16), Some(()));
+    assert_eq!(view.range(), (0x10004, 0x10004 + 16 * 11));
+    let mut large = BoundedBufferView::new(0x10000, 0x20010, false).unwrap();
+    assert_eq!(large.allow_complete_structured_read(16), None);
+    assert_eq!(large.range(), (0x10000, 0x10000));
+    let mut unordered = BoundedBufferView::new(0x10000, 0x10010, true).unwrap();
+    assert_eq!(unordered.allow_complete_structured_read(16), None);
 }
