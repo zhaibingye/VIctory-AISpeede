@@ -6,6 +6,39 @@ use crate::{host::HostList, page_shader::UnloweredShader};
 // 每个列表及整批分别限额；重复命令只累计次数。
 const LIMIT: usize = 96;
 
+/// 只描述此前已经录入的写入候选，不能用作实际资源准入证明。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EarlierTextureWrite {
+    SameNativeObject,
+    OverlappingVirtualRange,
+    NoIdentifiedWriter,
+}
+
+pub(crate) fn earlier_texture_write(
+    source: Option<(u64, u64)>,
+    writers: impl Iterator<Item = (bool, Option<(u64, u64)>)>,
+) -> EarlierTextureWrite {
+    for (same_object, span) in writers {
+        if same_object {
+            return EarlierTextureWrite::SameNativeObject;
+        }
+        if let (Some((a, b)), Some((c, d))) = (source, span) && a < d && c < b {
+            return EarlierTextureWrite::OverlappingVirtualRange;
+        }
+    }
+    EarlierTextureWrite::NoIdentifiedWriter
+}
+
+#[test]
+fn earlier_texture_write_distinguishes_identity_overlap_and_adjacent_ranges() {
+    use EarlierTextureWrite::*;
+    let source = Some((4, 9));
+    assert_eq!(earlier_texture_write(source, [(false, Some((9, 14))), (true, None)].into_iter()), SameNativeObject);
+    assert_eq!(earlier_texture_write(source, [(false, Some((8, 14))), (true, None)].into_iter()), OverlappingVirtualRange);
+    assert_eq!(earlier_texture_write(source, [(false, Some((0, 4))), (false, None)].into_iter()), NoIdentifiedWriter);
+    assert_eq!(earlier_texture_write(None, [(true, None)].into_iter()), SameNativeObject);
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Observation {
     Command(&'static str),
@@ -15,6 +48,7 @@ pub(crate) enum Observation {
         colors: Vec<i32>,
         depth: Option<i32>,
         rejection: Option<UnloweredShader>,
+        earlier_texture_write: Option<EarlierTextureWrite>,
     },
     Rejection(String),
 }
@@ -101,6 +135,7 @@ fn merges_repeats_without_crowding_out_rejections() {
             colors: Vec::new(),
             depth: None,
             rejection: None,
+            earlier_texture_write: None,
         });
     }
     later.observe(Observation::Rejection("NotClosed".into()));

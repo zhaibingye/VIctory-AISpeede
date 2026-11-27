@@ -258,7 +258,7 @@ impl PageOp {
         out.extend(target);
     }
 
-    fn writes_native<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
+    pub(crate) fn writes_native<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
         match self {
             Self::CopyTexture(copy) => out.push(copy.target()),
             Self::ResolveTexture(resolve) => out.push(resolve.target()),

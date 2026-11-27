@@ -434,8 +434,23 @@ impl State {
         } else {
             (Vec::new(), None)
         };
+        // 失败的资源可能刚由同一列表中的较早操作写入，尚未到提交或 Fence。
+        // 只记归类，不记指针、地址或资源内容。
+        let earlier_texture_write = rejection.and_then(|reason| {
+            use crate::page_shader::{DescriptorSlotReason::UnsupportedTexture, UnloweredShader};
+            let UnloweredShader::DescriptorSlot {
+                root, index, reason: UnsupportedTexture {
+                    phase: crate::descriptor::TextureSrvReject::NativeOrBytes { .. }, ..
+                }, ..
+            } = reason else { return None; };
+            let crate::descriptor::View::Shader(resource, _) = self.page_view(!graphics, root, index)? else {
+                return None;
+            };
+            let copy = crate::resource::host_copy(resource as This)?;
+            Some(list.earlier_texture_write(&copy))
+        });
         list.record_inventory(crate::page_inventory::Observation::Pipeline {
-            command, shaders, colors, depth, rejection,
+            command, shaders, colors, depth, rejection, earlier_texture_write,
         });
     }
 

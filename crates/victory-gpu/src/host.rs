@@ -1783,6 +1783,24 @@ impl HostList {
         self.page_inventory.lock().unwrap_or_else(|e| e.into_inner()).observe(entry);
     }
 
+    /// 只比较同一录制列表中之前已转换的操作，不读取游戏内存或执行命令。
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn earlier_texture_write(&self, copy: &crate::resource::HostTexture) -> crate::page_inventory::EarlierTextureWrite {
+        let deferred = self.deferred();
+        let mut targets = Vec::new();
+        use crate::page_inventory::EarlierTextureWrite;
+        for step in deferred.copies.iter().rev() {
+            let Step::Page(op) = step else { continue; };
+            targets.clear();
+            op.writes_native(&mut targets);
+            let found = crate::page_inventory::earlier_texture_write(copy.candidate_guest_span, targets.iter().map(|target| {
+                (std::ptr::eq(copy, target.as_ref()), target.candidate_guest_span)
+            }));
+            if found != EarlierTextureWrite::NoIdentifiedWriter { return found; }
+        }
+        EarlierTextureWrite::NoIdentifiedWriter
+    }
+
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     pub(crate) fn summarize_inventory(&self, result: &mut crate::page_inventory::Inventory) {
         result.merge(&self.page_inventory.lock().unwrap_or_else(|e| e.into_inner()));
