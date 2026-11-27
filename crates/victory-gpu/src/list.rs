@@ -1678,8 +1678,9 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         if crate::page_inventory::enabled() && let Some(list) = host_list(this) {
             // 安全：来宾方法签名约定 count 个 16 字节组头；只读有界组头的数值字段。
             let (counts_by_kind, headers_skipped) = unsafe { enhanced_group_counts(count, _groups) };
+            let textures = enhanced_texture_candidates(count, _groups);
             list.record_page_barrier(crate::page_resource::PageBarrier::EnhancedUav {
-                counts_by_kind, headers_skipped,
+                counts_by_kind, headers_skipped, textures,
             });
             return;
         }
@@ -1704,6 +1705,76 @@ unsafe fn enhanced_group_counts(count: u32, groups: *const u8) -> ([u64; 4], u32
         counts[kind.min(3) as usize] += u64::from(entries);
     }
     (counts, count - inspected)
+}
+
+/// 桌面 SDK 形状下的候选字段。对象经登记核验，字段本身仍不是来宾 ABI 证明。
+#[cfg(any(test, all(windows, feature = "paged-title", feature = "diagnostics")))]
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CandidateTextureBarrier {
+    pub(crate) before: u32,
+    pub(crate) after: u32,
+    pub(crate) range: [u32; 6],
+    pub(crate) flags: u32,
+}
+
+#[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+const _: () = {
+    use windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_BARRIER as Desktop;
+    assert!(std::mem::size_of::<Desktop>() == 64);
+    assert!(offset_of!(Desktop, LayoutBefore) == 16 && offset_of!(Desktop, LayoutAfter) == 20);
+    assert!(offset_of!(Desktop, pResource) == 24 && offset_of!(Desktop, Subresources) == 32);
+    assert!(offset_of!(Desktop, Flags) == 56);
+};
+
+#[cfg(any(test, all(windows, feature = "paged-title", feature = "diagnostics")))]
+fn desktop_texture_candidate(bytes: &[u8; 64]) -> (usize, CandidateTextureBarrier) {
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let object = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+    (object, CandidateTextureBarrier {
+        before: word(16), after: word(20), range: std::array::from_fn(|i| word(32 + 4 * i)), flags: word(56),
+    })
+}
+
+#[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+fn enhanced_texture_candidates(count: u32, groups: *const u8)
+    -> Vec<(std::sync::Weak<crate::resource::HostTexture>, CandidateTextureBarrier)>
+{
+    let mut found = Vec::new();
+    if groups.is_null() { return found; }
+    let mut remaining = 64u32;
+    for i in 0..count.min(64) {
+        let mut header = [0u8; 16];
+        if !crate::host::read_into(groups.wrapping_add(i as usize * 16), &mut header) { continue; }
+        if u32::from_le_bytes(header[..4].try_into().unwrap()) != 1 { continue; }
+        let entries = u32::from_le_bytes(header[4..8].try_into().unwrap()).min(remaining);
+        let payload = u64::from_le_bytes(header[8..].try_into().unwrap()) as usize;
+        remaining -= entries;
+        for j in 0..entries {
+            let Some(address) = payload.checked_add(j as usize * 64) else { break; };
+            let mut bytes = [0u8; 64];
+            // 内核检查可读性，不将候选指针作为 Rust 引用。
+            if payload == 0 || !crate::host::read_into(address as *const u8, &mut bytes) { break; }
+            let (object, fields) = desktop_texture_candidate(&bytes);
+            if let Some(identity) = crate::resource::known_texture_identity(object) {
+                found.push((identity, fields));
+            }
+        }
+        if remaining == 0 { break; }
+    }
+    found
+}
+
+#[test]
+fn desktop_texture_candidate_keeps_layout_range_and_flags_separate() {
+    let mut bytes = [0u8; 64];
+    for (i, offset) in [16, 20, 32, 36, 40, 44, 48, 52, 56].into_iter().enumerate() {
+        bytes[offset..offset + 4].copy_from_slice(&(i as u32 + 10).to_le_bytes());
+    }
+    bytes[24..32].copy_from_slice(&0x1234u64.to_le_bytes());
+    assert_eq!(desktop_texture_candidate(&bytes), (0x1234, CandidateTextureBarrier {
+        before: 10, after: 11, range: [12, 13, 14, 15, 16, 17], flags: 18,
+    }));
 }
 
 #[test]

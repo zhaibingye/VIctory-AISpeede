@@ -492,7 +492,10 @@ pub(crate) enum PageBarrier {
     NativeUav(Arc<HostTexture>),
     Uav,
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-    EnhancedUav { counts_by_kind: [u64; 4], headers_skipped: u32 },
+    EnhancedUav {
+        counts_by_kind: [u64; 4], headers_skipped: u32,
+        textures: Vec<(std::sync::Weak<HostTexture>, crate::list::CandidateTextureBarrier)>,
+    },
 }
 
 impl PageBarrier {

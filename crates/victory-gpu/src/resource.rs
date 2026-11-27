@@ -2129,6 +2129,11 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if crate::page_inventory::enabled() && let Some(host) = &resource.host {
+            BARRIER_TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
+                .insert(at, std::sync::Arc::downgrade(host));
+        }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -2141,6 +2146,16 @@ fn hand_out_resource(
 #[cfg(windows)]
 static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// 只接受已登记的纹理对象；不会解引用由猜测布局得到的未知地址。
+#[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+static BARRIER_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<usize, std::sync::Weak<HostTexture>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
+pub(crate) fn known_texture_identity(object: usize) -> Option<std::sync::Weak<HostTexture>> {
+    BARRIER_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).get(&object).cloned()
+}
 
 /// For a texture made for a placed view (`texture_at`): a title texture
 /// the GPU writes (render target, depth or unordered access) at the same
@@ -2177,6 +2192,11 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if self.host.is_some() && crate::page_inventory::enabled() {
+            BARRIER_TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
+                .remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+        }
         #[cfg(feature = "diagnostics")]
         if self
             .host

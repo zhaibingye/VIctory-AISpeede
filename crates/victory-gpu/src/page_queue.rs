@@ -307,14 +307,23 @@ fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError) {
     let mut same_discard_count = 0usize;
     let mut enhanced_counts_by_kind = [0u64; 4];
     let mut enhanced_headers_skipped = 0u64;
+    let mut enhanced_matched_objects = 0usize;
+    let mut enhanced_same_target_recent = std::collections::VecDeque::with_capacity(8);
     for (prior_index, op) in ops[..index].iter().enumerate() {
         if let PageOp::Barrier(barrier) = op
-            && let crate::page_resource::PageBarrier::EnhancedUav { counts_by_kind, headers_skipped } = barrier.as_ref()
+            && let crate::page_resource::PageBarrier::EnhancedUav { counts_by_kind, headers_skipped, textures } = barrier.as_ref()
         {
             for (total, count) in enhanced_counts_by_kind.iter_mut().zip(counts_by_kind) {
                 *total = total.saturating_add(*count);
             }
             enhanced_headers_skipped = enhanced_headers_skipped.saturating_add(u64::from(*headers_skipped));
+            enhanced_matched_objects += textures.len();
+            for (copy, fields) in textures {
+                if std::ptr::eq(copy.as_ptr(), Arc::as_ptr(target)) {
+                    if enhanced_same_target_recent.len() == 8 { enhanced_same_target_recent.pop_front(); }
+                    enhanced_same_target_recent.push_back((prior_index, *fields));
+                }
+            }
         }
         if let PageOp::DiscardNote { copy, whole } = op {
             if std::ptr::eq(copy.as_ptr(), Arc::as_ptr(target)) {
@@ -358,6 +367,7 @@ fn trace_missing_color(ops: &[PageOp], index: usize, error: &BatchError) {
         prior_virtual_overlap_ops = virtual_overlap_ops, prior_unknown_span_ops = unknown_span_ops,
         same_discard_count, last_ignored_discard_index_and_whole = ?last_discard,
         enhanced_counts_by_kind = ?enhanced_counts_by_kind, enhanced_headers_skipped,
+        enhanced_matched_objects, enhanced_same_target_recent = ?enhanced_same_target_recent,
         known_committed_linear = target.exact_committed_bytes().is_some(),
         known_compatible_source = target.compatible_texture_source().is_some(),
         native_generation_current = target.current_native_generation(),
