@@ -734,6 +734,10 @@ fn trace_missing_color(
     let mut writers = Vec::new();
     let mut virtual_overlap_ops = 0usize;
     let mut unknown_span_ops = 0usize;
+    // 只在失败点核对少数前序原生写入者的当前映射，不重写其录制时的身份。
+    let mut writer_probe_budget = 8192u64;
+    let mut observed_writers = 0usize;
+    let mut omitted_writers = 0usize;
     let mut last_discard = None;
     let mut same_discard_count = 0usize;
     let mut enhanced_counts_by_kind = [0u64; 4];
@@ -786,6 +790,31 @@ fn trace_missing_color(
         let mut overlap = false;
         let mut unknown = false;
         for writer in &writers {
+            if let Some(target_capture) = &capture {
+                if observed_writers < 16 {
+                    observed_writers += 1;
+                    let mut private_heap = false;
+                    let mut full_mapping = false;
+                    let mut shared_pages = None;
+                    if let Some((a, b)) = writer.candidate_guest_span {
+                        private_heap = crate::title_backing::is_private_heap_span(a as usize, b as usize);
+                        if !private_heap && let Some(addresses) = inventory_page_addresses((a, b), &mut writer_probe_budget) {
+                            let mut backing = SubmissionBacking::default();
+                            backing.include(a as usize, b as usize);
+                            backing.flush();
+                            let (ids, missing) = inventory_page_ids(backing.pins(), addresses);
+                            full_mapping = missing == 0;
+                            shared_pages = Some(ids.intersection(&target_capture.pages).count());
+                        }
+                    }
+                    // SAFETY: the command retains the actual writer's D3D12 resource.
+                    let d = unsafe { writer.texture.GetDesc() };
+                    tracing::info!(index, prior_index, operation = op.operation(), same_object = Arc::ptr_eq(writer, target),
+                        format = d.Format.0, width = d.Width, height = d.Height, mip_levels = d.MipLevels,
+                        known_range = writer.candidate_guest_span.is_some(), private_heap, full_mapping, ?shared_pages,
+                        "[VNME_PREFIX_NATIVE_WRITER] 未提交前缀的实际写入候选：失败时的物理范围交集，不证明此前映射、内容覆盖或旧色");
+                } else { omitted_writers += 1; }
+            }
             if Arc::ptr_eq(writer, target) {
                 same = true;
             } else if let (Some((a, b)), Some((c, d))) = (writer.candidate_guest_span, target.candidate_guest_span) {
@@ -803,7 +832,8 @@ fn trace_missing_color(
         }
     }
     tracing::info!(
-        index, slot, subresource, prior_same_object_ops = mentions, prior_same_object_recent = ?recent,
+        index, slot, subresource, observed_writers, omitted_writers,
+        prior_same_object_ops = mentions, prior_same_object_recent = ?recent,
         prior_virtual_overlap_ops = virtual_overlap_ops, prior_unknown_span_ops = unknown_span_ops,
         same_discard_count, last_ignored_discard_index_and_whole = ?last_discard,
         enhanced_counts_by_kind = ?enhanced_counts_by_kind, enhanced_headers_skipped,
