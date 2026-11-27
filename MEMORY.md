@@ -17,6 +17,9 @@
 
 - `20d0ad1` 自行等开场帧计数稳定并确认游戏窗口在前台后发一次 Enter，复现同一首错。DirectStorage 的 9,894 次裸地址写入没有候选 VA 重叠，保留的 1,655 个 section 候选页也无命中；360 次采样不完整，不能排除盲区。未提交前缀声明 10 个脏页，也没有命中目标。下一步优先追目标创建、XMem 绑定/重绑与首次 RTV/SRV 用途，查清是否漏掉应有的可证明初始化；不凭未匹配推断为零初始化。
 
+- `df5dcfd` 的 `[VNME_RTV_ORIGIN]` 确认为地址式创建，初始增强布局码 6，优化清除值存在，宿主无已知前代；`[VNME_XMEM_SECTION_HISTORY]` 的 510 个活跃页均匹配同一新绑定的 section，无相关解绑记录。`0x470` 在失败 draw 前同录制调用过一次，但 ABI 和语义未证实，不读取未知参数。桌面 D3D12 的布局枚举只供对照，不能把优化清除值解释为写像素。
+- 无前台时可在诊断构建使用连续重叠的 `VICTORY_KEYS` 定时区间合成一次 A 长按；本地在输入轮询开始后 65–66.1 秒成功触发同一首错。未发出输入或仅停在开始画面不算实机通过。
+
 ## 最小验证
 
 - 使用仓库锁定的 Rust、Windows x64 MSVC、`--locked --features paged-title,diagnostics,blake3/pure`。新增诊断的定向测试过滤 `page_resource::native_history_tests`、`page_queue::copy_prefix_`；内容顺序的实像素测试为 `page_draw::paged_title_partial_color_clear_observes_submission_order`，仅相关改动时重跑。

@@ -445,11 +445,15 @@ pub(crate) struct ClosedDraw {
     pipeline: ID3D12PipelineState,
     root: ID3D12RootSignature,
     targets: Vec<ColorTarget>,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    diagnostic_color_blend: Option<Arc<D3D12_BLEND_DESC>>,
     color_writes: u8,
     #[cfg(feature = "paged-title")]
     color_destination_reads: u8,
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     ignored_state_470_before_draw: u64,
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    ignored_state_470_prefix: Option<crate::host::State470Prefix>,
     depth: Option<DepthTarget>,
     depth_tests: u32,
     depth_writes: u32,
@@ -495,8 +499,9 @@ impl ClosedDraw {
     }
 
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-    pub(crate) fn with_ignored_state_470(mut self, calls: u64) -> Self {
+    pub(crate) fn with_ignored_state_470(mut self, calls: u64, prefix: Option<crate::host::State470Prefix>) -> Self {
         self.ignored_state_470_before_draw = calls;
+        self.ignored_state_470_prefix = prefix;
         self
     }
 
@@ -520,14 +525,31 @@ impl ClosedDraw {
             DrawCall::Indexed { indices, .. } => ("索引", Some(indices)),
             DrawCall::Indirect(_) => ("间接", None),
         };
+        // 保留旧日志字段名；它是保守门槛，不是混合方程判断。
+        let conservative_destination_read_gate = self.color_destination_reads & (1 << slot) != 0;
         tracing::info!(slot, kind, ?count, topology = self.topology.0, samples = target.samples,
-            reads_old_color = self.color_destination_reads & (1 << slot) != 0,
+            reads_old_color = conservative_destination_read_gate,
             depth_stencil_tests = self.depth_tests, viewport_contains_target_rect, scissor_contains_target_rect,
             "缺少旧内容的绘制状态：范围允许覆盖并不证明实际写满");
         if !crate::page_inventory::enabled() { return; }
         let subresource = target.sub.index;
+        if let Some(blend) = self.diagnostic_color_blend.as_deref()
+            && let Some((desc_slot, desc)) = crate::pipeline::host::effective_color_blend_slot(blend, slot)
+        {
+            tracing::info!(slot, subresource, conservative_destination_read_gate,
+                independent_blend_enable = blend.IndependentBlendEnable.as_bool(), desc_slot,
+                blend_enable = desc.BlendEnable.as_bool(), logic_op_enable = desc.LogicOpEnable.as_bool(),
+                logic_op = desc.LogicOp.0, rgb_src_blend = desc.SrcBlend.0, rgb_dest_blend = desc.DestBlend.0,
+                rgb_blend_op = desc.BlendOp.0, alpha_src_blend = desc.SrcBlendAlpha.0,
+                alpha_dest_blend = desc.DestBlendAlpha.0, alpha_blend_op = desc.BlendOpAlpha.0,
+                write_mask = desc.RenderTargetWriteMask,
+                "[VNME_COLOR_BLEND] 实际宿主 PSO 的有效槽：reads_old_color 只是保守门槛；方程是否依赖目标与绘制是否写满是两回事");
+        } else {
+            tracing::info!(slot, subresource, conservative_destination_read_gate,
+                "[VNME_COLOR_BLEND] 缺少宿主 PSO 描述，不能判断混合方程");
+        }
         tracing::info!(slot, subresource, same_recording_before_draw = self.ignored_state_470_before_draw,
-            process_before_failure = crate::list::ignored_470_calls(),
+            recording_prefix = ?self.ignored_state_470_prefix, process_before_failure = crate::list::ignored_470_calls(),
             "[VNME_IGNORED_STATE_470] 新版命令列表未知插槽：仅记录调用，不解释参数或认作初始化");
         let Some(origin) = target.guest_origin else {
             tracing::info!(slot, subresource, "[VNME_RTV_ORIGIN] 缺少旧内容：未捕获来宾 RTV 创建信息");
@@ -585,11 +607,15 @@ impl ClosedDraw {
     ) -> Self {
         Self {
             pipeline, root, targets: vec![target], color_writes: 1, depth: None, depth_tests: 0, depth_writes: 0, stencil_ref: 0, topology, viewport, scissor, inputs, call,
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            diagnostic_color_blend: None,
             shader: ShaderBindings::default(),
             #[cfg(feature = "paged-title")]
             color_destination_reads: 0,
             #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
             ignored_state_470_before_draw: 0,
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            ignored_state_470_prefix: None,
             blend_factor: [1.0; 4],
             sample: None,
         }
@@ -675,10 +701,14 @@ impl ClosedDraw {
         Ok(Self {
             pipeline: pipeline.pso.clone(), root: pipeline.root.clone(),
             targets, color_writes: pipeline.closed_color_writes,
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            diagnostic_color_blend: pipeline.diagnostic_color_blend.clone(),
             #[cfg(feature = "paged-title")]
             color_destination_reads: pipeline.closed_color_destination_reads,
             #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
             ignored_state_470_before_draw: 0,
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            ignored_state_470_prefix: None,
             depth, depth_tests: pipeline.closed_depth_tests, depth_writes: pipeline.closed_depth_writes,
             stencil_ref, topology, viewport, scissor, inputs, call, shader,
             blend_factor: [1.0; 4],

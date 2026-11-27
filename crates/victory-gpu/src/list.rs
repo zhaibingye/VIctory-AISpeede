@@ -1305,7 +1305,7 @@ pub(crate) fn ignored_470_calls() -> u64 {
     IGNORED_470_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-// 只观察已知插槽的调用；不读取未知参数、不改变命令索引或执行。
+// 只观察已知插槽的调用和宿主已有的录制状态；不读取未知参数，也不插入命令。
 extern "system" fn ignored_newer_state_470(this: This) {
     #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
     if crate::page_inventory::enabled() {
@@ -1490,7 +1490,13 @@ mod state {
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state(this, |list, s| {
+            s.set_targets(list, &handles, depth);
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            if crate::page_inventory::enabled() {
+                list.note_state_470_om_bind(!handles.is_empty(), depth != 0);
+            }
+        });
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -2036,10 +2042,10 @@ const fn newer_slot(slot: usize) -> usize {
 
 /// Methods only newer titles' lists have. 0x490: the enhanced barrier
 /// `(group count, groups)`, with 16-byte groups `(type, count, barriers)`
-/// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 `(u64)`,
+/// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 is
 /// called from Grand Theft Auto VI's state flush with its result unused.
-/// shortcut: 0x470's purpose is unknown; ignored until a title shows it
-/// matters.
+/// The original `(u64)` note was a call-shape inference, not a proven ABI;
+/// keep ignoring the slot's unknown arguments and effects.
 const NEWER_METHODS: [(usize, *const ()); 3] = [
     (142, ignored_newer_state_470 as *const ()),
     (146, barrier_groups as *const ()),

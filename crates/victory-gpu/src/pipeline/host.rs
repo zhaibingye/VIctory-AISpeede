@@ -148,6 +148,15 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     host
 }
 
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+pub(crate) fn effective_color_blend_slot(
+    blend: &D3D12_BLEND_DESC, slot: usize,
+) -> Option<(usize, &D3D12_RENDER_TARGET_BLEND_DESC)> {
+    blend.RenderTarget.get(slot)?;
+    let desc_slot = if blend.IndependentBlendEnable.as_bool() { slot } else { 0 };
+    Some((desc_slot, &blend.RenderTarget[desc_slot]))
+}
+
 /// 位集合只表示能否写入任一颜色通道，不证明覆盖了任何像素。
 fn color_write_slots(blend: &D3D12_BLEND_DESC, count: u32) -> u8 {
     let independent = blend.IndependentBlendEnable.as_bool();
@@ -399,6 +408,9 @@ pub(crate) struct HostPipeline {
     pub(crate) closed_color_writes: u8,
     #[cfg(feature = "paged-title")]
     pub(crate) closed_color_destination_reads: u8,
+    /// The normalized blend description passed to D3D12, only retained for inventory.
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) diagnostic_color_blend: Option<Arc<D3D12_BLEND_DESC>>,
     /// Planes to which this host PSO can write: depth (1), stencil (2).
     pub(crate) closed_depth_writes: u32,
     pub(crate) closed_depth_tests: u32,
@@ -682,6 +694,8 @@ impl HostPipeline {
                 closed_color_writes: 0,
                 #[cfg(feature = "paged-title")]
                 closed_color_destination_reads: 0,
+                #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+                diagnostic_color_blend: None,
                 closed_depth_writes: 0,
                 closed_depth_tests: 0,
                 name: format!("{shaders:?}"),
@@ -724,6 +738,8 @@ impl HostPipeline {
                 closed_color_writes: 0,
                 #[cfg(feature = "paged-title")]
                 closed_color_destination_reads: 0,
+                #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+                diagnostic_color_blend: None,
                 closed_depth_writes: 0,
                 closed_depth_tests: 0,
                 name: format!("{shaders:?}"),
@@ -828,6 +844,9 @@ impl HostPipeline {
             closed_color_writes: color_write_slots(&desc.BlendState, g.targets.NumRenderTargets),
             #[cfg(feature = "paged-title")]
             closed_color_destination_reads: color_destination_reads(&desc.BlendState, g.targets.NumRenderTargets),
+            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+            diagnostic_color_blend: crate::page_inventory::enabled()
+                .then(|| Arc::new(desc.BlendState)),
             closed_depth_tests: u32::from(g.depth.DepthEnable.as_bool())
                 | (u32::from(g.depth.StencilEnable.as_bool()) << 1),
             closed_depth_writes: u32::from(g.depth.DepthEnable.as_bool()
@@ -1069,6 +1088,28 @@ mod tests {
             assert_eq!(host.RenderTarget[2].SrcBlend, D3D12_BLEND_SRC_ALPHA);
             assert_eq!(host.RenderTarget[0].DestBlend, D3D12_BLEND_INV_SRC_ALPHA);
         }
+    }
+
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    #[test]
+    fn diagnostic_color_blend_slot_follows_normalized_pso() {
+        let mut b = blending(false);
+        b.RenderTarget[1].SrcBlend = D3D12_BLEND_ONE;
+        let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM]);
+        let host = host_blend(&b, &t);
+        assert_eq!(effective_color_blend_slot(&host, 1), Some((0, &b.RenderTarget[0])));
+
+        b.IndependentBlendEnable = true.into();
+        let host = host_blend(&b, &t);
+        assert_eq!(effective_color_blend_slot(&host, 1), Some((1, &b.RenderTarget[1])));
+
+        b.IndependentBlendEnable = false.into();
+        t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        let host = host_blend(&b, &t);
+        let (desc_slot, desc) = effective_color_blend_slot(&host, 1).unwrap();
+        assert_eq!(desc_slot, 1);
+        assert!(!desc.BlendEnable.as_bool());
+        assert_eq!(desc.SrcBlend, b.RenderTarget[0].SrcBlend);
     }
 
     #[test]

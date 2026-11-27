@@ -742,8 +742,6 @@ pub(crate) struct HostList {
     page_rejection: std::sync::Mutex<Option<crate::page_slabs::ListRejection>>,
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     page_inventory: Mutex<crate::page_inventory::Inventory>,
-    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-    ignored_state_470: std::sync::atomic::AtomicU64,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -954,6 +952,92 @@ enum Step {
 
 type AfterSubmission = Box<dyn Fn(&crate::title_backing::SubmissionBacking) + Send>;
 
+/// 只表示最近一次已知 OM 设置的调用形状，不证明状态有效或资源身份相同。
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OmBindShape {
+    color_handles_supplied: bool,
+    depth_handle_nonzero: bool,
+}
+
+/// 同一录制内最近一次 0x470 的位置和从调用到采样点的变化。
+/// Deferred 步数不是批内命令索引，也不包含未降低成 Step 的状态设置。
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct State470Prefix {
+    deferred_steps_before_last_call: usize,
+    deferred_steps_after_last_call: usize,
+    lowered_draws_before_last_call: usize,
+    lowered_draws_after_last_call: usize,
+    om_at_last_call: Option<OmBindShape>,
+    om_sets_after_last_call: usize,
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[derive(Default)]
+struct State470Recording {
+    calls: u64,
+    draws: usize,
+    om_sets: usize,
+    om: Option<OmBindShape>,
+    last: Option<State470Call>,
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+struct State470Call {
+    steps: usize,
+    draws: usize,
+    om_sets: usize,
+    om: Option<OmBindShape>,
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+impl State470Recording {
+    fn note_om_bind(&mut self, color_handles_supplied: bool, depth_handle_nonzero: bool) {
+        self.om_sets += 1;
+        self.om = Some(OmBindShape { color_handles_supplied, depth_handle_nonzero });
+    }
+
+    fn note_call(&mut self, steps: usize) {
+        self.calls += 1;
+        self.last = Some(State470Call { steps, draws: self.draws, om_sets: self.om_sets, om: self.om });
+    }
+
+    fn prefix(&self, steps: usize) -> Option<State470Prefix> {
+        let last = self.last.as_ref()?;
+        Some(State470Prefix {
+            deferred_steps_before_last_call: last.steps,
+            deferred_steps_after_last_call: steps.checked_sub(last.steps)?,
+            lowered_draws_before_last_call: last.draws,
+            lowered_draws_after_last_call: self.draws.checked_sub(last.draws)?,
+            om_at_last_call: last.om,
+            om_sets_after_last_call: self.om_sets.checked_sub(last.om_sets)?,
+        })
+    }
+}
+
+#[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+#[test]
+fn state_470_prefix_uses_latest_call_and_om_at_that_call() {
+    let mut state = State470Recording::default();
+    state.note_call(0);
+    state.note_om_bind(true, false);
+    state.draws = 2;
+    state.note_call(5);
+    state.note_om_bind(false, true);
+    state.draws += 1;
+    assert_eq!(state.calls, 2);
+    assert_eq!(state.prefix(8), Some(State470Prefix {
+        deferred_steps_before_last_call: 5,
+        deferred_steps_after_last_call: 3,
+        lowered_draws_before_last_call: 2,
+        lowered_draws_after_last_call: 1,
+        om_at_last_call: Some(OmBindShape { color_handles_supplied: true, depth_handle_nonzero: false }),
+        om_sets_after_last_call: 1,
+    }));
+    assert_eq!(State470Recording::default().prefix(0), None);
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -961,6 +1045,9 @@ type AfterSubmission = Box<dyn Fn(&crate::title_backing::SubmissionBacking) + Se
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    // 与 copies 一起清空，但不进入该流，不占编码命令索引。
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    ignored_state_470: State470Recording,
     uploads: Vec<ID3D12Resource>,
     transient_texture_uploads: Vec<std::sync::Arc<crate::texture::Upload>>,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -1124,8 +1211,6 @@ impl Host {
                 page_rejection: std::sync::Mutex::new(None),
                 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
                 page_inventory: Mutex::default(),
-                #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-                ignored_state_470: std::sync::atomic::AtomicU64::new(0),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -1789,7 +1874,14 @@ impl HostList {
 
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     pub(crate) fn note_ignored_state_470(&self) {
-        self.ignored_state_470.fetch_add(1, Ordering::Relaxed);
+        let mut deferred = self.deferred();
+        let steps = deferred.copies.len();
+        deferred.ignored_state_470.note_call(steps);
+    }
+
+    #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn note_state_470_om_bind(&self, color_handles_supplied: bool, depth_handle_nonzero: bool) {
+        self.deferred().ignored_state_470.note_om_bind(color_handles_supplied, depth_handle_nonzero);
     }
 
     /// 只比较同一录制列表中之前已转换的操作，不读取游戏内存或执行命令。
@@ -1858,6 +1950,18 @@ impl HostList {
             Step::Page(op) => Some(op.clone()),
             _ => None,
         }));
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if crate::page_inventory::enabled() && crate::device::newer() && deferred.ignored_state_470.draws == 19 {
+            // 已观察的 19-draw 对照形状；数量相同不证明是 UI，也不证明执行。
+            static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, Ordering::Relaxed) {
+                let calls = deferred.ignored_state_470.calls;
+                let prefix_at_list_end = deferred.ignored_state_470.prefix(deferred.copies.len());
+                drop(deferred);
+                tracing::info!(calls, ?prefix_at_list_end,
+                    "[VNME_STATE_470_CONTROL] 首个含 19 个已降低绘制的对照列表（未证明是 UI 或执行完成）");
+            }
+        }
         Ok(())
     }
 
@@ -1986,7 +2090,6 @@ impl HostList {
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
         if crate::page_inventory::enabled() {
             self.page_inventory.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            self.ignored_state_470.store(0, Ordering::Relaxed);
         }
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2235,9 +2338,18 @@ impl HostList {
 
     #[allow(dead_code, reason = "closed draws require paged queue submission")]
     pub(crate) fn record_page_draw(&self, draw: crate::page_draw::ClosedDraw) {
+        let mut deferred = self.deferred();
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-        let draw = draw.with_ignored_state_470(self.ignored_state_470.load(Ordering::Relaxed));
-        self.deferred().copies.push(Step::Page(crate::page_queue::PageOp::Draw(std::sync::Arc::new(draw))));
+        let draw = if crate::page_inventory::enabled() {
+            let steps = deferred.copies.len();
+            let recording = &mut deferred.ignored_state_470;
+            let draw = draw.with_ignored_state_470(recording.calls, recording.prefix(steps));
+            recording.draws += 1;
+            draw
+        } else {
+            draw
+        };
+        deferred.copies.push(Step::Page(crate::page_queue::PageOp::Draw(std::sync::Arc::new(draw))));
     }
 
     pub(crate) fn record_page_dispatch(&self, dispatch: crate::page_dispatch::ClosedDispatch) {
