@@ -507,12 +507,12 @@ impl ResourcePlan {
 }
 
 #[cfg(all(test, feature = "paged-title"))]
-fn small_color_target() -> (Arc<HostTexture>, ColorSubresource) {
+fn small_color_texture(mip_levels: u16) -> (Arc<HostTexture>, D3D12_RESOURCE_DESC) {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SAMPLE_DESC};
     let host = crate::host::host().expect("D3D12 宿主");
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-        Width: 4, Height: 4, DepthOrArraySize: 1, MipLevels: 1,
+        Width: 4, Height: 4, DepthOrArraySize: 1, MipLevels: mip_levels,
         Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
@@ -524,7 +524,45 @@ fn small_color_target() -> (Arc<HostTexture>, ColorSubresource) {
         &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
         D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
     ) }.unwrap();
-    (Arc::new(HostTexture::new(texture.unwrap(), 0, Vec::new())), ColorSubresource::capture(desc, 0).unwrap())
+    (Arc::new(HostTexture::new(texture.unwrap(), 0, Vec::new())), desc)
+}
+
+#[cfg(all(test, feature = "paged-title"))]
+fn small_color_target() -> (Arc<HostTexture>, ColorSubresource) {
+    let (target, desc) = small_color_texture(1);
+    (target, ColorSubresource::capture(desc, 0).unwrap())
+}
+
+#[cfg(all(test, feature = "paged-title"))]
+#[test]
+fn scoped_color_write_does_not_initialize_other_mips_or_whole_texture() {
+    use crate::page_slabs::{PageSlabs, PinnedBatch};
+    use victory_memory::physical::BackingPins;
+
+    let (target, desc) = small_color_texture(2);
+    let written = ColorSubresource::from_mip_slice(desc, 1, 0).unwrap();
+    let untouched = ColorSubresource::from_mip_slice(desc, 0, 0).unwrap();
+    let host = crate::host::host().expect("D3D12 宿主");
+    let list = host.new_list().unwrap();
+    let batch = PinnedBatch::from_capture(host, &mut PageSlabs::default(), &BackingPins::default(), &[]).unwrap();
+    let check = |plan: &mut ResourcePlan| {
+        plan.require_color_subresource(host, &list, &batch, &target, written).unwrap();
+        assert!(matches!(plan.require_color_subresource(host, &list, &batch, &target, untouched),
+            Err(BatchError::TargetNotInitialized)));
+        assert!(!plan.authoritative(&target));
+    };
+
+    let mut plan = ResourcePlan::default();
+    assert!(matches!(plan.require_color_subresource(host, &list, &batch, &target, written),
+        Err(BatchError::TargetNotInitialized)));
+    // 只模拟一次 mip 1 的整面写入及其 Fence，不读像素、不提交 GPU 命令。
+    plan.record_full_color_write(&target, written).unwrap();
+    check(&mut plan);
+    let mut tail = SubmittedTail::default();
+    plan.advance_submitted_tail(&mut tail);
+    check(&mut ResourcePlan::after(&tail));
+    plan.commit(Fence(1), Fence(1), &batch);
+    check(&mut ResourcePlan::default());
 }
 
 #[cfg(all(test, feature = "paged-title"))]
