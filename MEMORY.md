@@ -52,6 +52,8 @@
 
 - `copy_gfx10_1pipe_rx_rgba8` 可恢复非均匀块，但只实现公开 GFX10 非 RB+、单 pipe、256 B interleave、`pipeBankXor=0` 的上述主平面。在 `gfx10_rx` 夹具中，`Addr2ComputeSurfaceAddrFromCoord` 对同一幅 259×131 合成图的 texel (63,64) 在 1 和 2 pipe 下分别给出平面内字节偏移 `0x6a8c` 与 `0x6b8c`。布局码、行距、格式和大小不能选出方程。该函数不改变 `Layout::addressable()`，不用于判断游戏配置或旧色权威。
 
+- `gfx10_rx::both_addrlib_metadata_modes_match_the_same_rgba8_main_plane` 独立引用同一 PAL 版本的 `Addr2ComputeSurfaceInfo` 正反对照：`noMetadata=1` 和 `requireMetadata=1` 的 3840×2160 R_X 主平面均为 33,423,360 B（510 页），对齐 64 KiB，mip 偏移 0；后一种能独立计算 163,840 B DCC 空间。该对照不识别实机的压缩模式，不能按这个大小搜寻或拼接游戏元数据。`64dd795` 的 510 页来自 VNME 按已建模平面生成的候选范围；节历史只在该范围内匹配，不测量完整分配。地址式创建保存基础 `ResourceDesc`，但实跑 RTV 摘要没有其原始 flags，合成的 DEFAULT 堆参数不是来宾压缩策略。当前没有可传递的独立平面契约；下一步若走字节路径，须先有能定位到**同一分配**的公开、独立且语义明确的格式/元数据契约，再证明提交时旧色版本；否则只追有证语义的原生生产者。
+
 ## 最小验证
 
 - 使用仓库锁定的 Rust、Windows x64 MSVC、`--locked --features paged-title,diagnostics,blake3/pure`。新增诊断的定向测试过滤 `page_resource::native_history_tests`、`page_queue::copy_prefix_`；内容顺序的实像素测试为 `page_draw::paged_title_partial_color_clear_observes_submission_order`，仅相关改动时重跑。

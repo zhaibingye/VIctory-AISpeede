@@ -19,7 +19,9 @@
 //! 259×131 surface, (63,64) moves from byte offset `0x6a8c` to `0x6b8c` and
 //! the digest becomes `328f2914f21585d8`. Geometry cannot select this profile.
 
-use victory_formats::texture::{Desc, Dimension, Layout, Swizzle, copy_gfx10_1pipe_rx_rgba8};
+use victory_formats::texture::{
+    Desc, Dimension, Layout, Swizzle, Texture, TextureDesc, copy_gfx10_1pipe_rx_rgba8,
+};
 
 const BLOCK_BYTES: usize = 65536;
 const TAG: u32 = 0x7654_3210;
@@ -78,6 +80,44 @@ fn visible_address_tags_match_addrlib_for_every_texel() {
         });
         assert_eq!(hash, digest, "visible {width}x{height} texels");
         assert_eq!(rows[n..], [SENTINEL; 9], "wrote beyond dense rows");
+    }
+}
+
+// Second independent oracle: same PAL revision and one-pipe profile as above.
+// Call Addr2ComputeSurfaceInfo with the same 2D color geometry, bpp=32, one
+// slice/mip/sample/fragment and an output pMipInfo for mip 0. Change only
+// (flags.noMetadata, flags.requireMetadata) from (1, 0) to (0, 1).
+// Both calls succeed and return the same pitch, padded height, surfSize,
+// baseAlign and mip offsets. For the latter case call Addr2ComputeDccInfo with
+// the same colorFlags, shape and swizzle, dccKeyFlags.pipeAligned=1,
+// dataSurfaceSize=surfSize and firstMipIdInTail from the surface output.
+// The separate DCC result is 4096 bytes at 4096-byte alignment for 259x131,
+// and 163840 bytes at 4096-byte alignment for 3840x2160. This supports both
+// contracts for the same main-plane projection; it does not identify which
+// one a title uses, where its metadata resides, or how it was initialized.
+#[test]
+fn both_addrlib_metadata_modes_match_the_same_rgba8_main_plane() {
+    for (width, height, pitch, rows, bytes) in [
+        (259, 131, 384, 256, 393_216),
+        (3840, 2160, 3840, 2176, 33_423_360),
+    ] {
+        // The same constructor is used by both the GPU and the HLE XG projection.
+        let texture = Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d,
+            width,
+            height,
+            depth_or_array: 1,
+            mips: 1,
+            format: 29, // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_R_X,
+        })
+        .unwrap();
+        let plane = &texture.planes[0];
+        let mip = &plane.layout.mips[0];
+        assert_eq!((mip.pitch, mip.rows), (pitch, rows));
+        assert_eq!((plane.layout.size, plane.layout.alignment), (bytes, 65_536));
+        assert_eq!((plane.offset, mip.offset), (0, 0));
     }
 }
 

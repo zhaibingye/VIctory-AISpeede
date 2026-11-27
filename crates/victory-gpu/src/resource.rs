@@ -132,9 +132,10 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     })
 }
 
-/// A texture's layout in console memory, as the console's layout library
-/// gives it (`victory-hle`'s `xg` serves the same): the description's
-/// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
+/// Models the console texture's data/depth/stencil planes, as HLE XG does.
+/// The layout field is `0x100 | swizzle mode`, 1 linear, or 0 for the
+/// model's default. Matching the XG projection does not establish whether
+/// an actual allocation uses compression or fast-clear metadata.
 pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
     use texture::{Dimension, Swizzle, TextureDesc};
     const TEXTURE_1D: u32 = 2;
@@ -169,12 +170,13 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
     .ok()
 }
 
-/// 整个已识别布局的保守地址范围。供物理身份捕获使用；不能作为
-/// 像素复制范围，也不能把缺失结果解释为「不访问内存」。
+/// 已建模平面的地址范围，含平面填充。供物理身份捕获使用；不表明实际
+/// 分配到此为止、不证明元数据缺席，也不能作为像素复制范围。缺失结果
+/// 不表示「不访问内存」。
 #[cfg(all(windows, feature = "paged-title"))]
 fn native_writer_candidate_span(address: u64, desc: &ResourceDesc) -> Option<(u64, u64)> {
     let layout = texture_layout(desc)?;
-    // XOR 或多样本可能没有逐 texel 寻址，但完整分配的尺寸仍已知。
+    // XOR 或多样本可能没有逐 texel 寻址，但仍能计算已建模平面的跨度。
     // 这里只查询物理身份，不将超过着色器地址表的范围用于 GPU 读取。
     let end = address.checked_add(layout.size)?;
     usize::try_from(end).ok()?;
