@@ -380,6 +380,40 @@ pub struct Options {
     pub raw_page_uav_reads: bool,
 }
 
+/// What can be established about the emitted `SV_Target0.a` at surviving
+/// pixel shader returns. This says nothing about whether any sample is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelAlphaProbe {
+    /// The byte-matched PS falls outside the supported proof subset.
+    Unknown,
+    /// No pixel translation could be matched to the bound host bytecode.
+    UnverifiedDxil,
+    /// Every surviving return exports alpha exactly 1.0.
+    OpaqueOnSurvivingReturn,
+    /// Every surviving return exports finite alpha no greater than 0.5.
+    AtMostHalfOnSurvivingReturn,
+    /// No execution can reach a return without being discarded.
+    NoSurvivingReturn,
+}
+
+/// Inspects the final CFG of a pixel translation, accepting its result only
+/// if the emitted DXIL container is byte-identical to `expected_dxil`.
+#[cfg(feature = "diagnostics")]
+pub fn probe_pixel_alpha(
+    container: &[u8],
+    options: Options,
+    expected_dxil: &[u8],
+) -> PixelAlphaProbe {
+    let mut probe = PixelAlphaProbe::Unknown;
+    if translate_impl(container, options, Some(&mut probe))
+        .is_ok_and(|host| host.stage == HwStage::Ps && host.dxil == expected_dxil)
+    {
+        probe
+    } else {
+        PixelAlphaProbe::UnverifiedDxil
+    }
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -388,6 +422,14 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    translate_impl(container, options, None)
+}
+
+fn translate_impl(
+    container: &[u8],
+    options: Options,
+    probe: Option<&mut PixelAlphaProbe>,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -411,7 +453,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_impl(&c, &native, &p, &st, &io, &res, options, probe)
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -435,6 +477,20 @@ pub fn emit_with(
     io: &io::Io,
     res: &resource::Resources,
     options: Options,
+) -> Result<HostShader, ShaderError> {
+    emit_impl(c, native, p, st, io, res, options, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_impl(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+    mut probe: Option<&mut PixelAlphaProbe>,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -503,14 +559,18 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower_page_access(&parts(st, res), options.raw_page_uav_reads) {
+    let l = match lower::lower_page_access_impl(
+        &parts(st, res),
+        options.raw_page_uav_reads,
+        probe.as_deref_mut(),
+    ) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower_page_access(&parts(&st, &res), options.raw_page_uav_reads)?
+            lower::lower_page_access_impl(&parts(&st, &res), options.raw_page_uav_reads, probe)?
         }
         l => l?,
     };
@@ -654,6 +714,88 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn pixel_alpha_probe_requires_exact_retranslated_dxil() {
+        // An XDAT native blob with a single PS, no inputs or export patches.
+        // Target1 precedes Target0 in the signature: element id != row/index.
+        let target = |index| SigElement {
+            name: "SV_Target".into(),
+            index,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(index),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let osg1 = container::signature(&[target(1), target(0)], false);
+        for (alpha, expected) in [
+            (1.0f32, PixelAlphaProbe::OpaqueOnSurvivingReturn),
+            (0.5, PixelAlphaProbe::AtMostHalfOnSurvivingReturn),
+        ] {
+            let words = [
+                0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+                0xF800_001F,
+                0, // exp mrt1 v0, v0, v0, v0
+                0x7E00_02FF,
+                alpha.to_bits(), // v_mov_b32 v0, alpha
+                0xF800_180F,
+                0, // exp mrt0 v0, v0, v0, v0 done vm
+                0xBF81_0000,
+            ];
+            let record = 0x68usize;
+            let stage = record + 0x54;
+            let code_at = stage + 0x14c + 8 * 404;
+            let mut payload = vec![0; code_at];
+            payload[..8].copy_from_slice(&6u64.to_le_bytes());
+            for slot in [0x08, 0x10, 0x18, 0x20, 0x28, 0x48, 0x60] {
+                payload[slot..slot + 8].copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_le_bytes());
+            }
+            payload[0x30..0x38].copy_from_slice(&(record as u64).to_le_bytes());
+            payload[record..record + 8].copy_from_slice(&(code_at as u64).to_le_bytes());
+            payload[record + 8..record + 16]
+                .copy_from_slice(&(size_of_val(&words) as u64).to_le_bytes());
+            payload[record + 0x14] = 1 << 5; // wave32
+            payload[record + 0x50] = 4; // VGPRs
+            for mrt in 0..8 {
+                let at = stage + 0x14c + mrt * 404;
+                payload[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            }
+            payload.extend(words.into_iter().flat_map(u32::to_le_bytes));
+            let mut fssm = b"FSSM".to_vec();
+            fssm.extend(0x101u32.to_le_bytes());
+            fssm.extend((payload.len() as u64).to_le_bytes());
+            fssm.extend(payload);
+            let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&fssm, 6);
+            let mut dxil = vec![0; 0x18];
+            dxil.extend(b"XDAT");
+            for word in [1, 0x24, 0x0d, 0x30, 0x18 + compressed.len() as u32] {
+                dxil.extend(word.to_le_bytes());
+            }
+            dxil.extend(b"XBCH");
+            dxil.extend(3u32.to_le_bytes());
+            dxil.extend((compressed.len() as u64).to_le_bytes());
+            dxil.extend((fssm.len() as u64).to_le_bytes());
+            dxil.extend(compressed);
+            let bytes = crate::dxbc::build(&[(FourCC::DXIL, &dxil), (FourCC::OSG1, &osg1)]);
+            let out = translate(&bytes).unwrap();
+            assert_eq!(out.stage, HwStage::Ps);
+            assert_eq!(
+                probe_pixel_alpha(&bytes, Options::default(), &out.dxil),
+                expected,
+            );
+            let mut different = out.dxil;
+            different[4] ^= 1;
+            assert_eq!(
+                probe_pixel_alpha(&bytes, Options::default(), &different),
+                PixelAlphaProbe::UnverifiedDxil,
+            );
+        }
+    }
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
