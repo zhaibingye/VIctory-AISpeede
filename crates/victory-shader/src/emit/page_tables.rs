@@ -85,7 +85,28 @@ pub enum StaticViewFailure {
     UntracedSource { operation: &'static str },
     DivergentSource { operation: &'static str },
     MissingTableAddress { operation: &'static str },
-    UnprovenTableSlot { operation: &'static str },
+    UnprovenTableSlot { operation: &'static str, reason: TableSlotFailure },
+}
+
+/// 不记录当前地址、表偏移原值或寄存器数据，只标明哪条证明失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableSlotFailure {
+    UnknownRoot,
+    RootKind(RootType),
+    DynamicOffset,
+    OffsetOverflow,
+    Misaligned,
+    OutsideWindow,
+    NoDeclaration,
+    RootSlotMismatch,
+    Declaration {
+        kind: ResourceType,
+        dwords: u8,
+        stride: u32,
+        unique: bool,
+        field_fits_stride: Option<bool>,
+        statically_bounded_index: Option<bool>,
+    },
 }
 
 pub enum StaticViewReport {
@@ -201,10 +222,10 @@ fn view_report(container: &[u8], direct: Option<[u32; 3]>) -> Result<StaticViewR
         let Some(&address) = addresses.get(&load) else {
             return rejected(Reason::MissingTableAddress { operation: name });
         };
-        let Some(view) = proven_slot(&native, address, first, access) else {
-            return rejected(Reason::UnprovenTableSlot { operation: name });
-        };
-        slots.insert(view);
+        match proven_slot(&native, address, first, access) {
+            Ok(view) => { slots.insert(view); }
+            Err(reason) => return rejected(Reason::UnprovenTableSlot { operation: name, reason }),
+        }
     }
     Ok(StaticViewReport::Proven(slots.into_iter().collect()))
 }
@@ -477,18 +498,18 @@ fn bounded_structured_access(
     })
 }
 
-fn table_slot(address: Address, first: u8) -> Option<u32> {
+fn table_slot(address: Address, first: u8) -> Result<u32, TableSlotFailure> {
     if address.dynamic.is_some() {
-        return None;
+        return Err(TableSlotFailure::DynamicOffset);
     }
-    let bytes = address.offset.checked_add(u32::from(first) * 4)?;
+    let bytes = address.offset.checked_add(u32::from(first) * 4)
+        .ok_or(TableSlotFailure::OffsetOverflow)?;
     if !bytes.is_multiple_of(32) {
-        return None;
+        return Err(TableSlotFailure::Misaligned);
     }
     let slot = bytes / 32;
-    // A proof for explicitly bounded small table runs. A later encoder
-    // must populate exactly these slots, not read outside captured views.
-    (slot < 256).then_some(slot)
+    // 只为闭合路径能精确填充的有限表区间建立证明。
+    (slot < 256).then_some(slot).ok_or(TableSlotFailure::OutsideWindow)
 }
 
 fn proven_root_srv(
@@ -539,11 +560,11 @@ fn proven_root_srv(
 
 fn proven_slot(
     native: &NativeProgram, address: Address, first: u8, proof: AccessProof,
-) -> Option<StaticViewSlot> {
-    let param = native.layout.get(address.param)?;
+) -> Result<StaticViewSlot, TableSlotFailure> {
+    let param = native.layout.get(address.param).ok_or(TableSlotFailure::UnknownRoot)?;
     let index = table_slot(address, first)?;
     if param.root != RootType::Table {
-        return None;
+        return Err(TableSlotFailure::RootKind(param.root));
     }
     // Match the translator's used-kind selection first; skipping a
     // mismatched declaration here can otherwise prove the wrong DXIL view.
@@ -551,62 +572,70 @@ fn proven_slot(
         u.root == RootType::Table && u.user_data == param.user_data
             && u.table_offset_dwords <= index * 8
     });
-    let used = relevant.clone().max_by_key(|u| u.table_offset_dwords)?;
+    let used = relevant.clone().max_by_key(|u| u.table_offset_dwords).ok_or(TableSlotFailure::NoDeclaration)?;
     if used.slot != param.slot {
-        return None;
+        return Err(TableSlotFailure::RootSlotMismatch);
     }
-    let unique = || relevant.clone()
-        .filter(|u| u.table_offset_dwords == used.table_offset_dwords).count() == 1;
+    let unique = relevant.filter(|u| u.table_offset_dwords == used.table_offset_dwords).count() == 1;
+    let (field_fits_stride, statically_bounded_index) = match &proof {
+        AccessProof::StructuredAccess { elements, last_byte, .. } =>
+            (Some(*last_byte <= used.stride), Some(elements.is_some())),
+        _ => (None, None),
+    };
+    let reject = TableSlotFailure::Declaration {
+        kind: used.kind, dwords: used.dwords, stride: used.stride, unique,
+        field_fits_stride, statically_bounded_index,
+    };
     let access = match proof {
         AccessProof::StructuredAccess { elements, last_byte, write }
-            if unique() && used.dwords == 4
+            if unique && used.dwords == 4
                 && (4..=2048).contains(&used.stride) && used.stride.is_multiple_of(4)
                 && last_byte <= used.stride =>
         {
             match (used.kind, elements) {
-                (ResourceType::Srv, Some(elements)) if !write && elements.checked_mul(used.stride)? <= 65536 =>
+                (ResourceType::Srv, Some(elements)) if !write && elements.checked_mul(used.stride).is_some_and(|bytes| bytes <= 65536) =>
                     StaticViewAccess::StructuredSrv { stride: used.stride, elements },
                 // 只开放已证明内层字段不会跨界的顶点只读访问。堆中的完整 SRV
                 // 使用真实元素数做越界检查，与不带长度的根描述符不同。
                 (ResourceType::Srv, None) if !write && native.stage == HwStage::Vs =>
                     StaticViewAccess::StructuredSrvDescriptor { stride: used.stride },
                 (ResourceType::Uav, Some(elements)) if native.stage == HwStage::Cs
-                    && elements.checked_mul(used.stride)? <= 65536 =>
+                    && elements.checked_mul(used.stride).is_some_and(|bytes| bytes <= 65536) =>
                     StaticViewAccess::StructuredUav { stride: used.stride, elements, write },
-                _ => return None,
+                _ => return Err(reject),
             }
         }
-        AccessProof::ScalarBufferRead { offset, bytes } if unique() && used.dwords == 4 => {
+        AccessProof::ScalarBufferRead { offset, bytes } if unique && used.dwords == 4 => {
             match used.kind {
                 ResourceType::Cbv => StaticViewAccess::ConstantTable { offset, bytes },
                 ResourceType::Srv if used.stride == 0 => StaticViewAccess::RawSrv { offset, bytes },
-                _ => return None,
+                _ => return Err(reject),
             }
         }
         AccessProof::Native(access @ StaticViewAccess::TextureWrite { .. })
-            if native.stage == HwStage::Cs && unique() && used.kind == ResourceType::Uav && used.dwords == 8 => access,
+            if native.stage == HwStage::Cs && unique && used.kind == ResourceType::Uav && used.dwords == 8 => access,
         AccessProof::Native(access @ StaticViewAccess::TextureRead { .. }) if used.kind == ResourceType::Srv && used.dwords == 8 => access,
         AccessProof::Native(StaticViewAccess::RawUav { offset, bytes, write: false })
-            if used.kind == ResourceType::Srv && used.dwords == 4 && used.stride == 0 && unique() =>
+            if used.kind == ResourceType::Srv && used.dwords == 4 && used.stride == 0 && unique =>
         {
             StaticViewAccess::RawSrv { offset, bytes }
         }
         AccessProof::Native(access @ StaticViewAccess::RawUav { .. })
-            if used.kind == ResourceType::Uav && used.dwords == 4 && used.stride == 0 && unique() => access,
-        _ => return None,
+            if used.kind == ResourceType::Uav && used.dwords == 4 && used.stride == 0 && unique => access,
+        _ => return Err(reject),
     };
-    Some(StaticViewSlot { slot: StaticTextureSlot { root: param.slot, index }, access })
+    Ok(StaticViewSlot { slot: StaticTextureSlot { root: param.slot, index }, access })
 }
 
 #[cfg(test)]
 #[test]
 fn page_texture_table_proof_requires_static_aligned_offsets() {
     let a = Address { param: 0, offset: 48, dynamic: None };
-    assert_eq!(table_slot(a, 4), Some(2));
-    assert_eq!(table_slot(a, 0), None);
-    assert_eq!(table_slot(Address { dynamic: Some(crate::ir::Value(0)), ..a }, 4), None);
-    assert_eq!(table_slot(Address { offset: u32::MAX - 3, ..a }, 1), None);
-    assert_eq!(table_slot(Address { offset: 256 * 32, ..a }, 0), None);
+    assert_eq!(table_slot(a, 4), Ok(2));
+    assert_eq!(table_slot(a, 0), Err(TableSlotFailure::Misaligned));
+    assert_eq!(table_slot(Address { dynamic: Some(crate::ir::Value(0)), ..a }, 4), Err(TableSlotFailure::DynamicOffset));
+    assert_eq!(table_slot(Address { offset: u32::MAX - 3, ..a }, 1), Err(TableSlotFailure::OffsetOverflow));
+    assert_eq!(table_slot(Address { offset: 256 * 32, ..a }, 0), Err(TableSlotFailure::OutsideWindow));
 }
 
 
