@@ -13,6 +13,8 @@
 - `3a63016` 手动复现同一首错。目标 510 页均为 XMem section，布局线索为 `SW_64KB_R_X`（27）；2,248 个原生写入 Fence 压缩为两组，未淘汰，成员均是默认私有堆候选；`[VNME_BYTE_WRITE_HISTORY]` 保留 10 个已完成的分页 GPU 写回页，目标命中为零，无跳过或淘汰。未观测的写入路径仍可能存在。
 - `[VNME_DSTORAGE_WRITE_HISTORY]` 新增 CPU 侧证据：物理分段的身份取自写侧保活的 `Slice`，成功只记实际写入长度，原地失败仅记可能写过，裸 VA 只计未归属次数。与原生、GPU 字节历史共用一份目标快照；不回查历史 VA，不读取游戏内容。其他 CPU 写入、布局和当前权威仍须独立证明。`R_X` 已有分配尺寸计算，现有代码无逐 texel 寻址，不能当作线性数据。
 
+- `267f353` 仍复现同一首错；DirectStorage 未记录直接物理页写入，却观测到 9,896 次未归属的裸 VA 写入。这不是排除 DirectStorage 的证据。后续 `[VNME_DSTORAGE_VA_WRITE_HISTORY]` 将写前/写后目标页身份与 VA 范围独立比较：映射快照有采样限额，相同端点不证明中途未重绑。`[VNME_PREFIX_BYTE_INVENTORY]` 对照首错前已编码的 GPU 字节写入计划，不把未提交的命令说成已写入。
+
 ## 最小验证
 
 - 使用仓库锁定的 Rust、Windows x64 MSVC、`--locked --features paged-title,diagnostics,blake3/pure`。新增诊断的定向测试过滤 `page_resource::native_history_tests`、`page_queue::copy_prefix_`；内容顺序的实像素测试为 `page_draw::paged_title_partial_color_clear_observes_submission_order`，仅相关改动时重跑。

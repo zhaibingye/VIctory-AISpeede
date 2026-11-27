@@ -956,18 +956,23 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
-        // SAFETY: the title's destination holds `destination_size` bytes, at
-        // least `len`, and nothing else writes it until completion.
-        let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        let result = fill(out);
-        // An error may have modified the destination, but there is no
-        // retained backing identity for this VA.
+        let at = request.destination as usize;
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-        if result.unwrap_or(len) != 0 {
-            victory_gpu::title_backing::note_dstorage_va_write();
+        let probe = victory_gpu::title_backing::probe_dstorage_va_write(at, len);
+        let result = {
+            // Raw reads land through the kernel, which does not fault into the
+            // GPU side's guard on title buffers; open them first.
+            let _writing = victory_gpu::kernel_will_write(at, len);
+            // SAFETY: the title's destination holds `destination_size` bytes, at
+            // least `len`, and nothing else writes it until completion.
+            let out =
+                unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+            fill(out)
+        };
+        // Observe outside the write guard; even an error may have written bytes.
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if let Some(probe) = probe {
+            probe.finish(result.ok());
         }
         return result.map(drop);
     }
@@ -1566,6 +1571,30 @@ mod tests {
         assert_eq!(&*window.bytes(), &[0x5a, 0]);
         drop(window);
         assert_eq!(xmem::XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn raw_va_fills_preserve_short_success_and_partial_failure() {
+        for produced in [Ok(1), Err(INVALID_DATA)] {
+            let mut out = [0u8; 3];
+            let r = request(
+                0,
+                out.as_mut_ptr().cast(),
+                out.len(),
+                std::ptr::null(),
+                0,
+                0,
+            );
+            assert_eq!(
+                into_destination(&r, 2, |dst| {
+                    assert_eq!(dst.len(), 2);
+                    dst[0] = 0x5a;
+                    produced
+                }),
+                produced.map(drop)
+            );
+            assert_eq!(out, [0x5a, 0, 0]);
+        }
     }
 
     #[test]

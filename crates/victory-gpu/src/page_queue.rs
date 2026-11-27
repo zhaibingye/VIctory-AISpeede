@@ -483,6 +483,52 @@ impl ByteWriteKind {
     }
 }
 
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+#[derive(Default)]
+struct PrefixByteWriteCounts {
+    dirty: usize,
+    dirty_without_exact: usize,
+    exact_partial: usize,
+    exact_whole: usize,
+}
+
+#[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+fn compare_prefix_byte_writes(
+    target_pages: &BTreeSet<PhysicalPage>, dirty: &BTreeSet<PhysicalPage>, plan: &crate::page_resource::ResourcePlan,
+) -> PrefixByteWriteCounts {
+    let mut counts = PrefixByteWriteCounts::default();
+    for &page in target_pages {
+        let declared = usize::from(dirty.contains(&page));
+        counts.dirty += declared;
+        // 显式覆盖独立查询；尚未提交，不存在 GPU bitmap 观测。
+        match ByteWriteKind::classify(plan.guest_overwrites(page), false) {
+            ByteWriteKind::ExactWholePage => counts.exact_whole += 1,
+            ByteWriteKind::ExactPartialPage => counts.exact_partial += 1,
+            _ => counts.dirty_without_exact += declared,
+        }
+    }
+    counts
+}
+
+#[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+#[test]
+fn prefix_byte_writes_compare_only_captured_target_pages() {
+    let first = victory_memory::physical::PageNumbers::default().allocate(6).unwrap();
+    let [declared, partial, whole, exact_only, untouched, outside] = std::array::from_fn(|i| first.offset(i));
+    let target = [declared, partial, whole, exact_only, untouched].into();
+    let dirty = [declared, partial, whole, outside].into();
+    let mut plan = crate::page_resource::ResourcePlan::default();
+    let half = PAGE_BYTES as usize / 2;
+    plan.record_guest_overwrite(partial, 7, 1);
+    plan.record_guest_overwrite(whole, half, half);
+    plan.record_guest_overwrite(whole, 0, half);
+    plan.record_guest_overwrite(exact_only, 11, 1);
+    plan.record_guest_overwrite(outside, 0, PAGE_BYTES as usize);
+
+    let counts = compare_prefix_byte_writes(&target, &dirty, &plan);
+    assert_eq!((counts.dirty, counts.dirty_without_exact, counts.exact_partial, counts.exact_whole), (3, 1, 2, 1));
+}
+
 // 只保存页身份及计数。枚举的四类互斥；第五项另计 GPU 页映像与提交前摘要不同。
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 type ByteWriteCounts = [usize; 5];
@@ -610,6 +656,7 @@ fn byte_write_history_keeps_repeated_pages_and_reports_incomplete_retention() {
 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
 fn trace_missing_color(
     ops: &[PageOp], index: usize, error: &BatchError, plan: &crate::page_resource::ResourcePlan, pins: &BackingPins,
+    dirty: &BTreeSet<PhysicalPage>,
 ) {
     use crate::page_slabs::TextureContentUse;
     use std::sync::Arc;
@@ -621,8 +668,19 @@ fn trace_missing_color(
     if subresource != bound_subresource { return; }
     draw.trace_color_coverage_inputs(slot);
     if let Some(capture) = crate::page_resource::ResourcePlan::trace_color_native_history(target, subresource) {
+        // ClosedDraw::encode 的 ColorTarget 缺失检查不登记来宾覆盖，且早于
+        // ShaderBindings::prepare 的 UAV dirty 登记。两份计划只来自成功编码的前缀。
+        let counts = compare_prefix_byte_writes(&capture.pages, dirty, plan);
+        tracing::info!(
+            index, slot, subresource,
+            target_mapped_page_ids = capture.pages.len(), prefix_declared_dirty_page_ids = dirty.len(),
+            target_declared_dirty_page_ids = counts.dirty,
+            target_declared_without_exact_page_ids = counts.dirty_without_exact,
+            target_exact_partial_page_ids = counts.exact_partial, target_exact_whole_page_ids = counts.exact_whole,
+            "[VNME_PREFIX_BYTE_INVENTORY] 颜色目标缺少内容：未提交前缀的来宾字节写入计划（只比较已识别的整资源候选页；dirty 可为保守声明；共页和覆盖不证明实际写入或旧像素）"
+        );
         trace_byte_write_history(index, slot, subresource, &capture.pages);
-        crate::title_backing::trace_dstorage_write_history(index, slot, subresource, &capture.pages);
+        crate::title_backing::trace_dstorage_write_history(index, slot, subresource, &capture.pages, target.candidate_guest_span);
     }
     plan.trace_color_predecessor(target, subresource);
 
@@ -1461,7 +1519,7 @@ impl Host {
                 Ok(())
             })().map_err(|error| {
                 #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-                trace_missing_color(ops, index, &error, targets, pins);
+                trace_missing_color(ops, index, &error, targets, pins, &dirty);
                 op.failure("encode", index, error)
             })?;
         }
