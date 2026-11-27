@@ -1682,9 +1682,9 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0 {
         #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
         if crate::page_inventory::enabled() && let Some(list) = host_list(this) {
-            let (counts_by_kind, headers_skipped, textures) = enhanced_texture_candidates(count, _groups);
+            let (counts_by_kind, headers_skipped, payload_coverage, textures) = enhanced_texture_candidates(count, _groups);
             list.record_page_barrier(crate::page_resource::PageBarrier::EnhancedUav {
-                counts_by_kind, headers_skipped, textures,
+                counts_by_kind, headers_skipped, payload_coverage, textures,
             });
             return;
         }
@@ -1751,31 +1751,73 @@ fn desktop_texture_candidate(bytes: &[u8; 64]) -> (usize, CandidateTextureBarrie
     })
 }
 
+/// 依次为读成功、尝试但失败、无地址、达到上限；余下的差额是读失败后未尝试。
+#[cfg(any(test, all(windows, feature = "paged-title", feature = "diagnostics")))]
+fn visit_enhanced_textures(
+    entries: u32, payload: usize, remaining: &mut u32,
+    mut read: impl FnMut(usize, &mut [u8; 64]) -> bool,
+    mut visit: impl FnMut(usize, CandidateTextureBarrier),
+) -> [u32; 4] {
+    if payload == 0 { return [0, 0, entries, 0]; }
+    let budget = entries.min(*remaining);
+    let mut coverage = [0, 0, 0, entries - budget];
+    for j in 0..budget {
+        *remaining -= 1;
+        let mut bytes = [0u8; 64];
+        if !payload.checked_add(j as usize * bytes.len()).is_some_and(|address| read(address, &mut bytes)) {
+            coverage[1] += 1;
+            break;
+        }
+        coverage[0] += 1;
+        let (object, fields) = desktop_texture_candidate(&bytes);
+        visit(object, fields);
+    }
+    coverage
+}
+
 #[cfg(all(windows, feature = "paged-title", feature = "diagnostics"))]
 fn enhanced_texture_candidates(count: u32, groups: *const u8)
-    -> ([u64; 4], u32, Vec<(std::sync::Weak<crate::resource::HostTexture>, CandidateTextureBarrier)>)
+    -> ([u64; 4], u32, [u64; 4], Vec<(std::sync::Weak<crate::resource::HostTexture>, CandidateTextureBarrier)>)
 {
     let mut found = Vec::new();
     let mut remaining = 64u32;
+    let mut payload_coverage = [0u64; 4];
     let (counts, skipped) = enhanced_group_headers(
         count, groups as usize, |address, header| crate::host::read_into(address as *const u8, header),
         |kind, entries, payload| {
-            if kind != 1 || payload == 0 { return; }
-            let entries = entries.min(remaining);
-            remaining -= entries;
-            for j in 0..entries {
-                let Some(address) = payload.checked_add(j as usize * 64) else { break; };
-                let mut bytes = [0u8; 64];
-                // 内核检查可读性，不将候选指针作为 Rust 引用。
-                if !crate::host::read_into(address as *const u8, &mut bytes) { break; }
-                let (object, fields) = desktop_texture_candidate(&bytes);
-                if let Some(identity) = crate::resource::known_texture_identity(object) {
-                    found.push((identity, fields));
-                }
-            }
+            if kind != 1 { return; }
+            let group = visit_enhanced_textures(entries, payload, &mut remaining,
+                |address, bytes| crate::host::read_into(address as *const u8, bytes),
+                |object, fields| {
+                    if let Some(identity) = crate::resource::known_texture_identity(object) {
+                        found.push((identity, fields));
+                    }
+                },
+            );
+            for (total, count) in payload_coverage.iter_mut().zip(group) { *total += u64::from(count); }
         },
     );
-    (counts, skipped, found)
+    (counts, skipped, payload_coverage, found)
+}
+
+#[test]
+fn enhanced_texture_coverage_separates_read_failure_from_missing_identity() {
+    let mut remaining = 4;
+    let mut decoded = Vec::new();
+    let mut read = |address, bytes: &mut [u8; 64]| {
+        if address == 192 { return false; }
+        bytes[24..32].copy_from_slice(&0x1234u64.to_le_bytes());
+        true
+    };
+    assert_eq!(visit_enhanced_textures(5, 128, &mut remaining, &mut read,
+        |object, _| decoded.push(object)), [1, 1, 0, 1]);
+    assert_eq!(decoded, [0x1234]); // 解出候选指针并不表示它已登记。
+    assert_eq!(remaining, 2);
+    assert_eq!(visit_enhanced_textures(2, 0, &mut remaining, &mut read,
+        |_, _| unreachable!()), [0, 0, 2, 0]);
+    assert_eq!(visit_enhanced_textures(3, 256, &mut remaining, &mut read,
+        |_, _| {}), [2, 0, 0, 1]);
+    assert_eq!(remaining, 0);
 }
 
 #[test]

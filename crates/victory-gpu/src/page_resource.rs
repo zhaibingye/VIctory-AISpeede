@@ -537,7 +537,7 @@ pub(crate) enum PageBarrier {
     DiscardColor(Arc<HostTexture>, ColorSubresource),
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     EnhancedUav {
-        counts_by_kind: [u64; 4], headers_skipped: u32,
+        counts_by_kind: [u64; 4], headers_skipped: u32, payload_coverage: [u64; 4],
         textures: Vec<(std::sync::Weak<HostTexture>, crate::list::CandidateTextureBarrier)>,
     },
 }
