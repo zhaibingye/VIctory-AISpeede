@@ -258,6 +258,14 @@ impl PageOp {
         out.extend(target);
     }
 
+    fn ordered_color_reads<'a>(&'a self, out: &mut Vec<&'a crate::page_texture::OrderedRenderRead>) {
+        match self {
+            Self::Draw(draw) => draw.ordered_color_reads(out),
+            Self::Dispatch(dispatch) => dispatch.ordered_color_reads(out),
+            _ => {},
+        }
+    }
+
     pub(crate) fn writes_native<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
         match self {
             Self::CopyTexture(copy) => out.push(copy.target()),
@@ -326,6 +334,9 @@ impl ClosedTitleBatch {
     pub(crate) fn native_window_candidate(&self) -> bool {
         // A cheap scheduler hint. The footprint is resolved only under
         // the direct queue lock, which also orders pointer publication.
+        let mut ordered_colors = Vec::new();
+        for op in &self.0 { op.ordered_color_reads(&mut ordered_colors); }
+        if !ordered_colors.is_empty() { return false; }
         self.0.iter().all(|op| matches!(op,
             PageOp::Clear(_) | PageOp::ClearDepth(_) | PageOp::ClearUavTexture(_)
             | PageOp::Barrier(_) | PageOp::CopyTexture(_) | PageOp::ResolveTexture(_) | PageOp::Draw(_)
@@ -462,6 +473,93 @@ impl ClosedFootprint {
             visible,
         })
     }
+}
+
+/// 保守证明整批的来宾字节操作和不同原生对象均不与有序颜色纹理相交。
+/// 这里只固定映射，不把纹理内容放入 GPU 页 slab。
+#[cfg(feature = "paged-title")]
+fn ordered_color_backing(
+    ops: &[PageOp], ranges: &[(u64, u64)], backing: &mut SubmissionBacking,
+) -> std::result::Result<BTreeSet<usize>, BatchError> {
+    let mut reads = Vec::new();
+    for op in ops { op.ordered_color_reads(&mut reads); }
+    if reads.is_empty() { return Ok(BTreeSet::new()); }
+    let reject = || BatchError::unsupported_texture_map("按序原生颜色读取的物理归属未获证明");
+    let mut writers = Vec::new();
+    for op in ops { op.writes_native(&mut writers); }
+    let mut writer_spans = BTreeMap::new();
+    for writer in writers {
+        let key = std::sync::Arc::as_ptr(writer) as usize;
+        if writer_spans.contains_key(&key) { continue; }
+        let (start, end) = writer.candidate_guest_span.ok_or_else(reject)?;
+        let private_heap = writer.began_on_private_heap
+            && crate::title_backing::is_private_heap_span(start as usize, end as usize);
+        writer_spans.insert(key, ((start, end), private_heap));
+        if !private_heap { backing.include(start as usize, end as usize); }
+    }
+    for read in &reads { backing.include(read.span.0 as usize, read.span.1 as usize); }
+    for &(start, end) in ranges { backing.include(start as usize, end as usize); }
+    backing.flush();
+    let pins = backing.pins();
+    let ordinary_pages = physical_footprint(pins, ranges)?;
+    let mut approved = BTreeSet::new();
+    for read in reads {
+        let key = std::sync::Arc::as_ptr(&read.copy) as usize;
+        let (start, end) = read.span;
+        if writer_spans.get(&key) != Some(&(read.span, false))
+            || !read.copy.current_native_generation()
+            || pins.physical_runs(start as usize, end as usize).as_ref() != Some(&read.identity)
+        {
+            return Err(reject());
+        }
+        if !approved.insert(key) { continue; }
+        if !ordered_color_disjoint(
+            pins, read.span, &ordinary_pages,
+            writer_spans.iter().filter_map(|(&other, &span)| (other != key).then_some(span)),
+        )? {
+            return Err(reject());
+        }
+    }
+    Ok(approved)
+}
+
+#[cfg(feature = "paged-title")]
+fn ordered_color_disjoint(
+    pins: &BackingPins, (start, end): (u64, u64), ordinary: &BTreeSet<PhysicalPage>,
+    other_writes: impl Iterator<Item = ((u64, u64), bool)>,
+) -> std::result::Result<bool, BatchError> {
+    let own = physical_footprint(pins, &[(start, end)])?;
+    if own.len() as u64 != end.div_ceil(PAGE_BYTES) - start / PAGE_BYTES
+        || !own.is_disjoint(ordinary)
+    {
+        return Ok(false);
+    }
+    for ((a, b), private_heap) in other_writes {
+        if start < b && a < end
+            || !private_heap && !own.is_disjoint(&physical_footprint(pins, &[(a, b)])?)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(all(test, feature = "paged-title"))]
+#[test]
+fn ordered_color_rejects_physical_aliases_and_missing_writers() {
+    let mut pins = BackingPins::default();
+    let physical = victory_memory::physical::PageNumbers::default().allocate(4).unwrap();
+    let page = PAGE_BYTES as usize;
+    let span = |n: u64| (n * PAGE_BYTES, (n + 1) * PAGE_BYTES);
+    pins.remember(page, 2 * page, Some(physical));
+    pins.remember(2 * page, 3 * page, Some(physical)); // 异地址、同物理页。
+    pins.remember(3 * page, 4 * page, Some(physical.offset(1)));
+    let empty = BTreeSet::new();
+    assert!(ordered_color_disjoint(&pins, span(1), &empty, [(span(3), false)].into_iter()).unwrap());
+    assert!(!ordered_color_disjoint(&pins, span(1), &empty, [(span(2), false)].into_iter()).unwrap());
+    assert!(!ordered_color_disjoint(&pins, span(1), &[physical].into(), std::iter::empty()).unwrap());
+    assert!(!ordered_color_disjoint(&pins, (PAGE_BYTES, 3 * PAGE_BYTES), &empty, std::iter::empty()).unwrap());
+    assert!(ordered_color_disjoint(&pins, span(1), &empty, [(span(4), false)].into_iter()).is_err());
 }
 
 #[derive(Clone, Copy)]
@@ -804,7 +902,11 @@ impl Host {
         } = footprint;
         #[cfg(feature = "paged-title")]
         let mut publications = Vec::with_capacity(visible.len());
+        #[cfg(feature = "paged-title")]
+        let ordered_backing = ordered_color_backing(ops, &ranges, backing)?;
         let stats = self.execute_paged_work_locked(signal, heap, backing, &ranges, WriteSet::Declared, |list, _, batch, pins, descriptors, targets| {
+            #[cfg(feature = "paged-title")]
+            { targets.ordered_color_backing = ordered_backing; }
             #[cfg(feature = "paged-title")]
             if !visible.is_empty() || !preserved.is_empty() {
                 // Own preservation and own tail publication are an

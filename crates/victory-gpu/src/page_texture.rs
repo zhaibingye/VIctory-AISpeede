@@ -102,6 +102,8 @@ impl ScopedTextureAccess {
 /// from an exact compatible byte representation.
 pub(crate) enum TextureInput {
     #[cfg(feature = "paged-title")]
+    OrderedRender(OrderedRenderRead),
+    #[cfg(feature = "paged-title")]
     Volume {
         copy: std::sync::Arc<crate::resource::HostTexture>,
         format: DXGI_FORMAT,
@@ -128,6 +130,39 @@ pub(crate) enum TextureInput {
         depth_plane: bool,
         compatible_input: Option<LinearTexture>,
     },
+}
+
+/// 原生颜色读取只采集已固定的内存身份，不上传来宾像素。
+#[cfg(feature = "paged-title")]
+pub(crate) struct OrderedRenderRead {
+    pub(crate) copy: std::sync::Arc<crate::resource::HostTexture>,
+    pub(crate) span: (u64, u64),
+    pub(crate) identity: Vec<(victory_memory::physical::PhysicalPage, usize)>,
+    format: DXGI_FORMAT,
+}
+
+#[cfg(feature = "paged-title")]
+impl OrderedRenderRead {
+    pub(crate) fn capture(copy: &std::sync::Arc<crate::resource::HostTexture>, format: DXGI_FORMAT) -> Option<Self> {
+        // 安全：copy 保留有效的宿主资源。
+        let desc = unsafe { copy.texture.GetDesc() };
+        if !sample_color(format) || desc.Format != format
+            || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+            || desc.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+            || crate::page_resource::ColorSubresource::capture(desc, 0)?.is_scoped()
+            || copy.has_pointer_exposure() || copy.sparse.is_some()
+            || copy.twin.get().is_some_and(Option::is_some)
+            || !copy.uses_unproven_alias_backing()
+        {
+            return None;
+        }
+        let (start, end) = copy.candidate_guest_span?;
+        let mut backing = crate::title_backing::SubmissionBacking::default();
+        backing.include(start as usize, end as usize);
+        backing.flush();
+        let identity = backing.pins().physical_runs(start as usize, end as usize)?;
+        Some(Self { copy: copy.clone(), span: (start, end), identity, format })
+    }
 }
 
 const EXTENDED_COLOR: [DXGI_FORMAT; 8] = [
@@ -325,6 +360,8 @@ impl TextureInput {
         match self {
             Self::Scoped { .. } => {},
             #[cfg(feature = "paged-title")]
+            Self::OrderedRender(_) => {},
+            #[cfg(feature = "paged-title")]
             Self::Volume { backing, .. } => {
                 if let Some(input) = backing { ranges.extend(input.ranges()); }
             },
@@ -358,6 +395,8 @@ impl TextureInput {
             Self::Linear { copy, .. } | Self::Native { copy, .. } | Self::Scoped { copy, .. } => copy,
             #[cfg(feature = "paged-title")]
             Self::Section2d { copy, .. } | Self::Volume { copy, .. } => copy,
+            #[cfg(feature = "paged-title")]
+            Self::OrderedRender(read) => &read.copy,
         };
         copy.texture == target.texture
     }
@@ -391,6 +430,18 @@ impl TextureInput {
         plan: &mut crate::page_resource::ResourcePlan, mut shared: Option<&mut ScopedTextureAccess>,
     ) -> Result<(ID3D12Resource, DXGI_FORMAT), BatchError> {
         match self {
+            #[cfg(feature = "paged-title")]
+            Self::OrderedRender(read) => {
+                if shared.is_some() || read.copy.has_pointer_exposure()
+                    || !extended_color_support(host, read.format)
+                {
+                    return Err(BatchError::unsupported_texture_map("无法验证按序原生颜色读取"));
+                }
+                plan.require_ordered_color(&read.copy)?;
+                plan.transition_texture(list, &read.copy, SHADER_READ.0 as u32)?;
+                list.keep(&read.copy.texture);
+                Ok((read.copy.texture.clone(), read.format))
+            }
             #[cfg(feature = "paged-title")]
             Self::Volume { copy, format, backing } => {
                 if shared.is_some() || copy.has_pointer_exposure()

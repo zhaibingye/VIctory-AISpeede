@@ -180,7 +180,11 @@ impl ColorClear {
                 cmd.ResourceBarrier(&[self.target.sub.temporary_transition(texture, after, before)]);
             }
         }
-        initialized.record_color_write(&self.target.copy, self.target.sub)?;
+        if self.replaces_all() {
+            initialized.record_full_color_write(&self.target.copy, self.target.sub)?;
+        } else {
+            initialized.record_color_write(&self.target.copy, self.target.sub)?;
+        }
         Ok(())
     }
 }
@@ -520,6 +524,11 @@ impl ClosedDraw {
             blend_factor: [1.0; 4],
             sample: None,
         })
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn ordered_color_reads<'a>(&'a self, out: &mut Vec<&'a crate::page_texture::OrderedRenderRead>) {
+        self.shader.ordered_color_reads(out);
     }
 
     pub(crate) fn set_blend_factor(&mut self, factor: [f32; 4]) {

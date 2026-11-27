@@ -320,6 +320,8 @@ pub(crate) struct ShaderBindings {
     tables: BTreeMap<u8, BTreeMap<u32, ClosedView>>,
     cbvs: Vec<(u32, ConstantSpan)>,
     root_srvs: BTreeMap<u8, ByteSpan>,
+    #[cfg(feature = "paged-title")]
+    has_ordered_color_reads: bool,
 }
 
 enum ClosedView {
@@ -466,6 +468,8 @@ impl ShaderBindings {
         let mut cbvs = Vec::new();
         let mut root_srvs = BTreeMap::<u8, ByteSpan>::new();
         let mut tables = BTreeMap::<u8, BTreeMap<u32, _>>::new();
+        #[cfg(feature = "paged-title")]
+        let mut has_ordered_color_reads = false;
         for stage in &pipeline.stages {
             let t = stage.translated();
             for &(slot, param) in &stage.root_cbvs {
@@ -608,6 +612,8 @@ impl ShaderBindings {
                             }
                             _ => return Err(reason(DescriptorSlotReason::UnsupportedAccess)),
                         };
+                        #[cfg(feature = "paged-title")]
+                        { has_ordered_color_reads |= matches!(&bound, ClosedView::Texture(TextureInput::OrderedRender(_))); }
                         e.insert(bound);
                     }
                     match (table.get_mut(&slot.index), proof.access) {
@@ -681,7 +687,11 @@ impl ShaderBindings {
                 return Err(UnloweredShader::DescriptorTable);
             }
         }
-        Ok(Self { constants, tables, cbvs, root_srvs })
+        Ok(Self {
+            constants, tables, cbvs, root_srvs,
+            #[cfg(feature = "paged-title")]
+            has_ordered_color_reads,
+        })
     }
 
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
@@ -810,6 +820,16 @@ impl ShaderBindings {
         Ok(())
     }
 
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn ordered_color_reads<'a>(&'a self, out: &mut Vec<&'a crate::page_texture::OrderedRenderRead>) {
+        if !self.has_ordered_color_reads { return; }
+        out.extend(self.tables.values().flat_map(|table| table.values()).filter_map(|view| match view {
+            ClosedView::Texture(TextureInput::OrderedRender(read)) => Some(read),
+            _ => None,
+        }));
+    }
+
+    #[cfg(feature = "paged-title")]
     pub(crate) fn written_targets<'a>(&'a self, out: &mut Vec<&'a std::sync::Arc<crate::resource::HostTexture>>) {
         out.extend(self.texture_outputs().map(crate::page_uav::ShaderTextureUav::target));
     }

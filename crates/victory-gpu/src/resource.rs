@@ -908,6 +908,8 @@ pub(crate) struct HostTexture {
     #[cfg(feature = "paged-title")]
     pub(crate) began_on_private_heap: bool,
     #[cfg(feature = "paged-title")]
+    address_identity_key: Option<MemoryKey>,
+    #[cfg(feature = "paged-title")]
     committed_linear: std::sync::OnceLock<crate::page_texture::LinearTexture>,
     #[cfg(feature = "paged-title")]
     mapped_pointers: std::sync::Mutex<MapEpoch>,
@@ -1217,6 +1219,8 @@ impl HostTexture {
             byte_exposure: 0.into(),
             #[cfg(feature = "paged-title")]
             candidate_guest_span: None,
+            #[cfg(feature = "paged-title")]
+            address_identity_key: None,
             #[cfg(feature = "paged-title")]
             began_on_private_heap: false,
             #[cfg(feature = "paged-title")]
@@ -1617,6 +1621,7 @@ fn shared_texture(
     #[cfg(feature = "paged-title")]
     {
         texture.candidate_guest_span = native_writer_candidate_span(address, desc);
+        texture.address_identity_key = key;
         texture.began_on_private_heap = texture.candidate_guest_span.is_some_and(|(start, end)|
             crate::title_backing::is_private_heap_span(start as usize, end as usize));
     }
@@ -1665,6 +1670,21 @@ fn current(this: This) -> bool {
     map.as_ref()
         .and_then(|m| m.get(&k)?.upgrade())
         .is_none_or(|live| std::sync::Arc::ptr_eq(&live, h))
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+pub(crate) fn current_address_texture(this: This) -> bool {
+    !this.is_null() && matches!(resource(this).backing, Backing::Address(_)) && current(this)
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+impl HostTexture {
+    pub(crate) fn current_native_generation(&self) -> bool {
+        let Some(key) = self.address_identity_key else { return false; };
+        let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref().and_then(|m| m.get(&key)?.upgrade())
+            .is_some_and(|live| std::ptr::eq(live.as_ref(), self))
+    }
 }
 
 /// Whether the host has `format` at all. A castable list naming one it does

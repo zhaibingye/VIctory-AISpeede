@@ -412,6 +412,13 @@ pub(crate) enum TextureSrvReject {
     },
 }
 
+#[cfg(all(windows, feature = "paged-title"))]
+fn title_exact_render_view(resource: This, format: u32) -> bool {
+    crate::resource::title_format(resource) == Some(format)
+        && crate::resource::current_address_texture(resource)
+        && crate::resource::alias_source(resource).is_none()
+}
+
 impl View {
     /// A canonical 2D view with exact native color or depth format.
     /// A multi-mip view requires native authority for every named mip.
@@ -485,18 +492,27 @@ impl View {
 
         #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
         let observed_span = copy.candidate_guest_span;
-        TextureInput::native(copy.clone(), format, compatible.or(plain_linear)).or_else(|| {
-            plain_linear.map(|input| TextureInput::Linear { copy: copy.clone(), input })
-        }).ok_or_else(|| {
-            #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
-            if external_alias {
-                crate::page_resource::trace_rejected_shared_read(observed_span);
-            }
-            NativeOrBytes {
-                external_alias,
-                host_format: actual.Format.0,
-                authority_evidence: crate::resource::srv_authority_evidence(resource, &copy),
-            }
+        if let Some(native) = TextureInput::native(copy.clone(), format, compatible.or(plain_linear)) {
+            return Ok(native);
+        }
+        if let Some(input) = plain_linear {
+            return Ok(TextureInput::Linear { copy, input });
+        }
+        #[cfg(feature = "paged-title")]
+        if external_alias && !array && matches!(self, Self::Shader(..))
+            && title_exact_render_view(resource, format.0 as u32)
+            && let Some(read) = crate::page_texture::OrderedRenderRead::capture(&copy, format)
+        {
+            return Ok(TextureInput::OrderedRender(read));
+        }
+        #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
+        if external_alias {
+            crate::page_resource::trace_rejected_shared_read(observed_span);
+        }
+        Err(NativeOrBytes {
+            external_alias,
+            host_format: actual.Format.0,
+            authority_evidence: crate::resource::srv_authority_evidence(resource, &copy),
         })
     }
 

@@ -54,6 +54,11 @@ impl ClosedDispatch {
         })
     }
 
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn ordered_color_reads<'a>(&'a self, out: &mut Vec<&'a crate::page_texture::OrderedRenderRead>) {
+        self.shader.ordered_color_reads(out);
+    }
+
     pub(crate) fn ranges(&self, ranges: &mut Vec<(u64, u64)>) -> Result<(), BatchError> {
         self.shader.ranges(ranges)?;
         if let DispatchCall::Indirect(args) = self.call {

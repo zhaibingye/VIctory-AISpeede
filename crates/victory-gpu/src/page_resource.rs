@@ -122,6 +122,10 @@ pub(crate) struct ResourcePlan {
     pending: BTreeMap<(usize, Option<u32>), (Arc<HostTexture>, Version)>,
     #[cfg(feature = "paged-title")]
     pub(crate) section_texture_read: bool,
+    #[cfg(feature = "paged-title")]
+    pub(crate) ordered_color_backing: std::collections::BTreeSet<usize>,
+    #[cfg(feature = "paged-title")]
+    ordered_color_initialized: std::collections::BTreeSet<usize>,
     // 已编码而未提交的批次计数；提交成功前不得发布。
     pub(crate) encoded_draws: u64,
     pub(crate) encoded_dispatches: u64,
@@ -269,6 +273,33 @@ impl ResourcePlan {
         self.record_write_at(copy, sub.authority())
     }
 
+    /// 只承认这个批次内已编码的整张写入，不依赖上一个 Fence 或旧标记。
+    pub(crate) fn record_full_color_write(&mut self, copy: &Arc<HostTexture>, sub: ColorSubresource) -> Result<(), BatchError> {
+        self.record_color_write(copy, sub)?;
+        #[cfg(feature = "paged-title")]
+        if !sub.is_scoped() && self.ordered_color_backing.contains(&Self::key(copy)) {
+            self.ordered_color_initialized.insert(Self::key(copy));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "paged-title")]
+    fn has_ordered_color_write(&self, copy: &Arc<HostTexture>) -> bool {
+        self.ordered_color_initialized.contains(&Self::key(copy))
+            && self.pending.get(&(Self::key(copy), None))
+                .is_some_and(|(_, v)| v.representation == Representation::NativeGpu)
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn require_ordered_color(&self, copy: &Arc<HostTexture>) -> Result<(), BatchError> {
+        if self.has_ordered_color_write(copy) && copy.current_native_generation()
+        {
+            Ok(())
+        } else {
+            Err(BatchError::unsupported_texture_map("本批次没有该颜色纹理的已验证整张原生写入"))
+        }
+    }
+
     #[cfg(all(feature = "paged-title", feature = "diagnostics"))]
     pub(crate) fn capture_trace_writers(&mut self) {
         if !self.trace_writers.is_empty() {
@@ -402,6 +433,45 @@ impl ResourcePlan {
             }
         }
     }
+}
+
+#[cfg(all(test, feature = "paged-title"))]
+#[test]
+fn ordered_color_requires_full_write_to_same_native_object_in_current_batch() {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SAMPLE_DESC};
+    let host = crate::host::host().expect("D3D12 宿主");
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 4, Height: 4, DepthOrArraySize: 1, MipLevels: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        ..Default::default()
+    };
+    let make = || {
+        let mut texture = None::<ID3D12Resource>;
+        // 安全：结构与目标类型匹配；此测试只检查计划，不提交命令。
+        unsafe { host.device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+        ) }.unwrap();
+        Arc::new(HostTexture::new(texture.unwrap(), 0, Vec::new()))
+    };
+    let target = make();
+    let other = make();
+    let sub = ColorSubresource::capture(desc, 0).unwrap();
+    let mut plan = ResourcePlan::default();
+    plan.ordered_color_backing.extend([ResourcePlan::key(&target), ResourcePlan::key(&other)]);
+    assert!(!plan.has_ordered_color_write(&target));
+    plan.record_color_write(&target, sub).unwrap();
+    assert!(!plan.has_ordered_color_write(&target));
+    plan.record_full_color_write(&other, sub).unwrap();
+    assert!(!plan.has_ordered_color_write(&target));
+    plan.record_full_color_write(&target, sub).unwrap();
+    assert!(plan.has_ordered_color_write(&target));
+    let mut tail = SubmittedTail::default();
+    plan.advance_submitted_tail(&mut tail);
+    assert!(!ResourcePlan::after(&tail).has_ordered_color_write(&target));
 }
 
 /// Include possible compatible ranges before page admission. An earlier
@@ -690,7 +760,11 @@ impl TextureUpload {
         }
         plan.transition_texture(list, &self.target, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32)?;
         self.source.copy_to_subresource(host, list, batch, &self.target.texture, self.sub.index, self.offset)?;
-        plan.record_write_at(&self.target, self.sub.authority())?;
+        if self.fills_target {
+            plan.record_full_color_write(&self.target, self.sub)?;
+        } else {
+            plan.record_color_write(&self.target, self.sub)?;
+        }
         Ok(())
     }
 }
@@ -965,8 +1039,12 @@ impl TextureCopy {
             }
         }
         if same_allocation { scoped.transition(cmd, true); }
-        for authority in self.authorities(self.destination) {
-            plan.record_write_at(&self.dst, authority)?;
+        if !self.destination.is_scoped() && self.area.as_ref().is_none_or(|area| area.fills_destination) {
+            plan.record_full_color_write(&self.dst, self.destination)?;
+        } else {
+            for authority in self.authorities(self.destination) {
+                plan.record_write_at(&self.dst, authority)?;
+            }
         }
         Ok(())
     }
