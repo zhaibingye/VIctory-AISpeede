@@ -148,6 +148,28 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     host
 }
 
+/// 位集合只表示能否写入任一颜色通道，不证明覆盖了任何像素。
+fn color_write_slots(blend: &D3D12_BLEND_DESC, count: u32) -> u8 {
+    let independent = blend.IndependentBlendEnable.as_bool();
+    (0..count.min(8) as usize).fold(0, |slots, slot| {
+        let desc = &blend.RenderTarget[if independent { slot } else { 0 }];
+        slots | (u8::from(desc.RenderTargetWriteMask != 0) << slot)
+    })
+}
+
+#[test]
+fn color_write_slots_follow_effective_blend_descriptors() {
+    let mut blend = D3D12_BLEND_DESC::default();
+    blend.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED.0 as u8;
+    assert_eq!(color_write_slots(&blend, 3), 0);
+    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_GREEN.0 as u8;
+    assert_eq!(color_write_slots(&blend, 3), 0b111);
+    blend.IndependentBlendEnable = true.into();
+    assert_eq!(color_write_slots(&blend, 3), 0b011);
+    assert_eq!(color_write_slots(&blend, 1), 0b001);
+    assert_eq!(color_write_slots(&blend, 0), 0);
+}
+
 impl GraphicsState {
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
@@ -345,6 +367,7 @@ pub(crate) struct HostPipeline {
     pub(crate) closed_color_formats: Option<Vec<DXGI_FORMAT>>,
     pub(crate) closed_depth_format: Option<DXGI_FORMAT>,
     pub(crate) closed_samples: Option<DXGI_SAMPLE_DESC>,
+    pub(crate) closed_color_writes: u8,
     /// Planes to which this host PSO can write: depth (1), stencil (2).
     pub(crate) closed_depth_writes: u32,
     pub(crate) closed_depth_tests: u32,
@@ -625,6 +648,7 @@ impl HostPipeline {
                 closed_color_formats: None,
                 closed_depth_format: None,
                 closed_samples: None,
+                closed_color_writes: 0,
                 closed_depth_writes: 0,
                 closed_depth_tests: 0,
                 name: format!("{shaders:?}"),
@@ -664,6 +688,7 @@ impl HostPipeline {
                 closed_color_formats: None,
                 closed_depth_format: None,
                 closed_samples: None,
+                closed_color_writes: 0,
                 closed_depth_writes: 0,
                 closed_depth_tests: 0,
                 name: format!("{shaders:?}"),
@@ -765,6 +790,7 @@ impl HostPipeline {
                 .then(|| g.targets.RTFormats[..g.targets.NumRenderTargets as usize].to_vec()),
             closed_depth_format: (g.depth_format != DXGI_FORMAT_UNKNOWN).then_some(g.depth_format),
             closed_samples: Some(g.samples),
+            closed_color_writes: color_write_slots(&desc.BlendState, g.targets.NumRenderTargets),
             closed_depth_tests: u32::from(g.depth.DepthEnable.as_bool())
                 | (u32::from(g.depth.StencilEnable.as_bool()) << 1),
             closed_depth_writes: u32::from(g.depth.DepthEnable.as_bool()
