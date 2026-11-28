@@ -58,6 +58,7 @@
 | 弃旧局部清除仍挡共享读；线性 SRV 跨对象别名；体 UAV 未证明的预填充范围 | `page_queue::discarded_partial_color_clear_blocks_shared_texture_read`、`page_queue::linear_read_tests`、`page_uav::prefill_tests` |
 | WARP 实像素读回：提交顺序、完整原生生产者、Alpha 与覆盖、地址式创建不生产旧色 | `page_draw::paged_title_partial_color_clear_observes_submission_order`、`page_draw::paged_title_blended_draw_requires_preceding_full_native_color_producer` |
 | Windows 交互桌面：双层 `PresentX` 显式 CPU 写前后，及同源 `CopyResource` 真 Fence 读回 | `queue::present_fixture::present_x_resolves_explicit_texture_write_before_copy_resource`（定向 `--ignored`） |
+| Windows 硬件 D3D12：两层独立整面清除、叠加层局部混合读旧色、双层 `PresentX` 真 Fence 读回绘制区与保留区 | `queue::present_fixture::present_x_preserves_native_overlay_around_partial_blend`（定向 `--ignored`） |
 | 有序颜色路径的目的范围须完整捕获；别名与空范围反例 | `page_queue::ordered_color_disjoint_requires_complete_physical_destination` |
 | 均匀块末尾反例、非均匀块与 pipe 选择、同主平面不同元数据要求、XG CPU 复制边界 | `victory-formats` 的 `uniform_rx`、`gfx10_rx`（含 `both_addrlib_metadata_modes_match_the_same_rgba8_main_plane`）；`modules::xg::tests::copy_into_rejects_default_render_target_layout_without_writing` |
 | 只改诊断时验证历史分类和失败前缀报告 | `page_resource::native_history_tests`、`page_queue::copy_prefix_` |
