@@ -1,4 +1,4 @@
-//! Small native D3D12 capability probe; no game, shaders, or presentation.
+//! Native D3D12 sparse tile reuse probe; no game, shaders, or presentation.
 //! Backing size describes the explicit tile heap, not total driver memory.
 //! Set `VICTORY_TEST_SPARSE_BACKING=1`, then run:
 //! `cargo test -p victory-gpu --test sparse_backing reserved_buffer_two_tiles -- --exact --nocapture`
@@ -9,20 +9,25 @@ use std::ptr::{copy_nonoverlapping, null_mut};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use victory_gpu::sparse_backing::{SparseBacking, TILE_BYTES};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::Interface;
 
-const TILE_BYTES: u32 = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
 const VIRTUAL_BYTES: u32 = 64 << 20;
-const VIRTUAL_TILES: u32 = VIRTUAL_BYTES / TILE_BYTES;
-const TILE_INDICES: [u32; 2] = [1, VIRTUAL_TILES - 1];
-const BACKING_BYTES: u64 = TILE_INDICES.len() as u64 * TILE_BYTES as u64;
+const VIRTUAL_TILES: u32 = VIRTUAL_BYTES / TILE_BYTES as u32;
+const PHYSICAL_TILES: u32 = 2;
+const BACKING_BYTES: u64 = PHYSICAL_TILES as u64 * TILE_BYTES as u64;
+const RETIRED_TILE: u32 = 1;
+const KEPT_TILE: u32 = VIRTUAL_TILES - 1;
+const REPLACEMENT_TILE: u32 = VIRTUAL_TILES / 2;
 const PATTERN_BYTES: usize = 16;
-const PAYLOAD: &[u8; 2 * PATTERN_BYTES] = b"0123456789ABCDEFqrstuvwxyz!@#$%^";
-const FENCE_VALUE: u64 = 1;
+const READBACK_BYTES: usize = 2 * PATTERN_BYTES;
+const PAYLOAD: &[u8; 3 * PATTERN_BYTES] = b"0123456789ABCDEFqrstuvwxyz!@#$%^recycled-tile-03";
+const FIRST_FENCE: u64 = 1;
+const SECOND_FENCE: u64 = 2;
 const FENCE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[test]
@@ -82,6 +87,7 @@ fn staging(
     device: &ID3D12Device,
     kind: D3D12_HEAP_TYPE,
     state: D3D12_RESOURCE_STATES,
+    bytes: usize,
 ) -> Result<ID3D12Resource> {
     let mut resource = None;
     // SAFETY: the caller supplies the heap type and its required initial state.
@@ -94,7 +100,7 @@ fn staging(
                 ..Default::default()
             },
             D3D12_HEAP_FLAG_NONE,
-            &buffer_desc(PAYLOAD.len() as u64),
+            &buffer_desc(bytes as u64),
             state,
             None,
             &mut resource,
@@ -103,15 +109,15 @@ fn staging(
     resource.context("CreateCommittedResource returned no buffer")
 }
 
-fn record_copies(
+fn record_copies<const N: usize>(
     device: &ID3D12Device,
     allocator: &ID3D12CommandAllocator,
     src: &ID3D12Resource,
-    src_offsets: [u64; 2],
+    src_offsets: [u64; N],
     dst: &ID3D12Resource,
-    dst_offsets: [u64; 2],
+    dst_offsets: [u64; N],
 ) -> Result<ID3D12CommandList> {
-    // SAFETY: the two buffers are live; every range fits its buffer and each
+    // SAFETY: both buffers are live; every range fits its buffer and each
     // sparse range fits a single tile, mapped before the lists are executed.
     unsafe {
         let list: ID3D12GraphicsCommandList = device
@@ -125,24 +131,68 @@ fn record_copies(
     }
 }
 
-fn wait_for_gpu(device: &ID3D12Device, fence: &ID3D12Fence) -> Result<u64> {
+fn submit_copies(queue: &ID3D12CommandQueue, lists: &[ID3D12CommandList; 2]) {
+    // SAFETY: the probe keeps the copy lists, allocator and resources live
+    // until completion. Execute separately so the sparse buffer promotes
+    // COMMON -> COPY_DEST, decays to COMMON, then promotes to COPY_SOURCE.
+    unsafe {
+        for list in lists {
+            queue.ExecuteCommandLists(&[Some(list.clone())]);
+        }
+    }
+}
+
+fn wait_for_gpu(device: &ID3D12Device, fence: &ID3D12Fence, expected: u64) -> Result<u64> {
     let deadline = Instant::now() + FENCE_TIMEOUT;
     loop {
         // SAFETY: querying live native D3D12 objects.
         let completed = unsafe { fence.GetCompletedValue() };
-        if completed != 0 || Instant::now() >= deadline {
+        if completed >= expected || Instant::now() >= deadline {
             // SAFETY: the device is kept live alongside the fence.
             unsafe { device.GetDeviceRemovedReason() }.context("device lost during GPU work")?;
-            // A removed device may make GetCompletedValue return UINT64_MAX;
-            // it must not be mistaken for a completed submission.
+            // Device removal can return u64::MAX, not a completed signal.
             ensure!(
-                completed == FENCE_VALUE,
-                "queue fence expected {FENCE_VALUE}, observed {completed} (limit {FENCE_TIMEOUT:?})"
+                completed == expected,
+                "queue fence expected {expected}, observed {completed} (limit {FENCE_TIMEOUT:?})"
             );
             return Ok(completed);
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+fn verify_readback(readback: &ID3D12Resource, tiles: [u32; 2], expected: &[u8]) -> Result<()> {
+    ensure!(expected.len() == READBACK_BYTES, "invalid readback fixture");
+    let range = D3D12_RANGE {
+        Begin: 0,
+        End: READBACK_BYTES,
+    };
+    let mut data = null_mut();
+    let mut actual = [0u8; READBACK_BYTES];
+    // SAFETY: the phase's fence has completed; the buffer is live and no GPU
+    // work accesses it while we map and read the committed staging range.
+    unsafe {
+        readback
+            .Map(0, Some(&range), Some(&mut data))
+            .context("Map readback")?;
+        if !data.is_null() {
+            copy_nonoverlapping(data.cast::<u8>(), actual.as_mut_ptr(), actual.len());
+        }
+        readback.Unmap(0, Some(&D3D12_RANGE::default()));
+    }
+    ensure!(!data.is_null(), "Map readback returned no CPU pointer");
+    for (i, (got, want)) in actual
+        .chunks_exact(PATTERN_BYTES)
+        .zip(expected.chunks_exact(PATTERN_BYTES))
+        .enumerate()
+    {
+        ensure!(
+            got == want,
+            "readback mismatch at virtual tile {}",
+            tiles[i]
+        );
+    }
+    Ok(())
 }
 
 fn probe() -> Result<()> {
@@ -154,8 +204,8 @@ fn probe() -> Result<()> {
         desc.VendorId, desc.DeviceId
     );
 
-    // SAFETY: the probe owns all objects and CPU mappings; only the two
-    // mapped tiles are copied, and readback waits for the native queue fence.
+    // SAFETY: the probe owns all objects and CPU mappings; only mapped tiles
+    // are copied in each phase, and readback waits for the native queue fence.
     unsafe {
         let mut device = None;
         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
@@ -191,51 +241,18 @@ fn probe() -> Result<()> {
             "TiledResourcesTier={tier}; need >=2"
         );
 
-        let mut heap = None;
-        device
-            .CreateHeap(
-                &D3D12_HEAP_DESC {
-                    SizeInBytes: BACKING_BYTES,
-                    Properties: D3D12_HEAP_PROPERTIES {
-                        Type: D3D12_HEAP_TYPE_DEFAULT,
-                        CreationNodeMask: 1,
-                        VisibleNodeMask: 1,
-                        ..Default::default()
-                    },
-                    Alignment: 0,
-                    Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
-                },
-                &mut heap,
-            )
-            .context("CreateHeap for two 64 KiB tiles")?;
-        let heap: ID3D12Heap = heap.context("CreateHeap returned no heap")?;
-        let mut sparse = None;
-        device
-            .CreateReservedResource(
-                &buffer_desc(u64::from(VIRTUAL_BYTES)),
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut sparse,
-            )
-            .context("CreateReservedResource for 64 MiB buffer")?;
-        let sparse: ID3D12Resource = sparse.context("CreateReservedResource returned no buffer")?;
-        let mut tiles = 0;
-        device.GetResourceTiling(&sparse, Some(&mut tiles), None, None, None, 0, null_mut());
-        ensure!(
-            tiles == VIRTUAL_TILES,
-            "reserved buffer reported {tiles} tiles; expected {VIRTUAL_TILES}"
-        );
-
         let upload = staging(
             &device,
             D3D12_HEAP_TYPE_UPLOAD,
             D3D12_RESOURCE_STATE_GENERIC_READ,
+            PAYLOAD.len(),
         )
         .context("create upload staging buffer")?;
         let readback = staging(
             &device,
             D3D12_HEAP_TYPE_READBACK,
             D3D12_RESOURCE_STATE_COPY_DEST,
+            READBACK_BYTES,
         )
         .context("create readback staging buffer")?;
         let payload_range = D3D12_RANGE {
@@ -263,93 +280,104 @@ fn probe() -> Result<()> {
         let fence: ID3D12Fence = device
             .CreateFence(0, D3D12_FENCE_FLAG_NONE)
             .context("CreateFence")?;
+        let backing = SparseBacking::new(&device, &queue, &fence, VIRTUAL_TILES, PHYSICAL_TILES)
+            .context("create sparse backing")?;
+        let sparse = backing.buffer();
+        let initial_tiles = [RETIRED_TILE, KEPT_TILE];
+        let replacement_tiles = [KEPT_TILE, REPLACEMENT_TILE];
+        let tile_offset = |tile| u64::from(tile) * TILE_BYTES as u64;
         let staging_offsets = [0, PATTERN_BYTES as u64];
-        let sparse_offsets = TILE_INDICES.map(|tile| u64::from(tile) * u64::from(TILE_BYTES));
-        let up = record_copies(
-            &device,
-            &allocator,
-            &upload,
-            staging_offsets,
-            &sparse,
-            sparse_offsets,
-        )
-        .context("record upload copies")?;
-        let down = record_copies(
-            &device,
-            &allocator,
-            &sparse,
-            sparse_offsets,
-            &readback,
-            staging_offsets,
-        )
-        .context("record readback copies")?;
+        let initial = [
+            record_copies(
+                &device,
+                &allocator,
+                &upload,
+                staging_offsets,
+                sparse,
+                initial_tiles.map(tile_offset),
+            )
+            .context("record initial upload copies")?,
+            record_copies(
+                &device,
+                &allocator,
+                sparse,
+                initial_tiles.map(tile_offset),
+                &readback,
+                staging_offsets,
+            )
+            .context("record initial readback copies")?,
+        ];
+        let replacement = [
+            record_copies(
+                &device,
+                &allocator,
+                &upload,
+                [READBACK_BYTES as u64],
+                sparse,
+                [tile_offset(REPLACEMENT_TILE)],
+            )
+            .context("record replacement upload copy")?,
+            // Read the kept tile into a different slot so stale readback bytes
+            // from phase one cannot satisfy either phase-two comparison.
+            record_copies(
+                &device,
+                &allocator,
+                sparse,
+                replacement_tiles.map(tile_offset),
+                &readback,
+                staging_offsets,
+            )
+            .context("record replacement readback copies")?,
+        ];
 
-        let regions = TILE_INDICES.map(|x| D3D12_TILED_RESOURCE_COORDINATE {
-            X: x,
-            ..Default::default()
-        });
-        let sizes = [D3D12_TILE_REGION_SIZE {
-            NumTiles: 1,
-            ..Default::default()
-        }; 2];
-        let flags = [D3D12_TILE_RANGE_FLAG_NONE; 2];
-        let heap_offsets = [0, 1];
-        let counts = [1, 1];
-        // Keep all objects live even on an error after queuing work. If the
-        // wait fails these small allocations are left to test-process teardown.
-        let in_flight = ManuallyDrop::new((
-            up, down, allocator, upload, readback, sparse, heap, fence, queue, device,
+        // Mapping itself queues work. Keep all GPU objects live on any error
+        // from here until the final fence; teardown can reclaim them if needed.
+        let mut in_flight = ManuallyDrop::new((
+            initial,
+            replacement,
+            allocator,
+            upload,
+            readback,
+            backing,
+            fence,
+            queue,
+            device,
         ));
-        let (up, down, _, _, _, sparse, heap, fence, queue, device) = &*in_flight;
-        queue.UpdateTileMappings(
-            sparse,
-            regions.len() as u32,
-            Some(regions.as_ptr()),
-            Some(sizes.as_ptr()),
-            heap,
-            heap_offsets.len() as u32,
-            Some(flags.as_ptr()),
-            Some(heap_offsets.as_ptr()),
-            Some(counts.as_ptr()),
-            D3D12_TILE_MAPPING_FLAG_NONE,
+        let (initial, replacement, _, _, readback, backing, fence, queue, device) = &mut *in_flight;
+        for tile in initial_tiles {
+            ensure!(backing.map_tile(tile)?, "failed to map initial tile {tile}");
+        }
+        submit_copies(queue, initial);
+        // The retired tile's only GPU uses have now been enqueued; its
+        // Signal(FIRST_FENCE) will follow them on the same queue.
+        backing
+            .retire_tile(RETIRED_TILE, FIRST_FENCE)
+            .context("retire the first sparse tile")?;
+        ensure!(
+            !backing.map_tile(REPLACEMENT_TILE)?,
+            "reused retired backing before fence {FIRST_FENCE} was submitted"
         );
-        // UpdateTileMappings is void; check removal now and verify both
-        // mappings via the copies and the fence on this same queue.
-        device
-            .GetDeviceRemovedReason()
-            .context("device lost after UpdateTileMappings")?;
-        // Two ExecuteCommandLists calls: the buffer promotes COMMON ->
-        // COPY_DEST for upload, decays to COMMON, then promotes to COPY_SOURCE.
-        queue.ExecuteCommandLists(&[Some(up.clone())]);
-        queue.ExecuteCommandLists(&[Some(down.clone())]);
-        queue.Signal(fence, FENCE_VALUE).context("queue Signal")?;
-        let completed = wait_for_gpu(device, fence)?;
+        queue
+            .Signal(&*fence, FIRST_FENCE)
+            .context("signal initial fence")?;
+        let initial_completed = wait_for_gpu(device, fence, FIRST_FENCE)?;
+        verify_readback(readback, initial_tiles, &PAYLOAD[..READBACK_BYTES])?;
 
+        ensure!(
+            backing.map_tile(REPLACEMENT_TILE)?,
+            "retired backing was not reusable after fence {initial_completed} completed"
+        );
+        submit_copies(queue, replacement);
+        queue
+            .Signal(&*fence, SECOND_FENCE)
+            .context("signal replacement fence")?;
+        let completed = wait_for_gpu(device, fence, SECOND_FENCE)?;
         let finished = ManuallyDrop::into_inner(in_flight);
         let (_, _, _, _, readback, ..) = &finished;
-        let mut data = null_mut();
-        readback
-            .Map(0, Some(&payload_range), Some(&mut data))
-            .context("Map readback")?;
-        ensure!(!data.is_null(), "Map readback returned no CPU pointer");
-        let mut actual = [0u8; PAYLOAD.len()];
-        copy_nonoverlapping(data.cast::<u8>(), actual.as_mut_ptr(), actual.len());
-        readback.Unmap(0, Some(&empty_range));
-        for (i, (got, want)) in actual
-            .chunks_exact(PATTERN_BYTES)
-            .zip(PAYLOAD.chunks_exact(PATTERN_BYTES))
-            .enumerate()
-        {
-            ensure!(
-                got == want,
-                "readback mismatch at virtual tile {}",
-                TILE_INDICES[i]
-            );
-        }
+        verify_readback(readback, replacement_tiles, &PAYLOAD[PATTERN_BYTES..])?;
         eprintln!(
-            "CAPABILITY sparse_backing status=pass tiled_resources_tier={tier} virtual_bytes={VIRTUAL_BYTES} backing_heap_bytes={BACKING_BYTES} mapped_tiles={} verified_bytes={} fence_completed={completed}",
-            TILE_INDICES.len(),
-            PAYLOAD.len()
+            "CAPABILITY sparse_backing status=pass tiled_resources_tier={tier} virtual_bytes={VIRTUAL_BYTES} backing_heap_bytes={BACKING_BYTES} mapped_tiles={PHYSICAL_TILES} verified_bytes={} reuse_blocked_before_signal=true reused_tile={REPLACEMENT_TILE} first_fence_completed={initial_completed} fence_completed={completed}",
+            2 * READBACK_BYTES
         );
     }
     Ok(())

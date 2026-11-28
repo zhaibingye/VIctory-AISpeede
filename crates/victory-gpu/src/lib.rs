@@ -91,6 +91,8 @@ mod shading;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+pub mod sparse_backing;
+#[cfg(windows)]
 mod tiles;
 pub mod signature;
 #[cfg(windows)]
