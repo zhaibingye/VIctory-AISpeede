@@ -13,6 +13,7 @@
 //! address for good, so the same addresses must stay the same copy.
 //! `VICTORY_UPLOAD_LOW=0`: from the process heap, as before.
 
+use std::num::NonZeroUsize;
 use std::sync::{Mutex, OnceLock};
 
 /// What blocks are cut on: a page of the directory of memory by address.
@@ -54,10 +55,51 @@ fn gap(taken: &[bool], n: usize) -> Option<usize> {
     None
 }
 
-/// Fresh zeroed memory in [4 GiB, 2^37) (where the directory of memory by
-/// address reaches, `MEMORY_PAGES`), write-watched as the title's own
-/// pools are (copies then take only written pages).
+/// Owns fresh zeroed, write-watched memory in [4 GiB, 2^37), within the
+/// directory of memory by address. Dropping it releases the allocation
+/// unless ownership was transferred to the process with [`Self::keep`].
+pub(crate) struct Reservation(NonZeroUsize);
+
+// In the release test, keep parallel users of this allocator from taking
+// the same address between VirtualFree and VirtualQuery.
+#[cfg(test)]
+static RESERVATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+impl Reservation {
+    pub(crate) fn new(len: usize) -> Option<Self> {
+        #[cfg(test)]
+        let _lock = RESERVATION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        allocate(len).map(Self)
+    }
+
+    /// The allocation base, valid while this owner lives or after `keep`.
+    pub(crate) fn address(&self) -> usize {
+        self.0.get()
+    }
+
+    /// Keep this allocation at the same address for the life of the process.
+    pub(crate) fn keep(self) -> usize {
+        let at = self.address();
+        std::mem::forget(self);
+        at
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: this owner holds the original allocation base; MEM_RELEASE
+        // with size zero releases the entire allocation.
+        unsafe { VirtualFree(self.address() as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+/// Fresh write-watched memory kept for the life of the process.
 pub(crate) fn reserve(len: usize) -> Option<usize> {
+    Reservation::new(len).map(Reservation::keep)
+}
+
+fn allocate(len: usize) -> Option<NonZeroUsize> {
     use windows_sys::Win32::System::Memory::{
         MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements,
         PAGE_READWRITE, VirtualAlloc2,
@@ -84,7 +126,7 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
             1,
         )
     } as usize;
-    (at != 0).then_some(at)
+    NonZeroUsize::new(at)
 }
 
 impl Upload {
@@ -146,6 +188,47 @@ pub(crate) fn block(address: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn unpublished_reservation_releases_pages_but_kept_reservation_does_not() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_FREE, MEM_RELEASE, MEMORY_BASIC_INFORMATION, VirtualFree, VirtualQuery,
+        };
+
+        fn query(at: usize) -> MEMORY_BASIC_INFORMATION {
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: VirtualQuery writes into `info` and does not dereference `at`.
+            assert_ne!(unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) }, 0);
+            info
+        }
+
+        let len = 2 * BLOCK;
+        let unpublished = Reservation::new(len).unwrap();
+        let kept = Reservation::new(len).unwrap();
+        let at = unpublished.address();
+        let before = query(at);
+        assert_eq!(before.AllocationBase as usize, at);
+        assert_eq!(before.State, MEM_COMMIT);
+        assert!(before.RegionSize >= len);
+
+        let _lock = RESERVATION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A failure before publication drops the owner.
+        drop(unpublished);
+        let after = query(at);
+        assert_eq!(after.State, MEM_FREE);
+        assert!(after.RegionSize >= len);
+
+        // A successful publication consumes the owner without freeing the pages.
+        let at = kept.address();
+        assert_eq!(kept.keep(), at);
+        let after = query(at);
+        assert_eq!(after.AllocationBase as usize, at);
+        assert_eq!(after.State, MEM_COMMIT);
+        assert!(after.RegionSize >= len);
+        // SAFETY: the kept sample was never shared outside this test.
+        assert_ne!(unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) }, 0);
+    }
 
     #[test]
     fn blocks_lie_below_40_bits_and_are_used_again_zeroed() {

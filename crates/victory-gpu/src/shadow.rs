@@ -94,6 +94,8 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// A by-address copy whose shader side owns `len` bytes of [`BY_ADDRESS_CARD_BYTES`].
+    by_address_on_card: bool,
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
@@ -2764,6 +2766,9 @@ impl Drop for Shadow {
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
+        if self.by_address_on_card {
+            BY_ADDRESS_CARD_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+        }
         let window = self.window;
         if self.mapped && window {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
@@ -3196,6 +3201,11 @@ impl Shadow {
         self.id
     }
 
+    /// Whether this by-address copy's shader side lies in the card's own memory.
+    pub(crate) fn by_address_on_card(&self) -> bool {
+        self.by_address_on_card
+    }
+
     /// Whether it is no copy but title memory in place (`crate::inplace`).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
@@ -3307,6 +3317,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            by_address_on_card: false,
             changes_only: Default::default(),
             wc: AtomicU8::new(0),
             mapped: false,
@@ -5564,6 +5575,26 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
         .any(|(key, entry)| entry.end > address && entry.end - key.0 <= most)
 }
 
+/// A prepared pair not yet visible to the carded-buffer scanners. The
+/// caller publishes it only after the source bytes and descriptor have
+/// been retained, so a failed allocation cannot expose a freed source.
+pub(crate) struct ByAddressBacking(Arc<Shadow>);
+
+impl ByAddressBacking {
+    pub(crate) fn shadow(&self) -> &Arc<Shadow> {
+        &self.0
+    }
+
+    pub(crate) fn publish(self) -> Arc<Shadow> {
+        let shadow = self.0;
+        carded(&shadow);
+        let place = usize::from(!shadow.by_address_on_card);
+        BY_ADDRESS[2 * place].fetch_add(1, Ordering::Relaxed);
+        BY_ADDRESS[2 * place + 1].fetch_add(shadow.len, Ordering::Relaxed);
+        shadow
+    }
+}
+
 /// A copy of the memory `[start, start + len)` (an arena of
 /// [`crate::memory`]'s, its directory, title memory around a small buffer)
 /// for the programs that find memory by address, on the card: the structures
@@ -5572,7 +5603,7 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// What shaders write there by address is not brought back, so the copy is
 /// the only place that has it. The CPU's side holds the bytes as they were
 /// last taken, and only dwords that changed since go up.
-pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
+pub(crate) fn by_address(start: u64, len: u64) -> Option<ByAddressBacking> {
     let host = host()?;
     if !cards() || !host.card_ready() {
         return None;
@@ -5581,7 +5612,6 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
     // that the side shaders see is in the PC's memory.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
@@ -5590,30 +5620,22 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // `crate::resource::by_address_room`.)
     let room = host.video_memory().is_none_or(|[budget, used, ..]| crate::resource::by_address_room(budget, used, len));
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+    let on_card = if room {
+        try_by_address_card(&BY_ADDRESS_CARD_BYTES, len, most, || host.uav_buffer(len))
     } else {
         None
     };
-    // Counted by where it lies: `WINDOW_CARD_BYTES` below takes both.
-    let place = usize::from(on_card.is_none());
-    BY_ADDRESS[2 * place].fetch_add(1, Ordering::Relaxed);
-    BY_ADDRESS[2 * place + 1].fetch_add(len, Ordering::Relaxed);
-    if place == 0 {
-        BY_ADDRESS_ON_CARD.lock().unwrap_or_else(|e| e.into_inner()).insert(start);
-    }
-    let buffer = match on_card {
-        Some(buffer) => buffer,
-        None => host.shared_buffer(len)?.0,
+    let (buffer, by_address_on_card) = match on_card {
+        Some(buffer) => (buffer, true),
+        None => (host.shared_buffer(len)?.0, false),
     };
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
-    // (Counted down with the windows' on the card when it goes.)
-    WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.by_address_on_card = by_address_on_card;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,
@@ -5624,24 +5646,46 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         me: std::sync::OnceLock::new(),
         size: len,
     });
-    let shadow = Arc::new(shadow);
-    carded(&shadow);
-    Some(shadow)
+    // Both placements are counted down with the window card sides on drop.
+    WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+    Some(ByAddressBacking(Arc::new(shadow)))
 }
 
-/// Title memory by address made since the start ([`by_address`]): with its
+/// Title memory by address published since the start ([`by_address`]): with its
 /// shaders' side in the card's own memory, how many and their bytes; then
 /// in the PC's memory, where every access of a shader crosses the bus.
 static BY_ADDRESS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-/// Where the pieces of [`by_address`] made in the card's own memory start
-/// (they live as long as the process).
-static BY_ADDRESS_ON_CARD: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+/// Bytes reserved for by-address shader sides being made or alive in the card's memory.
+static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Whether the piece of [`by_address`] that starts at `start` lies in the
-/// card's own memory (else in the PC's, where shaders read it over the bus).
-pub(crate) fn by_address_on_card(start: u64) -> bool {
-    BY_ADDRESS_ON_CARD.lock().unwrap_or_else(|e| e.into_inner()).contains(&start)
+/// Reserve space before making the shader side. Only a successful allocation
+/// keeps its reservation, which the resulting [`Shadow`] owns.
+fn try_by_address_card<T>(used: &AtomicU64, len: u64, most: u64, make: impl FnOnce() -> Option<T>) -> Option<T> {
+    used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| bytes.checked_add(len).filter(|&sum| sum <= most)).ok()?;
+    let made = make();
+    if made.is_none() {
+        used.fetch_sub(len, Ordering::Relaxed);
+    }
+    made
+}
+
+#[cfg(test)]
+#[test]
+fn by_address_card_reserves_only_with_room_and_rolls_back_failed_allocations() {
+    let used = AtomicU64::new(0);
+    assert_eq!(
+        try_by_address_card(&used, 4, 4, || {
+            assert_eq!(used.load(Ordering::Relaxed), 4);
+            None::<()>
+        }),
+        None
+    );
+    assert_eq!(used.load(Ordering::Relaxed), 0);
+    assert_eq!(try_by_address_card(&used, 4, 4, || Some(())), Some(()));
+    assert_eq!(try_by_address_card::<()>(&used, 1, 4, || unreachable!()), None);
+    assert_eq!(try_by_address_card::<()>(&used, u64::MAX, u64::MAX, || unreachable!()), None);
+    assert_eq!(used.load(Ordering::Relaxed), 4);
 }
 
 /// Copies of title memory outside buffers, by (start, length).

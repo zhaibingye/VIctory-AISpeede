@@ -301,17 +301,34 @@ pub(crate) struct Ready {
     pub(crate) base: u32,
 }
 
+/// Only failed, unpublished reservations reach this diagnostic. The owner
+/// releases them as the caller returns; no live submission names these bytes.
+fn note_unpublished_backing(bytes: u64, stage: &'static str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FAILURES: AtomicU64 = AtomicU64::new(0);
+    let count = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        tracing::warn!(count, bytes, stage, "releasing an unpublished by-address reservation");
+    }
+}
+
 impl Memory {
     fn new() -> Option<Memory> {
         let host = host()?;
         let bytes = u64::from(MEMORY_PAGES) * 8;
         // Zeroed, and watched for writes as the title's memory is.
-        let entries = crate::upload::reserve(bytes as usize)?;
-        let directory = crate::shadow::by_address(entries as u64, bytes)?;
-        crate::host::name(&directory.buffer, || "title memory by address: directory".into());
+        let entries = crate::upload::Reservation::new(bytes as usize)?;
+        let Some(directory) = crate::shadow::by_address(entries.address() as u64, bytes) else {
+            note_unpublished_backing(bytes, "directory buffer");
+            return None;
+        };
+        crate::host::name(&directory.shadow().buffer, || "title memory by address: directory".into());
         // Twice the notes a shader knows of: the programs that walk leave
         // theirs in the first half, the builder in the second ([`ready`]).
-        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 8)?;
+        let Some((faults, data)) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 8) else {
+            note_unpublished_backing(bytes, "fault buffer");
+            return None;
+        };
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
         unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 8) };
@@ -319,7 +336,7 @@ impl Memory {
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
-            directory: (entries as *mut u32, directory),
+            directory: (entries.keep() as *mut u32, directory.publish()),
             faults: (faults, data.cast::<u32>(), gpu),
             copies: Vec::new(),
             numbers: HashMap::new(),
@@ -474,9 +491,10 @@ impl Memory {
         // Small title buffers in it: what the builder stores in them comes
         // back, so title memory itself.
         if self.windows < WINDOWS && crate::shadow::small_buffer_in(start, PAGE, BACK) {
-            if let Some(shadow) = crate::shadow::by_address(start, PAGE)
-                && let Some(n) = self.number(shadow)
+            if let Some(backing) = crate::shadow::by_address(start, PAGE)
+                && let Some(n) = self.number(backing.shadow().clone())
             {
+                drop(backing.publish());
                 self.windows += 1;
                 fill(self.entry(page), n, 0);
                 return true;
@@ -603,12 +621,19 @@ impl Memory {
 
     /// Another arena's pages.
     fn another(&mut self) -> bool {
-        let Some(at) = crate::upload::reserve(ARENA as usize) else {
+        let Some(reservation) = crate::upload::Reservation::new(ARENA as usize) else {
             return false;
         };
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        let Some(backing) = crate::shadow::by_address(reservation.address() as u64, ARENA) else {
+            note_unpublished_backing(ARENA, "arena buffer");
             return false;
         };
+        let Some(n) = self.number(backing.shadow().clone()) else {
+            note_unpublished_backing(ARENA, "arena descriptor");
+            return false;
+        };
+        let at = reservation.keep();
+        drop(backing.publish());
         self.arenas.push((n, at));
         // The lowest first.
         self.free.extend((0..(ARENA / PAGE) as usize).rev().map(|i| (n, at + i * PAGE as usize)));
@@ -1200,7 +1225,7 @@ impl Memory {
     fn census(&self) {
         // The places in `copies` of the arenas on the card.
         let on_card: std::collections::HashSet<usize> =
-            self.arenas.iter().filter(|&&(_, at)| crate::shadow::by_address_on_card(at as u64)).map(|&(n, _)| n).collect();
+            self.arenas.iter().map(|&(n, _)| n).filter(|&n| self.copies[n].by_address_on_card()).collect();
         // Held and free places: on the card, in the PC's memory.
         let mut held = [0usize; 2];
         let mut from_faults = [0usize; 2];
