@@ -651,6 +651,9 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
 static FUNCTIONS: Table<36> = Table(queue_table(false));
 static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 
+#[cfg(all(test, windows, feature = "paged-title", feature = "diagnostics"))]
+mod present_fixture;
+
 #[cfg(test)]
 mod tests {
     use super::*;

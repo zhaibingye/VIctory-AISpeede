@@ -69,6 +69,8 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    #[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+    present_observer: Mutex<Option<std::sync::mpsc::Sender<PresentObservation>>>,
     memory_adapter: OnceLock<Option<IDXGIAdapter3>>,
 }
 
@@ -282,6 +284,8 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             memory_adapter: OnceLock::new(),
             presenter: Mutex::new(Presentation::default()),
+            #[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+            present_observer: Mutex::default(),
         };
         #[cfg(feature = "paged-title")]
         host.sample_memory_pressure();
@@ -3604,19 +3608,84 @@ impl Meter {
     }
 }
 
+#[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+#[derive(Debug)]
+pub(crate) struct PresentObservation {
+    pub(crate) composited: bool,
+    pub(crate) rgba: [u8; 4],
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+type PresentInspector<'a> = &'a mut dyn FnMut(bool, [u8; 4]);
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn first_present_pixel(
+    buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) -> Option<[u8; 4]> {
+    let bgra = match footprint.Footprint.Format {
+        DXGI_FORMAT_R8G8B8A8_UNORM => false,
+        DXGI_FORMAT_B8G8R8A8_UNORM => true,
+        _ => return None,
+    };
+    let offset = usize::try_from(footprint.Offset).ok()?;
+    let read = D3D12_RANGE {
+        Begin: offset,
+        End: offset.checked_add(4)?,
+    };
+    let wrote = D3D12_RANGE { Begin: 0, End: 0 };
+    let mut data = std::ptr::null_mut();
+    // SAFETY: execute waited for the readback copy's real fence. The
+    // footprint is from that copy of a nonempty 8-bit back buffer.
+    let mut rgba = unsafe {
+        buffer.Map(0, Some(&read), Some(&mut data)).ok()?;
+        let pixel = (!data.is_null())
+            .then(|| data.cast::<u8>().add(offset).cast::<[u8; 4]>().read());
+        buffer.Unmap(0, Some(&wrote));
+        pixel?
+    };
+    if bgra {
+        rgba.swap(0, 2);
+    }
+    Some(rgba)
+}
+
 impl Host {
+    /// Arm this host's next `present` call, replacing any unclaimed observer.
+    /// Missing output, non-S_OK status, or failed 8-bit readback disconnects
+    /// rather than publishing a pixel. Use `recv_timeout` in case no present
+    /// reaches the host.
+    #[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+    pub(crate) fn observe_next_present(&self) -> std::sync::mpsc::Receiver<PresentObservation> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *self.present_observer.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
+        receiver
+    }
+
     /// Shows one or more `planes` (each a live host texture and its current
     /// host state, kept in that state), compositing planes 1.. on top of
     /// plane 0 when multiple planes are presented, as frame `frame` (saved if
     /// captures are on). `None` if nothing was shown; else, in diagnostics
     /// builds, whether the frame was black.
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+        #[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+        let mut publish = self
+            .present_observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|sender| {
+                move |composited, rgba| {
+                    let _ = sender.send(PresentObservation { composited, rgba });
+                }
+            });
         self.present_with_compositor(
             planes,
             frame,
             Compositor::new,
-            #[cfg(all(test, feature = "diagnostics"))]
-            |_, _| {},
+            #[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
+            publish.as_mut().map(|inspect| inspect as PresentInspector<'_>),
+            #[cfg(all(test, not(feature = "paged-title"), feature = "diagnostics"))]
+            None,
         )
     }
 
@@ -3625,10 +3694,7 @@ impl Host {
         planes: &[(&ID3D12Resource, u32)],
         frame: u64,
         create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
-        #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
-            &ID3D12Resource,
-            &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-        ),
+        #[cfg(all(test, feature = "diagnostics"))] inspect: Option<PresentInspector<'_>>,
     ) -> Option<bool> {
         let &(primary, _) = planes.first()?;
         // SAFETY: live resources.
@@ -3721,6 +3787,14 @@ impl Host {
             }
             p.copy.reset();
             let list = p.copy.recording();
+            #[cfg(feature = "diagnostics")]
+            let capture_wanted = || {
+                #[cfg(test)]
+                if inspect.is_some() {
+                    return true;
+                }
+                crate::capture::wanted(frame)
+            };
             // 单平面或合成器不可用时，仅允许用整张复制呈现第一个平面。
             let (capture, probe) = if copy_only {
                 let (texture, state) = planes[0];
@@ -3736,9 +3810,25 @@ impl Host {
                 ));
                 list.ResourceBarrier(&before);
                 list.CopyResource(&back, texture);
+                let back_state = D3D12_RESOURCE_STATE_COPY_DEST;
                 #[cfg(feature = "diagnostics")]
-                let capture = (cfg!(test) || crate::capture::wanted(frame))
-                    .then(|| crate::capture::read_back(&self.device, list, texture))
+                let capture_source = texture;
+                #[cfg(all(test, feature = "diagnostics"))]
+                let (capture_source, back_state) = if inspect.is_some() {
+                    // Observe the actual swap-chain output even on fallback,
+                    // not the texture it was copied from.
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        back_state,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    (&back, D3D12_RESOURCE_STATE_COPY_SOURCE)
+                } else {
+                    (capture_source, back_state)
+                };
+                #[cfg(feature = "diagnostics")]
+                let capture = capture_wanted()
+                    .then(|| crate::capture::read_back(&self.device, list, capture_source))
                     .flatten();
                 #[cfg(feature = "diagnostics")]
                 let probe = crate::capture::probe(&self.device, list, texture);
@@ -3751,11 +3841,7 @@ impl Host {
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
                     after.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
                 }
-                after.push(transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ));
+                after.push(transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT));
                 list.ResourceBarrier(&after);
                 (capture, probe)
             } else {
@@ -3852,7 +3938,7 @@ impl Host {
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                     )]);
-                    let capture = (cfg!(test) || crate::capture::wanted(frame))
+                    let capture = capture_wanted()
                         .then(|| crate::capture::read_back(&self.device, list, &back))
                         .flatten();
                     let probe = crate::capture::probe(&self.device, list, &back);
@@ -3881,13 +3967,13 @@ impl Host {
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
-            if let Some((buffer, footprint)) = capture {
-                // Tests inspect the completed copy before flip-discard Present
-                // can invalidate the back buffer, with the presenter still locked.
-                #[cfg(test)]
-                inspect(&buffer, &footprint);
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+            if let Some((buffer, footprint)) = &capture
+                && (!cfg!(test) || crate::capture::wanted(frame))
+            {
+                crate::capture::save_read_back(frame, buffer, footprint);
             }
+            #[cfg(all(not(test), feature = "diagnostics"))]
+            drop(capture);
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             if let Err(error) = status.ok() {
                 tracing::warn!(
@@ -3906,6 +3992,14 @@ impl Host {
                     "宿主交换链未确认呈现"
                 );
                 return None;
+            }
+            #[cfg(all(test, feature = "diagnostics"))]
+            if let (Some(inspect), Some((buffer, footprint))) = (inspect, capture)
+                && let Some(rgba) = first_present_pixel(&buffer, &footprint)
+            {
+                // The pre-Present GPU copy survives flip-discard. Only S_OK
+                // can publish its pixels, with the path that actually ran.
+                inspect(!copy_only, rgba);
             }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
@@ -4719,6 +4813,7 @@ mod present_plane_tests {
             "single-plane control"
         );
         let mut attempted = false;
+        let mut fallback_pixel = None;
         // A failing compositor still presents the frame: its first plane, as
         // a single-plane present does, instead of dropping it.
         assert!(
@@ -4731,12 +4826,16 @@ mod present_plane_tests {
                         windows::Win32::Foundation::E_FAIL,
                     ))
                 },
-                |_, _| {},
+                Some(&mut |composited, rgba| {
+                    assert!(!composited);
+                    fallback_pixel = Some(rgba);
+                }),
             )
             .is_some(),
             "the frame is presented after a compositor failure"
         );
         assert!(attempted);
+        assert_eq!(fallback_pixel, Some([255, 0, 0, 255]));
         assert!(
             host.present(&[(&scene, state)], 3).is_some(),
             "single-plane presentation after compositor initialization failed"
@@ -4747,22 +4846,10 @@ mod present_plane_tests {
                 &[(&scene, state), (&overlay, state)],
                 4,
                 Compositor::new,
-                |buffer, footprint| {
-                    let mut mapped = std::ptr::null_mut();
-                    // SAFETY: execute waited for the pre-Present copy. Read one
-                    // RGBA pixel from its footprint, before unmapping the buffer.
-                    unsafe {
-                        buffer.Map(0, None, Some(&mut mapped)).unwrap();
-                        pixel = Some(
-                            mapped
-                                .cast::<u8>()
-                                .add(footprint.Offset as usize)
-                                .cast::<[u8; 4]>()
-                                .read(),
-                        );
-                        buffer.Unmap(0, None);
-                    }
-                },
+                Some(&mut |composited, rgba| {
+                    assert!(composited);
+                    pixel = Some(rgba);
+                }),
             )
             .is_some(),
             "compositor initialization can be retried after failure"
