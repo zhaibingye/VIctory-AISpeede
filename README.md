@@ -21,7 +21,7 @@ VIctory 在 Windows 上原生运行 Xbox Series 游戏。这个分支只支持 S
 | 第一段任务演出 | 可以显示街道、建筑、车辆、角色、标题和字幕；画面缺光照，部分远处几何和角色显示异常，单帧约需 1 至 2 秒 |
 
 第三代内存引擎 VNME 仍在开发，使用 `paged-title` 功能显式开启。
-现行架构、实机证据和发版门槛见 [VNME 第三代架构与开发路线](docs/vnme.md)。
+见 [VNME 架构与验收](docs/vnme.md)、[实机与验证证据](docs/vnme-evidence.md) 和 [开发原则](docs/development.md)。
 
 > 较早的版本进入游戏世界时曾导致 GPU 挂起，Windows 可能重置显示驱动，
 > 短暂黑屏。遇到 GPU 错误可查看 `crashes.log`。诊断版可使用
