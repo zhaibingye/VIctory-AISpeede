@@ -68,5 +68,5 @@
 
 ## 当前状态指针
 
-- VNME 最近实机基准 `8c7269a`：按 A 后 draw 15 首拒 `MissingTextureContent`，未证明实际目标有可读的完整旧色。
+- VNME 最近实机基准为 `89e6734` 上的本地诊断 `d4d37f6`：可见继续提示的双层送显已确认前置整面 RTV 清除；按 A 后 `draw 15` 首拒 `MissingTextureContent`，不把提示层的已定义内容归给被拒目标。见[实机交接证据](docs/vnme-evidence.md#开场颜色内容交接)。
 - 独立 `fxceless/victory-fork@2eade68`：同机、同游戏入口、Series S 到达语言选择（实证记录 `4cce33f`）。未确认同一 draw、有效底图或可控场景，不是可玩验证。后续对照按来宾描述、实际 RTV 绑定、混合与相对顺序配对，不按 draw 编号、尺寸或地址猜对应；证据和限制以[实机证据](docs/vnme-evidence.md)为准。
