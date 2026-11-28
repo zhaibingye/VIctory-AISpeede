@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
+use crate::byte_ranges::ByteRanges;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
@@ -771,8 +772,8 @@ struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
-    // Last refresh frame and covered interval for throttled, unwatched copies.
-    unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
+    // Last scheduled frame and exact coverage for throttled, unwatched copies.
+    unwatched: std::collections::HashMap<u64, (u64, ByteRanges)>,
 }
 
 impl Default for BufferSweep {
@@ -834,7 +835,7 @@ mod heap_range_tests {
         assert_eq!(ranges.ranges().count(), SLOTS.div_ceil(3) as usize - 1);
     }
 
-    /// The spans of 4,400 copies from the ranges of 72,000 slots, as a pass
+    /// The range unions of 4,400 copies from 72,000 slots, as a pass
     /// makes them, by slot and from the table they were in. Run with
     /// `--ignored --nocapture`.
     #[test]
@@ -850,11 +851,13 @@ mod heap_range_tests {
             slots.set(slot, Some((copy.clone(), u64::from(slot), u64::from(slot) + 64)));
         }
         fn join<S: std::hash::BuildHasher + Default>(ranges: &mut dyn Iterator<Item = &(Arc<u64>, u64, u64)>) -> usize {
-            let mut spans: HashMap<usize, (Arc<u64>, u64, u64), S> = HashMap::default();
+            let mut spans: HashMap<usize, (Arc<u64>, super::ByteRanges), S> = HashMap::default();
             for (copy, from, to) in ranges {
-                let span = spans.entry(Arc::as_ptr(copy) as usize).or_insert_with(|| (copy.clone(), *from, *to));
-                span.1 = span.1.min(*from);
-                span.2 = span.2.max(*to);
+                spans
+                    .entry(Arc::as_ptr(copy) as usize)
+                    .or_insert_with(|| (copy.clone(), Default::default()))
+                    .1
+                    .insert(*from as usize, *to as usize);
             }
             spans.len()
         }
@@ -1272,7 +1275,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
-        Some(((shadow, address, address + len), written))
+        Some(((shadow, address, address.saturating_add(len)), written))
     };
     // Some slots at a time, on several threads.
     const AT_A_TIME: usize = 256;
@@ -1309,18 +1312,32 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
+    // Intersect each picked view with the copy its slot shows, then take
+    // the union per copy. Bytes between views are not part of the refresh.
+    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, ByteRanges)> = Default::default();
     let mut views = 0u32;
     for (shadow, from, to) in ranges.ranges() {
         views += 1;
+        let (start, len) = shadow.span();
+        let from = (*from).max(start);
+        let to = (*to).min(start.saturating_add(len));
+        if from >= to {
+            continue;
+        }
+        let (Ok(from), Ok(to)) = (usize::try_from(from), usize::try_from(to)) else {
+            continue;
+        };
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
+        spans.entry(key).or_insert_with(|| (shadow.clone(), ByteRanges::default())).1.insert(from, to);
     }
-    let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
-    // Memory that is not write-watched is copied whole by every refresh.
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    // The first pass and every growth of the set by half.
+    let seen = LOGGED.load(Ordering::Relaxed);
+    let log = u64::from(views) > seen + seen / 2;
+    let copies = spans.len();
+    let mut planned_bytes = 0;
+    let mut hole_bytes = 0;
+    // Every refresh of unwatched memory copies its requested range in full.
     // It was once refreshed only every 120 frames (unmapped pages read
     // one by one cost 14 GB a frame in run 11, before they were
     // remembered): streamed geometry then drew from stale buffers, and
@@ -1331,20 +1348,30 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let every = *EVERY.get_or_init(|| {
         std::env::var("VICTORY_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
-    let mut found = Vec::with_capacity(spans.len());
+    let mut found = Vec::with_capacity(copies);
     let mut next_unwatched = std::collections::HashMap::new();
-    for (shadow, from, to) in spans.values() {
-        if every > 1 && shadow.unwatched() {
-            let id = shadow.id();
-            if let Some(&(last, low, high)) = unwatched.get(&id)
-                && frame >= last && frame - last < every && low <= *from && *to <= high
-            {
-                next_unwatched.insert(id, (last, low, high));
-                continue;
-            }
-            next_unwatched.insert(id, (frame, *from, *to));
+    for (shadow, requested) in spans.into_values() {
+        let throttle = every > 1 && shadow.unwatched();
+        // A new view in a gap of the old plan must still be refreshed.
+        if throttle
+            && let Some((last, covered)) = unwatched.remove(&shadow.id())
+            && frame >= last && frame - last < every
+            && requested.iter().all(|(from, to)| covered.contains(from, to))
+        {
+            next_unwatched.insert(shadow.id(), (last, covered));
+            continue;
         }
-        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
+        if log {
+            // These are plan bytes, before submission and write-watch. The
+            // holes are the bytes that a single envelope would have added.
+            let bytes = requested.byte_len();
+            planned_bytes += bytes;
+            hole_bytes += requested.bounds().map_or(0, |(from, to)| to - from - bytes);
+        }
+        found.extend(requested.iter().map(|(from, to)| (shadow.clone(), from as u64, to as u64)));
+        if throttle {
+            next_unwatched.insert(shadow.id(), (frame, requested));
+        }
     }
     *unwatched = next_unwatched;
     drop(kept);
@@ -1355,16 +1382,15 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     for (sum, time) in HEAP_SPLIT.iter().zip([looked - started, refreshed - looked]) {
         sum.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
     }
-    static LOGGED: AtomicU64 = AtomicU64::new(0);
-    // The first pass and every growth of the set by half.
-    let seen = LOGGED.load(Ordering::Relaxed);
-    if u64::from(views) > seen + seen / 2 {
+    if log {
         LOGGED.store(u64::from(views), Ordering::Relaxed);
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = spans.len(),
-            mb = bytes >> 20,
+            copies,
+            refresh_ranges = found.len(),
+            planned_bytes,
+            hole_bytes,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"
         );
