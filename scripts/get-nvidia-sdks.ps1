@@ -1,5 +1,5 @@
 # Fetches the NVIDIA files DLSS and DLSS frame generation need (about 70 MB) from NVIDIA's own GitHub into
-# nvidia-sdk\Streamline\bin\x64 here (git-ignored), where scripts\play-foxhound.ps1 looks for them. They are
+# nvidia-sdk\Streamline\bin\x64 here (git-ignored), or a folder named with -To. They are
 # NVIDIA's, under NVIDIA's licences (saved beside them: read them); this repository does not and may not carry
 # them, so each person gets them from NVIDIA directly. Get-NVIDIA-DLSS.cmd in the repository's folder runs this.
 # Nothing of NVIDIA's is needed to build the layer: the files are loaded when the game runs.

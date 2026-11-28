@@ -2,8 +2,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::{Console, Unimplemented};
+use crate::Unimplemented;
 
+// Keep the standalone Series X patch and its tests; only the upscaler is used at launch.
+#[cfg_attr(not(test), allow(dead_code))]
 #[path = "native_1440p.rs"]
 mod native_1440p;
 
@@ -39,19 +41,16 @@ fn check_cpu_features() -> Result<()> {
 }
 
 #[cfg(windows)]
-pub fn run(
-    exe: &Path,
-    unimplemented: Unimplemented,
-    strict: bool,
-    execute: bool,
-    console: Console,
-) -> Result<()> {
+pub fn run(exe: &Path, unimplemented: Unimplemented, strict: bool, execute: bool) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
     if execute {
         check_cpu_features()?;
+    }
+    for key in ["VICTORY_NATIVE_1440P", "VICTORY_RENDER_1080P"] {
+        anyhow::ensure!(std::env::var(key).as_deref() != Ok("1"), "{key} requires the unsupported Series X profile");
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
@@ -63,8 +62,7 @@ pub fn run(
     let asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
     let available = victory_hle::streamline::init(&asked);
     // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
-    // scale with its own FidelityFX upscaling (no Streamline): DLSS's
-    // comparison, and on Series X what that path alone looks like.
+    // scale with its own FidelityFX upscaling (no Streamline), for DLSS comparisons.
     let fsr_path = std::env::var_os("VICTORY_FSR_PATH").is_some_and(|v| v == "1");
     let upscaler = (available.dlss || available.framegen || fsr_path).then_some(asked.mode);
     if fsr_path && !asked.any() {
@@ -86,42 +84,7 @@ pub fn run(
         None => println!("build          unknown ({hash})"),
     }
 
-    // A 1440p output instead of the Series X's 4K one (`native_1440p`): the
-    // patched image goes to a folder of its own, beside the stock one.
-    let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
-    let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
-    let images = if native_1440p {
-        anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
-        if upscaler.is_some() && render_1080p {
-            println!("display        VICTORY_RENDER_1080P is left out: VICTORY_DLSS_MODE sets the scene's size");
-        }
-        let (w, h) = native_1440p::prepare(&mut prepared, render_1080p && upscaler.is_none())?;
-        // SAFETY: nothing else runs yet; the title and the display mode list
-        // read these later.
-        unsafe {
-            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::WIDTH, native_1440p::HEIGHT));
-            std::env::set_var("VICTORY_NATIVE_1440P", "1");
-        }
-        match upscaler.map(|mode| (mode, native_1440p::prepare_upscaler(&mut prepared, mode))) {
-            Some((mode, Ok(()))) => {
-                let [rw, rh] = mode.render_size([native_1440p::WIDTH, native_1440p::HEIGHT]);
-                println!(
-                    "display        {}x{} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})",
-                    native_1440p::WIDTH,
-                    native_1440p::HEIGHT,
-                    mode.name()
-                );
-                cfg.cache_subdir(&format!("images/native-1440p-upscaler-{}-sdr", mode.name()))?
-            }
-            other => {
-                if let Some((_, Err(e))) = other {
-                    println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
-                }
-                println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
-                cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
-            }
-        }
-    } else if let Some(mode) = upscaler {
+    let images = if let Some(mode) = upscaler {
         match native_1440p::prepare_upscaler(&mut prepared, mode) {
             Ok(()) => {
                 println!("display        the title's output, scene at {} of it through its FidelityFX path ({})", mode.scale(), mode.name());
@@ -174,10 +137,7 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
-    victory_hle::console::set(match console {
-        Console::SeriesX => victory_hle::console::Console::SeriesX,
-        Console::SeriesS => victory_hle::console::Console::SeriesS,
-    });
+    victory_hle::console::set(victory_hle::console::Console::SeriesS);
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
@@ -676,6 +636,6 @@ mod cpu_check_tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

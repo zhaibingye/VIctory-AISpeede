@@ -24,7 +24,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[command(
     name = "victory",
     version,
-    about = "Run an Xbox Series title natively on Windows"
+    about = "Run an Xbox Series title natively on Windows in Series S mode"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -151,9 +151,9 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
-        /// The console model the title sees (device type, memory).
-        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
-        console: Console,
+        /// Compatibility option; only the Series S profile is supported.
+        #[arg(long = "console", value_name = "MODEL", value_parser = ["series-s"])]
+        _console: Option<String>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -191,12 +191,6 @@ enum Unimplemented {
     Zero,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Console {
-    SeriesX,
-    SeriesS,
-}
-
 fn main() -> Result<()> {
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -213,10 +207,9 @@ fn main() -> Result<()> {
     // before anything else is set up.
     #[cfg(windows)]
     if let Command::Play(options) = &cli.command {
-        let done = play::prepare(options).and_then(|ready| {
+        let done = play::prepare(options).and_then(|exe| {
             victory_core::logging::init("info");
-            let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };
-            run::run(&ready.exe, Unimplemented::Trap, false, true, console)
+            run::run(&exe, Unimplemented::Trap, false, true)
         });
         if let Err(e) = &done
             && bare
@@ -277,11 +270,11 @@ fn main() -> Result<()> {
             unimplemented,
             strict,
             execute,
-            console,
             title_args,
+            ..
         } => {
             victory_hle::runtime::set_title_args(title_args);
-            run::run(&exe, unimplemented, strict, execute, console)
+            run::run(&exe, unimplemented, strict, execute)
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),

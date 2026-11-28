@@ -1,7 +1,7 @@
 //! `victory play`, and `victory` started with no command at all (a double
 //! click): the title with the settings this fork plays with, so that the
 //! program alone, put beside the title's `game_scarlett_master.exe`, is all
-//! there is to start. What `scripts\play-foxhound.ps1` does, built in.
+//! there is to start. The title always runs with the Series S profile.
 //!
 //! Nothing is written beside the program or into the title's folder: the
 //! settings the F1 menu saves (`victory-settings.txt`), the logs and NVIDIA's
@@ -25,8 +25,7 @@ const GAME: &str = "game_scarlett_master.exe";
 /// `scripts\get-nvidia-sdks.ps1`, run by Windows PowerShell.
 const FETCH: &str = include_str!("../../../scripts/get-nvidia-sdks.ps1");
 
-/// The settings the title is started with (`scripts\play-foxhound.ps1` has
-/// the same, with what each is for).
+/// The settings the title is started with.
 const SETTINGS: &[(&str, &str)] = &[
     // Submission and copy machinery
     ("VICTORY_THIN", "1"),
@@ -104,7 +103,6 @@ const KEPT: &[&str] = &[
     "VICTORY_LOG",
 ];
 
-const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
 const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
 
 #[derive(clap::Args, Clone, Debug)]
@@ -112,13 +110,9 @@ pub(crate) struct Play {
     /// The title's executable. Without it: `game_scarlett_master.exe` beside
     /// this program, else in the current folder.
     exe: Option<PathBuf>,
-    /// The Series S profile (1280x720 inside: faster, softer).
-    #[arg(long)]
-    series_s: bool,
-    /// 1440: output and scene 2560x1440; 1080to1440: scene 1920x1080
-    /// upscaled by the title; 4k: the stock 3840x2160 output.
-    #[arg(long, default_value = "1440", value_parser = RESOLUTIONS)]
-    res: String,
+    /// Compatibility flag; Series S is the only supported profile.
+    #[arg(long = "series-s")]
+    _series_s: bool,
     /// DLSS in place of the title's upscaling (needs NVIDIA's files).
     #[arg(long, default_value = "quality", value_parser = DLSS_MODES)]
     dlss: String,
@@ -173,13 +167,12 @@ fn parse_menu(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The settings of a start and whether it is the Series S profile: the
-/// options, what the menu saved over them (`menu`), `--set` over both.
+/// The settings of a start: the options, what the menu saved over them
+/// (`menu`), `--set` over both. Only current menu choices are applied, so
+/// older saved console and resolution selections are ignored.
 /// `streamline`: the folder with NVIDIA's files, if there is one.
-fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (BTreeMap<String, String>, bool) {
+fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> BTreeMap<String, String> {
     let saved = |k: &str| menu.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-    let series_s = saved("VICTORY_MENU_CONSOLE").map_or(o.series_s, |c| c == "series-s");
-    let res = saved("VICTORY_MENU_RES").filter(|r| RESOLUTIONS.contains(r)).unwrap_or(&o.res);
     let dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
     // 0: off; 2 to 6: that many frames shown for each one rendered (1, from an older file: 2).
     let (mut framegen, mut times) = (o.framegen.is_some(), o.framegen.unwrap_or(2));
@@ -197,13 +190,6 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
 
     let mut s: BTreeMap<String, String> = SETTINGS.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
-    if !series_s {
-        match res {
-            "1440" => set("VICTORY_NATIVE_1440P", "1"),
-            "1080to1440" => set("VICTORY_RENDER_1080P", "1"),
-            _ => {}
-        }
-    }
     let (mut dlss_on, mut framegen_x) = (false, None);
     if dlss != "off"
         && let Some(dir) = streamline
@@ -239,12 +225,10 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     }
     // For the menu: what it shows as the current choices.
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
-    set("VICTORY_MENU_CONSOLE", if series_s { "series-s" } else { "series-x" });
-    set("VICTORY_MENU_RES", res);
     set("VICTORY_MENU_DLSS", if dlss_on { dlss } else { "off" });
     set("VICTORY_MENU_FRAMEGEN", &framegen_x.unwrap_or(0).to_string());
     set("VICTORY_MENU_FPS", &fps.to_string());
-    (s, series_s)
+    s
 }
 
 /// `year-month-day-hour-minute-second` (UTC) of `seconds` since 1970.
@@ -333,16 +317,10 @@ fn offer_dlss() {
     }
 }
 
-/// What a start needs once its settings are in the environment.
-pub(crate) struct Ready {
-    pub(crate) exe: PathBuf,
-    pub(crate) series_s: bool,
-}
-
-/// Finds the title, puts the settings into the environment and names the
-/// log file (`VICTORY_LOG_FILE`). Called first thing, before any thread of
+/// Returns the title's path, puts the settings into the environment and names
+/// the log file (`VICTORY_LOG_FILE`). Called first thing, before any thread of
 /// ours is started and before logging is set up.
-pub(crate) fn prepare(o: &Play) -> Result<Ready> {
+pub(crate) fn prepare(o: &Play) -> Result<PathBuf> {
     let program = std::env::current_exe().context("this program's own path")?;
     let here = program.parent().map(Path::to_path_buf).unwrap_or_default();
     let exe = match &o.exe {
@@ -374,7 +352,7 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         offer_dlss();
     }
     let streamline = streamline_dir(&here);
-    let (mut s, series_s) = settings(o, &menu, streamline.as_deref());
+    let mut s = settings(o, &menu, streamline.as_deref());
     // Where the menu saves, and how it starts the title again (`--set` is not carried over).
     let quoted = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "''"));
     s.insert("VICTORY_MENU_FILE".to_owned(), menu_file.to_string_lossy().into_owned());
@@ -384,9 +362,8 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         format!("play {}{}", quoted(&exe), if o.no_framegen_ready { " --no-framegen-ready" } else { "" }),
     );
     let log = log_file(&home.join("logs"))?;
-    let console = if series_s { "series-s" } else { "series-x" };
     let line: Vec<String> = s.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    std::fs::write(&log, format!("# console={console} build=release switches: {}\n", line.join(" ")))
+    std::fs::write(&log, format!("# console=series-s build=release switches: {}\n", line.join(" ")))
         .with_context(|| format!("writing {}", log.display()))?;
     println!("Log: {}", log.display());
     s.insert("VICTORY_LOG_FILE".to_owned(), log.to_string_lossy().into_owned());
@@ -404,7 +381,7 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
             std::env::set_var(k, v);
         }
     }
-    Ok(Ready { exe, series_s })
+    Ok(exe)
 }
 
 /// After a start that went wrong in a window of its own (a double click):
@@ -424,8 +401,7 @@ mod tests {
     fn options() -> Play {
         Play {
             exe: None,
-            series_s: false,
-            res: "1440".to_owned(),
+            _series_s: false,
             dlss: "quality".to_owned(),
             framegen: None,
             no_framegen_ready: false,
@@ -437,13 +413,11 @@ mod tests {
     #[test]
     fn a_plain_start_is_the_launchers() {
         let dir = Path::new(r"C:\nvidia");
-        let (s, series_s) = settings(&options(), &[], Some(dir));
-        assert!(!series_s);
+        let s = settings(&options(), &[], Some(dir));
         for (k, v) in SETTINGS {
             assert_eq!(s.get(*k).map(String::as_str), Some(*v), "{k}");
         }
         let get = |k: &str| s.get(k).map(String::as_str);
-        assert_eq!(get("VICTORY_NATIVE_1440P"), Some("1"));
         assert_eq!((get("VICTORY_DLSS"), get("VICTORY_DLSS_MODE")), (Some("1"), Some("quality")));
         assert_eq!(get("VICTORY_STREAMLINE_DIR"), Some(r"C:\nvidia"));
         // frame generation ready, off, with a little memory held back for it
@@ -451,29 +425,29 @@ mod tests {
         assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("1000"));
         assert_eq!((get("VICTORY_MENU_DLSS"), get("VICTORY_MENU_FRAMEGEN")), (Some("quality"), Some("0")));
-        assert_eq!((get("VICTORY_MENU_CONSOLE"), get("VICTORY_MENU_FPS")), (Some("series-x"), Some("1000")));
+        assert_eq!(get("VICTORY_MENU_FPS"), Some("1000"));
     }
 
     #[test]
     fn without_nvidias_files_there_is_no_dlss() {
-        let (s, _) = settings(&options(), &[], None);
+        let s = settings(&options(), &[], None);
         assert!(!s.contains_key("VICTORY_DLSS") && !s.contains_key("VICTORY_FRAMEGEN"));
         assert!(!s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT"));
         assert_eq!(s.get("VICTORY_MENU_DLSS").map(String::as_str), Some("off"));
     }
 
     #[test]
-    fn what_the_menu_saved_goes_over_the_options() {
+    fn what_the_menu_saved_goes_over_the_options_except_series_x_choices() {
         let menu = parse_menu(
-            "# Saved by the F1 menu\r\nVICTORY_MENU_FRAMEGEN=6\r\nVICTORY_MENU_CONSOLE=series-s\r\n\
-             VICTORY_MENU_DLSS=performance\r\nVICTORY_MENU_FPS=60\r\nVICTORY_BVH_BUILDER=\r\n\
-             VICTORY_AMBIENT=0.5\r\nVICTORY_EARLY_DEPTH=\r\nnot a setting=1\r\n",
+            "# Saved by the F1 menu\r\nVICTORY_MENU_FRAMEGEN=6\r\nVICTORY_MENU_CONSOLE=series-x\r\n\
+             VICTORY_MENU_RES=1080to1440\r\nVICTORY_MENU_DLSS=performance\r\nVICTORY_MENU_FPS=60\r\n\
+             VICTORY_BVH_BUILDER=\r\nVICTORY_AMBIENT=0.5\r\nVICTORY_EARLY_DEPTH=\r\nnot a setting=1\r\n",
         );
-        let (s, series_s) = settings(&options(), &menu, Some(Path::new("x")));
+        let s = settings(&options(), &menu, Some(Path::new("x")));
         let get = |k: &str| s.get(k).map(String::as_str);
-        assert!(series_s);
-        // the Series S profile has no picture size of its own
-        assert_eq!(get("VICTORY_NATIVE_1440P"), None);
+        // The fixed Series S launch must not forward any Series X choices.
+        assert_eq!((get("VICTORY_MENU_CONSOLE"), get("VICTORY_MENU_RES")), (None, None));
+        assert_eq!((get("VICTORY_RENDER_1080P"), get("VICTORY_NATIVE_1440P")), (None, None));
         assert_eq!((get("VICTORY_DLSS_MODE"), get("VICTORY_FRAMEGEN_X")), (Some("performance"), Some("6")));
         assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("80"));
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("16667"));
@@ -486,11 +460,10 @@ mod tests {
     #[test]
     fn options_and_set_are_applied() {
         let mut o = options();
-        (o.res, o.dlss, o.framegen, o.fps) = ("1080to1440".to_owned(), "off".to_owned(), Some(4), 30);
+        (o.dlss, o.framegen, o.fps) = ("off".to_owned(), Some(4), 30);
         o.more = vec!["VICTORY_AMBIENT=0".to_owned(), "VICTORY_NEW = 2".to_owned()];
-        let (s, _) = settings(&o, &[], Some(Path::new("x")));
+        let s = settings(&o, &[], Some(Path::new("x")));
         let get = |k: &str| s.get(k).map(String::as_str);
-        assert_eq!((get("VICTORY_RENDER_1080P"), get("VICTORY_NATIVE_1440P")), (Some("1"), None));
         // no DLSS, so no frame generation either
         assert_eq!((get("VICTORY_DLSS"), get("VICTORY_FRAMEGEN")), (None, None));
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("33333"));

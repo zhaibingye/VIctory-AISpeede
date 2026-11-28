@@ -1,6 +1,8 @@
 # DLSS and DLSS Frame Generation (NVIDIA Streamline)
 
-Two switches, both off by default:
+This upstream technical note includes historical Series X observations. The current launcher supports Series S only; the Series X launch recipes below no longer apply.
+
+Two switches, both off by default for direct `victory run`:
 
 - `VICTORY_DLSS=1`: DLSS Super Resolution does the title's FidelityFX upscaling
   (its `ffxDispatch`), from the same colour, depth, motion vectors, exposure and
