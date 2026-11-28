@@ -1013,13 +1013,15 @@ impl HostTexture {
     }
 
     #[cfg(feature = "paged-title")]
-    pub(crate) fn compatible_texture_source(&self) -> Option<crate::page_texture::LinearTexture> {
+    pub(crate) fn has_compatible_texture_version(&self) -> bool {
         use victory_memory::authority::Representation;
-        let value = self.native_authority.lock().unwrap_or_else(|e| e.into_inner());
-        if value.get(&None)?.version.representation != Representation::CompatibleBytes {
-            return None;
-        }
-        self.exact_committed_bytes()
+        self.native_authority.lock().unwrap_or_else(|e| e.into_inner())
+            .get(&None).is_some_and(|v| v.version.representation == Representation::CompatibleBytes)
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn compatible_texture_source(&self) -> Option<crate::page_texture::LinearTexture> {
+        if self.has_compatible_texture_version() { self.exact_committed_bytes() } else { None }
     }
 
     pub(crate) fn has_pointer_exposure(&self) -> bool {
@@ -1455,7 +1457,7 @@ pub(crate) mod life {
 
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
+#[cfg(all(windows, any(not(feature = "paged-title"), test)))]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let host = resource(this).host.as_ref()?;

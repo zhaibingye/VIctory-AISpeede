@@ -280,7 +280,7 @@ fn present_x_resolves_explicit_texture_write_before_copy_resource() {
             present_x(q.0, planes.len() as u32, planes.as_ptr(), null()),
             S_OK
         );
-        // Wait past present_now's source state restoration, not just its DXGI call.
+        // Wait for the guest presentation job to finish, not just its DXGI call.
         wait_for_queue(fence);
         let observed = observed
             .recv_timeout(TIMEOUT)
@@ -335,7 +335,10 @@ fn present_x_resolves_explicit_texture_write_before_copy_resource() {
         &overlay_native,
         &resource::host_copy(overlay.0).unwrap()
     ));
+    let overlay_state = overlay_native.state.load(Ordering::Acquire);
     let shown_b = present("after WriteToSubresource, before CopyResource", 4);
+    let presented_version = version(&overlay_native);
+    assert_eq!(overlay_native.state.load(Ordering::Acquire), overlay_state);
 
     let copying = new_list();
     slot::<extern "system" fn(This, This, This)>(copying.0, 0x88)(
@@ -399,4 +402,7 @@ fn present_x_resolves_explicit_texture_write_before_copy_resource() {
         [127, 128, 0, 255],
         "PresentX must composite the explicit B write",
     );
+    assert_completed_native(presented_version);
+    assert_eq!(presented_version.version.number, overlay_b.version.number);
+    assert!(presented_version.fence.0 > overlay_b.fence.0);
 }

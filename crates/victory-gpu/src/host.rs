@@ -3608,6 +3608,33 @@ impl Meter {
     }
 }
 
+enum PresentPlanes<'a> {
+    #[cfg(any(not(feature = "paged-title"), test))]
+    Native(&'a [(&'a ID3D12Resource, u32)]),
+    #[cfg(feature = "paged-title")]
+    Title(&'a [std::sync::Arc<crate::resource::HostTexture>]),
+}
+
+impl<'a> PresentPlanes<'a> {
+    fn len(&self) -> usize {
+        match self {
+            #[cfg(any(not(feature = "paged-title"), test))]
+            Self::Native(planes) => planes.len(),
+            #[cfg(feature = "paged-title")]
+            Self::Title(planes) => planes.len(),
+        }
+    }
+
+    fn texture(&self, index: usize) -> &'a ID3D12Resource {
+        match self {
+            #[cfg(any(not(feature = "paged-title"), test))]
+            Self::Native(planes) => planes[index].0,
+            #[cfg(feature = "paged-title")]
+            Self::Title(planes) => &planes[index].texture,
+        }
+    }
+}
+
 #[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
 #[derive(Debug)]
 pub(crate) struct PresentObservation {
@@ -3666,7 +3693,19 @@ impl Host {
     /// plane 0 when multiple planes are presented, as frame `frame` (saved if
     /// captures are on). `None` if nothing was shown; else, in diagnostics
     /// builds, whether the frame was black.
+    #[cfg(any(not(feature = "paged-title"), test))]
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+        self.present_planes(PresentPlanes::Native(planes), frame)
+    }
+
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn present_paged(
+        &self, planes: &[std::sync::Arc<crate::resource::HostTexture>], frame: u64,
+    ) -> Option<bool> {
+        self.present_planes(PresentPlanes::Title(planes), frame)
+    }
+
+    fn present_planes(&self, planes: PresentPlanes<'_>, frame: u64) -> Option<bool> {
         #[cfg(all(test, feature = "paged-title", feature = "diagnostics"))]
         let mut publish = self
             .present_observer
@@ -3691,12 +3730,14 @@ impl Host {
 
     fn present_with_compositor(
         &self,
-        planes: &[(&ID3D12Resource, u32)],
+        planes: PresentPlanes<'_>,
         frame: u64,
         create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
         #[cfg(all(test, feature = "diagnostics"))] inspect: Option<PresentInspector<'_>>,
     ) -> Option<bool> {
-        let &(primary, _) = planes.first()?;
+        let count = planes.len().min(MAX_PLANES as usize);
+        if count == 0 { return None; }
+        let primary = planes.texture(0);
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
         let Some(format) = swap_format(primary_desc.Format) else {
@@ -3704,9 +3745,9 @@ impl Host {
             return None;
         };
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
-        for &(tex, _) in &planes[1..] {
+        for index in 1..count {
             // SAFETY: live resource.
-            let d = unsafe { tex.GetDesc() };
+            let d = unsafe { planes.texture(index).GetDesc() };
             width = width.max(d.Width as u32);
             height = height.max(d.Height);
         }
@@ -3724,7 +3765,7 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
-        if planes.len() > 1 && p.compositor.as_ref().is_none_or(|c| c.format != format) {
+        if count > 1 && p.compositor.as_ref().is_none_or(|c| c.format != format) {
             match create_compositor(&self.device, format) {
                 Ok(c) => p.compositor = Some(c),
                 Err(error) => {
@@ -3733,7 +3774,7 @@ impl Host {
                 }
             }
         }
-        let plans_to_composite = planes.len() > 1 && p.compositor.is_some();
+        let plans_to_composite = count > 1 && p.compositor.is_some();
         if !plans_to_composite {
             // 降级为单平面时仍按源纹理的尺寸配置后台缓冲区；整张复制不能缩放。
             (width, height) = (primary_desc.Width as u32, primary_desc.Height);
@@ -3785,6 +3826,32 @@ impl Host {
                     return None;
                 }
             }
+            // Window and swap-chain setup are outside the direct-queue lock.
+            // Resolve the versions immediately before recording their reads.
+            #[cfg(feature = "paged-title")]
+            let mut ordered = {
+                self.sample_memory_pressure();
+                self.direct_queue()
+            };
+            let consumed = if copy_only { 1 } else { count };
+            #[cfg(feature = "paged-title")]
+            let title_sources;
+            let sources: &[(&ID3D12Resource, u32)] = match planes {
+                #[cfg(any(not(feature = "paged-title"), test))]
+                PresentPlanes::Native(planes) => &planes[..consumed],
+                #[cfg(feature = "paged-title")]
+                PresentPlanes::Title(planes) => {
+                    let planes = &planes[..consumed];
+                    if let Err(error) = self.prepare_present_textures_locked(&mut ordered, planes) {
+                        tracing::warn!(frame, ?error, "[VNME_PRESENT_REJECTED] 无法准备 CPU 纹理版本，未送显");
+                        return None;
+                    }
+                    title_sources = planes.iter().map(|plane| {
+                        (&plane.texture, plane.state.load(Ordering::Acquire))
+                    }).collect::<Vec<_>>();
+                    &title_sources
+                }
+            };
             p.copy.reset();
             let list = p.copy.recording();
             #[cfg(feature = "diagnostics")]
@@ -3797,7 +3864,7 @@ impl Host {
             };
             // 单平面或合成器不可用时，仅允许用整张复制呈现第一个平面。
             let (capture, probe) = if copy_only {
-                let (texture, state) = planes[0];
+                let (texture, state) = sources[0];
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
@@ -3863,10 +3930,9 @@ impl Host {
                 );
                 let srv_cpu_base = comp.srv_heap.GetCPUDescriptorHandleForHeapStart();
                 let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
-                let count = planes.len().min(MAX_PLANES as usize);
                 let mut before = Vec::with_capacity(count + 1);
                 let mut after = Vec::with_capacity(count);
-                for (i, &(tex, state)) in planes[..count].iter().enumerate() {
+                for (i, &(tex, state)) in sources.iter().enumerate() {
                     let d = tex.GetDesc();
                     let srv_fmt = swap_format(d.Format).unwrap_or(d.Format);
                     let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -3891,7 +3957,7 @@ impl Host {
                     );
                     let state = D3D12_RESOURCE_STATES(state as i32);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-                        && !planes[..i].iter().any(|(seen, _)| seen.as_raw() == tex.as_raw())
+                        && !sources[..i].iter().any(|(seen, _)| seen.as_raw() == tex.as_raw())
                     {
                         before.push(transition(tex, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                         after.push(transition(tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, state));
@@ -3965,6 +4031,20 @@ impl Host {
                 (capture, probe)
             };
             p.copy.close();
+            #[cfg(feature = "paged-title")]
+            {
+                // This host-owned list has no deferred title work. Do not
+                // re-enter execute while the direct queue is ordered.
+                if let Err(error) = p.copy.recording().cast()
+                    .and_then(|command| self.run_native_group(&mut ordered, &[Some(command)]))
+                {
+                    fail(format_args!("等待送显命令的 GPU Fence 失败：{error}{}", self.removal_data(&[&p.copy])));
+                }
+                release_retired();
+                self.log_messages();
+                drop(ordered);
+            }
+            #[cfg(not(feature = "paged-title"))]
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = &capture
@@ -4818,7 +4898,7 @@ mod present_plane_tests {
         // a single-plane present does, instead of dropping it.
         assert!(
             host.present_with_compositor(
-                &[(&scene, state), (&overlay, state)],
+                PresentPlanes::Native(&[(&scene, state), (&overlay, state)]),
                 2,
                 |_, _| {
                     attempted = true;
@@ -4843,7 +4923,7 @@ mod present_plane_tests {
         let mut pixel = None;
         assert!(
             host.present_with_compositor(
-                &[(&scene, state), (&overlay, state)],
+                PresentPlanes::Native(&[(&scene, state), (&overlay, state)]),
                 4,
                 Compositor::new,
                 Some(&mut |composited, rgba| {

@@ -1449,6 +1449,43 @@ impl Host {
         ClosedTitleBatch::capture(lists)?.execute(self, heap, backing)
     }
 
+    /// Materialize a published CPU write on demand, before the compositor
+    /// samples any plane. The caller holds the same direct-queue lock through
+    /// the present draw; the presentation barriers must use the post-upload state.
+    #[cfg(feature = "paged-title")]
+    pub(crate) fn prepare_present_textures_locked(
+        &self, signal: &mut u64, planes: &[std::sync::Arc<crate::resource::HostTexture>],
+    ) -> std::result::Result<(), BatchError> {
+        let mut ranges = Vec::new();
+        let mut uploads = Vec::new();
+        for plane in planes {
+            if !plane.has_compatible_texture_version()
+                || uploads.iter().any(|&seen| std::sync::Arc::ptr_eq(seen, plane))
+            {
+                continue;
+            }
+            let layout = plane.exact_committed_bytes()
+                .ok_or(BatchError::unsupported_texture_map("PresentX 无法确认 CPU 纹理后备"))?;
+            ranges.extend(layout.rows()?);
+            uploads.push(plane);
+        }
+        if uploads.is_empty() {
+            return Ok(());
+        }
+        let heap = crate::memory::heap().ok_or_else(|| BatchError::Native(oom()))?;
+        let mut backing = SubmissionBacking::default();
+        self.execute_paged_work_locked(signal, heap, &mut backing, &ranges, WriteSet::Declared,
+            |list, _, batch, _, _, plan| {
+                for plane in uploads {
+                    let before = plan.state(plane);
+                    plan.require_native(self, list, batch, plane)?;
+                    plan.transition_texture(list, plane, before.0 as u32)?;
+                }
+                Ok(BTreeSet::new())
+            })?;
+        Ok(())
+    }
+
     /// Materialize a completed native texture at an actual CPU Map
     /// demand, using the same physical-page writeback as title work.
     #[cfg(feature = "paged-title")]

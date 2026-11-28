@@ -24,6 +24,7 @@
 
 - 旧内容按同一键依序查本批 `pending` → 同队列在途窗口的 `SubmittedTail` → 已完成版本。单 mip 单 slice 的颜色纹理可用整资源键，多子资源用精确键；尺寸、相邻命令和跨对象版本号不建立继承关系。相同布局或物理身份也不能代替内容权威。
 - 已编码前缀不等于已入队，已入队不等于已完成。队列顺序可服务后续同队列消费者；页、描述符及在途资源所需的保活不能提前撤销，也不能用 CPU 计时、命令记录或诊断历史代替实际 Fence。只有观察到相关真实 GPU Fence 完成、必要的字节回读与合并成功之后，才能发布完成版本。不能以静默回退 Shadow Buffer 来掩盖准入失败。
+- `PresentX` 在逻辑队列运行到该操作时，只对实际消费的平面处理已发布的 `CompatibleBytes`；在同一个 Direct Queue 锁内，经 `ResourcePlan::require_native` 转成同版本的原生表示、恢复资源状态，再录制并执行送显读取。没有已发布 CPU 版本时不为这一步上传；这不证明未追踪的指针写或未知别名有效。合成器建立窗口和调用 DXGI `Present` 不持这个锁。
 - `title_backing::merge_page` 只写提交前像与 GPU 回读的**差异**与**显式覆盖**的并集，不按整页写回。中间间隙可能有并行 CPU 更新，也可能是只读宿主页；整页读改写会丢掉更新或失败。碎片写回只保证不触及这些间隙，不裁决 CPU/GPU 同字节冲突。
 
 ### 写窗口、快照和共享读取
@@ -56,6 +57,7 @@
 | 按片段写回，保留/避开间隙；单次复制的同页非重叠 vs 争写 | `title_backing::writeback_tests`、`copy_plan::alias_tests`、`page_queue::paged_buffer_copy_rejects_self_aliased_destination_before_submitting_prefix` |
 | 弃旧局部清除仍挡共享读；线性 SRV 跨对象别名；体 UAV 未证明的预填充范围 | `page_queue::discarded_partial_color_clear_blocks_shared_texture_read`、`page_queue::linear_read_tests`、`page_uav::prefill_tests` |
 | WARP 实像素读回：提交顺序、完整原生生产者、Alpha 与覆盖、地址式创建不生产旧色 | `page_draw::paged_title_partial_color_clear_observes_submission_order`、`page_draw::paged_title_blended_draw_requires_preceding_full_native_color_producer` |
+| Windows 交互桌面：双层 `PresentX` 显式 CPU 写前后，及同源 `CopyResource` 真 Fence 读回 | `queue::present_fixture::present_x_resolves_explicit_texture_write_before_copy_resource`（定向 `--ignored`） |
 | 有序颜色路径的目的范围须完整捕获；别名与空范围反例 | `page_queue::ordered_color_disjoint_requires_complete_physical_destination` |
 | 均匀块末尾反例、非均匀块与 pipe 选择、同主平面不同元数据要求、XG CPU 复制边界 | `victory-formats` 的 `uniform_rx`、`gfx10_rx`（含 `both_addrlib_metadata_modes_match_the_same_rgba8_main_plane`）；`modules::xg::tests::copy_into_rejects_default_render_target_layout_without_writing` |
 | 只改诊断时验证历史分类和失败前缀报告 | `page_resource::native_history_tests`、`page_queue::copy_prefix_` |

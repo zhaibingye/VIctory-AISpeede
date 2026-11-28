@@ -405,48 +405,82 @@ fn present_now(planes: u32, plane_parameters: *const Plane) -> HRESULT {
         && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes `planes` plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
-        use windows::core::Interface;
-        let mut sources: Vec<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> =
-            Vec::with_capacity(slice.len());
-        let mut restore = Vec::with_capacity(slice.len());
-        for (index, plane) in slice.iter().enumerate() {
-            // SAFETY: the title passes each plane's resource array.
-            let resource = unsafe { first_plane_resource(plane) };
-            if let Some(texture) = crate::resource::host_resource(resource) {
-                // Several title objects may share one host texture. Keep their
-                // plane order but transition and restore that host copy once.
-                let state = match sources.iter().find(|(seen, _)| seen.as_raw() == texture.as_raw()) {
-                    Some(&(_, state)) => state,
-                    None => {
-                        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-                            .map_or(COPY_SOURCE, |(_, before)| before);
-                        restore.push((resource, state));
-                        state
-                    }
-                };
-                sources.push((texture, state));
-            } else if index == 0 {
-                // 此时尚未触碰任何资源状态。不能把字幕或界面叠加层当成底图。
-                tracing::debug!(frame, planes, "主画面层没有可用的宿主纹理，未呈现叠加层");
-                return S_OK;
-            }
-        }
-        // 主画面层不可用时已提前返回，因此这里至少有一个源和它的原状态。
-        let shown = host.present(&sources, frame);
-        for &(resource, state) in &restore {
-            crate::resource::host_transition(resource, state);
-        }
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, restore[0].0, restore[0].1, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        #[cfg(feature = "paged-title")]
+        present_paged(host, slice, frame);
+        #[cfg(not(feature = "paged-title"))]
+        present_legacy(host, slice, frame, planes);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
+}
+
+#[cfg(all(windows, feature = "paged-title"))]
+fn present_paged(host: &crate::host::Host, planes: &[Plane], frame: u64) {
+    let mut sources = Vec::with_capacity(planes.len());
+    for (index, plane) in planes.iter().enumerate() {
+        // SAFETY: present_now received live plane resource arrays.
+        let resource = unsafe { first_plane_resource(plane) };
+        if let Some(texture) = crate::resource::host_copy(resource) {
+            sources.push(texture);
+        } else if index == 0 {
+            tracing::debug!(frame, planes = planes.len(), "主画面层没有可用的宿主纹理，未呈现叠加层");
+            return;
+        }
+    }
+    let shown = host.present_paged(&sources, frame);
+    #[cfg(feature = "diagnostics")]
+    blinks(
+        frame,
+        // SAFETY: the primary was checked above and present_now owns the array.
+        unsafe { first_plane_resource(&planes[0]) },
+        sources[0].state.load(Ordering::Acquire),
+        shown,
+    );
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = shown;
+}
+
+#[cfg(all(windows, not(feature = "paged-title")))]
+fn present_legacy(host: &crate::host::Host, slice: &[Plane], frame: u64, planes: u32) {
+    const COPY_SOURCE: u32 = 0x800;
+    use windows::core::Interface;
+    let mut sources: Vec<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> =
+        Vec::with_capacity(slice.len());
+    let mut restore = Vec::with_capacity(slice.len());
+    for (index, plane) in slice.iter().enumerate() {
+        // SAFETY: the title passes each plane's resource array.
+        let resource = unsafe { first_plane_resource(plane) };
+        if let Some(texture) = crate::resource::host_resource(resource) {
+            // Several title objects may share one host texture. Keep their
+            // plane order but transition and restore that host copy once.
+            let state = match sources.iter().find(|(seen, _)| seen.as_raw() == texture.as_raw()) {
+                Some(&(_, state)) => state,
+                None => {
+                    let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                        .map_or(COPY_SOURCE, |(_, before)| before);
+                    restore.push((resource, state));
+                    state
+                }
+            };
+            sources.push((texture, state));
+        } else if index == 0 {
+            // 此时尚未触碰任何资源状态。不能把字幕或界面叠加层当成底图。
+            tracing::debug!(frame, planes, "主画面层没有可用的宿主纹理，未呈现叠加层");
+            return;
+        }
+    }
+    // 主画面层不可用时已提前返回，因此这里至少有一个源和它的原状态。
+    let shown = host.present(&sources, frame);
+    for &(resource, state) in &restore {
+        crate::resource::host_transition(resource, state);
+    }
+    #[cfg(feature = "diagnostics")]
+    blinks(frame, restore[0].0, restore[0].1, shown);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = shown;
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
