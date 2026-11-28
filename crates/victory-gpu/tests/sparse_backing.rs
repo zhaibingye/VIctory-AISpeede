@@ -2,6 +2,8 @@
 //! Backing size describes the explicit tile heap, not total driver memory.
 //! Set `VICTORY_TEST_SPARSE_BACKING=1`, then run:
 //! `cargo test -p victory-gpu --test sparse_backing reserved_buffer_two_tiles -- --exact --nocapture`
+//! For the separate CPU-visible alias probe, set `VICTORY_TEST_SPARSE_CPU_ALIAS=1`:
+//! `cargo test -p victory-gpu --test sparse_backing cpu_visible_heap_supplies_sparse_tile -- --exact --nocapture`
 #![cfg(windows)]
 
 use std::mem::ManuallyDrop;
@@ -131,10 +133,9 @@ fn record_copies<const N: usize>(
     }
 }
 
-fn submit_copies(queue: &ID3D12CommandQueue, lists: &[ID3D12CommandList; 2]) {
-    // SAFETY: the probe keeps the copy lists, allocator and resources live
-    // until completion. Execute separately so the sparse buffer promotes
-    // COMMON -> COPY_DEST, decays to COMMON, then promotes to COPY_SOURCE.
+fn execute_separately(queue: &ID3D12CommandQueue, lists: &[ID3D12CommandList]) {
+    // SAFETY: the probes keep the lists, allocator and resources live until
+    // completion. Separate submissions let buffers decay to COMMON between uses.
     unsafe {
         for list in lists {
             queue.ExecuteCommandLists(&[Some(list.clone())]);
@@ -347,7 +348,7 @@ fn probe() -> Result<()> {
         for tile in initial_tiles {
             ensure!(backing.map_tile(tile)?, "failed to map initial tile {tile}");
         }
-        submit_copies(queue, initial);
+        execute_separately(queue, initial);
         // The retired tile's only GPU uses have now been enqueued; its
         // Signal(FIRST_FENCE) will follow them on the same queue.
         backing
@@ -367,7 +368,7 @@ fn probe() -> Result<()> {
             backing.map_tile(REPLACEMENT_TILE)?,
             "retired backing was not reusable after fence {initial_completed} completed"
         );
-        submit_copies(queue, replacement);
+        execute_separately(queue, replacement);
         queue
             .Signal(&*fence, SECOND_FENCE)
             .context("signal replacement fence")?;
@@ -381,4 +382,344 @@ fn probe() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[test]
+fn cpu_visible_heap_supplies_sparse_tile() {
+    if !std::env::var_os("VICTORY_TEST_SPARSE_CPU_ALIAS").is_some_and(|v| v == "1") {
+        eprintln!("CAPABILITY sparse_cpu_alias status=skipped opt_in=VICTORY_TEST_SPARSE_CPU_ALIAS=1");
+        return;
+    }
+    if let Err(e) = probe_cpu_alias() {
+        panic!("CAPABILITY sparse_cpu_alias status=fail error={e:#}");
+    }
+}
+
+fn record_alias(
+    device: &ID3D12Device,
+    allocator: &ID3D12CommandAllocator,
+    before: Option<&ID3D12Resource>,
+    after: &ID3D12Resource,
+) -> Result<ID3D12CommandList> {
+    // SAFETY: both resources (if present) stay live through execution. The
+    // cloned references in the barrier are released after recording it.
+    unsafe {
+        let list: ID3D12GraphicsCommandList = device
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, None)
+            .context("CreateCommandList for alias barrier")?;
+        let mut barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Aliasing: ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                    pResourceBefore: ManuallyDrop::new(before.cloned()),
+                    pResourceAfter: ManuallyDrop::new(Some(after.clone())),
+                }),
+            },
+        };
+        list.ResourceBarrier(std::slice::from_ref(&barrier));
+        let alias = &mut *barrier.Anonymous.Aliasing;
+        ManuallyDrop::drop(&mut alias.pResourceBefore);
+        ManuallyDrop::drop(&mut alias.pResourceAfter);
+        list.Close().context("Close alias barrier list")?;
+        list.cast().context("query ID3D12CommandList")
+    }
+}
+
+fn check_alias_debug(info: Option<&ID3D12InfoQueue>, stage: &str) -> Result<()> {
+    let Some(info) = info else {
+        return Ok(());
+    };
+    // SAFETY: query and read each message into aligned storage of the size
+    // returned by the debug queue; its description lives in that storage.
+    unsafe {
+        for i in 0..info.GetNumStoredMessages() {
+            let mut size = 0;
+            info.GetMessage(i, None, &mut size)
+                .with_context(|| format!("{stage}: size D3D12 debug message"))?;
+            let mut storage = vec![0u64; size.div_ceil(size_of::<u64>())];
+            let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            info.GetMessage(i, Some(message), &mut size)
+                .with_context(|| format!("{stage}: read D3D12 debug message"))?;
+            let m = &*message;
+            if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                let text = String::from_utf8_lossy(text);
+                bail!(
+                    "{stage}: D3D12 debug message {}: {}",
+                    m.ID.0,
+                    text.trim_end_matches('\0')
+                );
+            }
+        }
+        info.ClearStoredMessages();
+    }
+    Ok(())
+}
+
+// SAFETY: caller uses a live CPU-visible buffer with sufficient size, no
+// pending GPU use, and (for the placed resource) the active alias.
+unsafe fn write_probe_bytes(buffer: &ID3D12Resource, bytes: &[u8]) -> Result<()> {
+    let empty = D3D12_RANGE::default();
+    let mut data = null_mut();
+    unsafe {
+        buffer
+            .Map(0, Some(&empty), Some(&mut data))
+            .context("Map")?;
+        if data.is_null() {
+            buffer.Unmap(0, Some(&empty));
+            bail!("Map returned no CPU pointer");
+        }
+        copy_nonoverlapping(bytes.as_ptr(), data.cast::<u8>(), bytes.len());
+        let written = D3D12_RANGE {
+            Begin: 0,
+            End: bytes.len(),
+        };
+        buffer.Unmap(0, Some(&written));
+    }
+    Ok(())
+}
+
+// SAFETY: same requirements as write_probe_bytes; the bytes to read must
+// have been initialized before the completed CPU or GPU handoff.
+unsafe fn read_probe_bytes<const N: usize>(buffer: &ID3D12Resource) -> Result<[u8; N]> {
+    let range = D3D12_RANGE { Begin: 0, End: N };
+    let mut data = null_mut();
+    let mut bytes = [0; N];
+    unsafe {
+        buffer
+            .Map(0, Some(&range), Some(&mut data))
+            .context("Map")?;
+        if !data.is_null() {
+            copy_nonoverlapping(data.cast::<u8>(), bytes.as_mut_ptr(), N);
+        }
+        buffer.Unmap(0, Some(&D3D12_RANGE::default()));
+    }
+    ensure!(!data.is_null(), "Map returned no CPU pointer");
+    Ok(bytes)
+}
+
+fn probe_cpu_alias() -> Result<()> {
+    const NONCE: &[u8; PATTERN_BYTES] = b"CPU-tile-nonce01";
+    const GPU_RESULT: &[u8; PATTERN_BYTES] = b"GPU-tile-result!";
+    const GUARD: &[u8; PATTERN_BYTES] = b"keep-this-guard!";
+    const RESULT_AT: usize = PATTERN_BYTES;
+    const GUARD_AT: usize = 2 * PATTERN_BYTES;
+    const CHECK_BYTES: usize = 3 * PATTERN_BYTES;
+    const THIRD_FENCE: u64 = 3;
+
+    let (adapter, adapter_desc) = nvidia_adapter()?;
+    let name = String::from_utf16_lossy(&adapter_desc.Description);
+    let name = name.trim_end_matches('\0');
+    eprintln!(
+        "CAPABILITY sparse_cpu_alias status=adapter name={name:?} vendor={:#06x} device={:#06x}",
+        adapter_desc.VendorId, adapter_desc.DeviceId
+    );
+
+    // SAFETY: this probe owns all GPU objects and uses one Direct queue; the
+    // only CPU mappings are committed staging and active, fenced alias P.
+    unsafe {
+        let mut layer: Option<ID3D12Debug> = None;
+        if D3D12GetDebugInterface(&mut layer).is_ok() {
+            layer.iter().for_each(|l| l.EnableDebugLayer());
+        }
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+            .context("D3D12CreateDevice on the selected adapter")?;
+        let device = device.context("D3D12CreateDevice returned no device")?;
+        let info = device.cast::<ID3D12InfoQueue>().ok();
+        let debug_info_queue = info.is_some();
+        eprintln!(
+            "CAPABILITY sparse_cpu_alias status=validation debug_info_queue={debug_info_queue}"
+        );
+        ensure!(
+            device.GetNodeCount() == 1,
+            "probe requires a single D3D12 node"
+        );
+
+        let mut heap = None;
+        device
+            .CreateHeap(
+                &D3D12_HEAP_DESC {
+                    SizeInBytes: u64::from(TILE_BYTES),
+                    Properties: D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_CUSTOM,
+                        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                        MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                        CreationNodeMask: 1,
+                        VisibleNodeMask: 1,
+                    },
+                    Alignment: 0,
+                    Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                },
+                &mut heap,
+            )
+            .context("CreateHeap(CUSTOM/WRITE_BACK/L0/ALLOW_ONLY_BUFFERS)")?;
+        let heap: ID3D12Heap = heap.context("CreateHeap returned no heap")?;
+        // Identical buffer layouts at the same byte origin for data inheritance.
+        let desc = buffer_desc(u64::from(TILE_BYTES));
+        let mut placed = None;
+        device
+            .CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut placed)
+            .context("CreatePlacedResource P at heap offset 0")?;
+        let placed: ID3D12Resource = placed.context("CreatePlacedResource returned no P")?;
+        let mut reserved = None;
+        device
+            .CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut reserved)
+            .context("CreateReservedResource R")?;
+        let reserved: ID3D12Resource = reserved.context("CreateReservedResource returned no R")?;
+        let mut tiles = 0;
+        device.GetResourceTiling(&reserved, Some(&mut tiles), None, None, None, 0, null_mut());
+        device
+            .GetDeviceRemovedReason()
+            .context("device lost after GetResourceTiling")?;
+        ensure!(tiles == 1, "reserved buffer reported {tiles} tiles; expected 1");
+
+        let upload = staging(
+            &device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            PATTERN_BYTES,
+        )
+        .context("create upload verification staging")?;
+        let readback = staging(
+            &device,
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            PATTERN_BYTES,
+        )
+        .context("create readback verification staging")?;
+        write_probe_bytes(&upload, GPU_RESULT).context("write upload staging")?;
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+            .context("CreateCommandQueue")?;
+        let allocator: ID3D12CommandAllocator = device
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            .context("CreateCommandAllocator")?;
+        let fence: ID3D12Fence = device
+            .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+            .context("CreateFence")?;
+        check_alias_debug(info.as_ref(), "create alias resources and verification staging")?;
+
+        // Retain everything if an error leaves work without a proven fence,
+        // including the void tile update. Normal mismatches after a completed
+        // fence still release the objects.
+        let live = ManuallyDrop::new((
+            placed, reserved, heap, upload, readback, allocator, fence, queue, info, device,
+        ));
+        let (placed, reserved, heap, upload, readback, allocator, fence, queue, info, device) = &*live;
+        let mut lists = ManuallyDrop::new(Vec::new());
+        let mut pending = false;
+        let run = (|| -> Result<()> {
+            let finish = |value, stage: &'static str| -> Result<u64> {
+                queue
+                    .Signal(fence, value)
+                    .context("Signal native queue fence")
+                    .context(stage)?;
+                wait_for_gpu(device, fence, value).context(stage)
+            };
+            lists.push(record_alias(device, allocator, None, placed).context("record NULL -> P")?);
+            check_alias_debug(info.as_ref(), "record NULL -> P")?;
+            let at = D3D12_TILED_RESOURCE_COORDINATE::default();
+            let region = D3D12_TILE_REGION_SIZE {
+                NumTiles: 1,
+                ..Default::default()
+            };
+            let range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+            let heap_offset = 0;
+            let range_count = 1;
+            pending = true;
+            queue.UpdateTileMappings(
+                reserved,
+                1,
+                Some(&at),
+                Some(&region),
+                Some(heap),
+                1,
+                Some(&range_flag),
+                Some(&heap_offset),
+                Some(&range_count),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+            device
+                .GetDeviceRemovedReason()
+                .context("device lost after UpdateTileMappings R[0] -> H[0]")?;
+            let mapped = check_alias_debug(info.as_ref(), "UpdateTileMappings R[0] -> H[0]");
+            if mapped.is_ok() {
+                execute_separately(queue, &lists);
+            }
+            // Drain even if InfoQueue rejected the update, but don't use R or P.
+            let activated = finish(FIRST_FENCE, "fence for UpdateTileMappings / NULL -> P");
+            pending = activated.is_err();
+            mapped?;
+            let activated = activated?;
+            check_alias_debug(info.as_ref(), "activate P with NULL -> P")?;
+
+            let mut initial = [0xa5; CHECK_BYTES];
+            initial[..RESULT_AT].copy_from_slice(NONCE);
+            initial[GUARD_AT..].copy_from_slice(GUARD);
+            write_probe_bytes(placed, &initial).context("CPU write through P")?;
+            check_alias_debug(info.as_ref(), "CPU write through P")?;
+            lists.clear();
+            lists.push(
+                record_alias(device, allocator, Some(placed), reserved).context("record P -> R")?,
+            );
+            lists.push(
+                record_copies(device, allocator, reserved, [0], readback, [0])
+                    .context("record R -> readback nonce copy")?,
+            );
+            check_alias_debug(info.as_ref(), "record P -> R and reserved readback")?;
+            pending = true;
+            execute_separately(queue, &lists);
+            let read = finish(SECOND_FENCE, "fence for P -> R and reserved readback")?;
+            pending = false;
+            check_alias_debug(info.as_ref(), "P -> R and reserved readback")?;
+            let actual = read_probe_bytes::<PATTERN_BYTES>(readback)
+                .context("CPU read from readback staging")?;
+            check_alias_debug(info.as_ref(), "CPU read from readback staging")?;
+            ensure!(
+                actual == *NONCE,
+                "CPU -> R -> readback nonce mismatch: got {actual:02x?}, want {NONCE:02x?}"
+            );
+
+            lists.clear();
+            lists.push(
+                record_copies(device, allocator, upload, [0], reserved, [RESULT_AT as u64])
+                    .context("record upload -> R result copy")?,
+            );
+            lists.push(
+                record_alias(device, allocator, Some(reserved), placed).context("record R -> P")?,
+            );
+            check_alias_debug(info.as_ref(), "record reserved write and R -> P")?;
+            pending = true;
+            execute_separately(queue, &lists);
+            let written = finish(THIRD_FENCE, "fence for reserved write and R -> P")?;
+            pending = false;
+            check_alias_debug(info.as_ref(), "reserved write and R -> P")?;
+            let actual = read_probe_bytes::<CHECK_BYTES>(placed).context("CPU read through P")?;
+            device
+                .GetDeviceRemovedReason()
+                .context("device lost after CPU read through P")?;
+            check_alias_debug(info.as_ref(), "CPU read through P")?;
+            ensure!(&actual[..RESULT_AT] == NONCE, "R -> P changed the CPU nonce");
+            ensure!(
+                &actual[RESULT_AT..GUARD_AT] == GPU_RESULT,
+                "GPU -> R -> P result mismatch: got {:02x?}, want {GPU_RESULT:02x?}",
+                &actual[RESULT_AT..GUARD_AT]
+            );
+            ensure!(&actual[GUARD_AT..] == GUARD, "R -> P changed the original guard");
+            eprintln!(
+                "CAPABILITY sparse_cpu_alias status=pass heap=CUSTOM/WRITE_BACK/L0 heap_bytes={TILE_BYTES} mapped_tiles=1 gpu_readback_nonce=match cpu_nonce=match gpu_result=match guard=match activation_fence={activated} read_fence={read} write_fence={written} debug_info_queue={debug_info_queue}"
+            );
+            Ok(())
+        })();
+        if !pending {
+            drop(ManuallyDrop::into_inner(lists));
+            drop(ManuallyDrop::into_inner(live));
+        }
+        run
+    }
 }
