@@ -25,6 +25,9 @@ use windows_sys::Win32::System::Memory::{
     MemExtendedParameterAddressRequirements, PAGE_READWRITE, VirtualAlloc2, VirtualFree,
 };
 
+#[path = "present_overlay_draw.rs"]
+mod present_overlay_draw;
+
 static BACKING: LazyLock<Mutex<VirtualPages>> =
     LazyLock::new(|| Mutex::new(VirtualPages::default()));
 const PAGE: usize = PAGE_BYTES as usize;
@@ -405,4 +408,228 @@ fn present_x_resolves_explicit_texture_write_before_copy_resource() {
     assert_completed_native(presented_version);
     assert_eq!(presented_version.version.number, overlay_b.version.number);
     assert!(presented_version.fence.0 > overlay_b.fence.0);
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop and hardware D3D12 device"]
+fn present_x_preserves_native_overlay_around_partial_blend() {
+    const CHILD: &str = "VICTORY_PRESENT_X_NATIVE_BLEND_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // The backing hooks, presenter and capture settings are process-global.
+        let captures = tempfile::tempdir().expect("temporary PresentX capture directory");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "queue::present_fixture::present_x_preserves_native_overlay_around_partial_blend",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("VICTORY_CAPTURE", captures.path())
+            .env_remove("VICTORY_CAPTURE_FRAMES")
+            .env_remove("VICTORY_CAPTURE_WORLD")
+            .env_remove("VICTORY_DUMP_TARGETS")
+            .env_remove("VICTORY_D3D12_WARP")
+            .status()
+            .expect("start isolated native PresentX fixture");
+        assert!(
+            status.success(),
+            "isolated native PresentX fixture: {status}"
+        );
+        return;
+    }
+    install_backing();
+    crate::host::on_failure(|reason| {
+        eprintln!("native PresentX fixture: {reason}");
+        std::process::exit(1);
+    });
+    let host = crate::host::host().expect("hardware D3D12 device for the native PresentX fixture");
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
+        IDXGIFactory4,
+    };
+    // SAFETY: plain DXGI queries for the adapter selected by the live device.
+    let adapter = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .expect("DXGI adapter description")
+    };
+    assert_eq!(adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+
+    let q = Guest::new(|out| {
+        let desc = QueueDescX {
+            kind: 0,
+            flags: 0,
+            engine_or_pipe: 0,
+            queue: 0,
+        };
+        create_x(null(), &desc, &QUEUE_IIDS[0], out)
+    });
+    // SAFETY: q retains its queue table, which selects the console slots.
+    let newer = unsafe { q.0.cast::<*const *const ()>().read() } == NEWER_FUNCTIONS.0.as_ptr();
+    let execute = slot::<extern "system" fn(This, u32, *const This, u64, u32)>(
+        q.0,
+        if newer { 0x118 } else { 0x108 },
+    );
+    let present_x = slot::<extern "system" fn(This, u32, *const Plane, *const u8) -> HRESULT>(
+        q.0,
+        if newer { 0x100 } else { 0xf0 },
+    );
+    let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(
+        q.0,
+        if newer { 0x80 } else { 0x70 },
+    );
+    let fence = Guest::new(|out| crate::fence::create(null(), 0, 0, &IUNKNOWN, out));
+    let completed = slot::<extern "system" fn(This) -> u64>(fence.0, 0x40);
+    let allocator = Guest::new(|out| list::create_allocator(null(), 0, &IUNKNOWN, out));
+    let new_list =
+        || Guest::new(|out| list::create_list(null(), 0, 0, allocator.0, null(), &IUNKNOWN, out));
+    let close = |cmd: &Guest| {
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(cmd.0, 0x48)(cmd.0),
+            S_OK
+        );
+    };
+
+    let scene = texture(false);
+    let overlay = texture(false);
+    let [scene_native, overlay_native] = [&scene, &overlay]
+        .map(|r| resource::host_copy(r.0).expect("guest resource has a native texture"));
+    assert_ne!(scene_native.texture, overlay_native.texture);
+    for native in [&scene_native, &overlay_native] {
+        assert!(native.exact_committed_bytes().is_none());
+        assert!(!native.has_pointer_exposure());
+        assert!(native.native_authority.lock().unwrap().is_empty());
+    }
+
+    let [scene_clear, overlay_clear, draw] = [new_list(), new_list(), new_list()];
+    let mut scene_descriptor = [0u64; 14];
+    let mut overlay_descriptor = [0u64; 14];
+    let scene_rtv = scene_descriptor.as_mut_ptr() as u64;
+    let overlay_rtv = overlay_descriptor.as_mut_ptr() as u64;
+    for (cmd, target, rtv, color) in [
+        (&scene_clear, &scene, scene_rtv, [0., 0., 1., 1.]),
+        (&overlay_clear, &overlay, overlay_rtv, [0., 0.5, 0., 0.5]),
+    ] {
+        descriptor::create_rtv(null(), target.0, null(), rtv);
+        slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const list::Rect)>(
+            cmd.0, 0x1a0,
+        )(cmd.0, rtv, &color, 0, null());
+        close(cmd);
+    }
+    // SAFETY: draw is an open guest list and the overlay RTV names a live
+    // resource. Retain the returned draw objects until the queue retires.
+    let draw_objects = unsafe { present_overlay_draw::record_overlay_draw(draw.0, overlay_rtv) };
+    close(&draw);
+
+    let planes = [&scene.0, &overlay.0].map(|resources| Plane {
+        token: 0,
+        count: 1,
+        resources,
+        _rest: [0; 6],
+    });
+    let observed = host.observe_next_present();
+    execute(q.0, 1, &scene_clear.0, 0, 0);
+    // Queue-only boundaries prevent the native window from combining the
+    // two independent clears (or either clear with the draw). No CPU wait
+    // or intermediate PresentX prepares the overlay for the draw.
+    assert_eq!(signal(q.0, fence.0, 1), S_OK);
+    execute(q.0, 1, &overlay_clear.0, 0, 0);
+    assert_eq!(signal(q.0, fence.0, 2), S_OK);
+    execute(q.0, 1, &draw.0, 0, 0);
+    assert_eq!(
+        present_x(q.0, planes.len() as u32, planes.as_ptr(), null()),
+        S_OK
+    );
+    assert_eq!(signal(q.0, fence.0, 3), S_OK);
+    let start = Instant::now();
+    while completed(fence.0) < 3 {
+        assert!(start.elapsed() < TIMEOUT, "native PresentX did not retire");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop(draw_objects);
+
+    // The guest return means enqueue succeeded. Only the host observer
+    // confirms the real readback fence, dual-plane dispatch and DXGI S_OK.
+    let observed = observed
+        .recv_timeout(TIMEOUT)
+        .expect("fenced readback from DXGI S_OK");
+    assert!(
+        observed.composited,
+        "native PresentX used the single-plane fallback"
+    );
+    let version = |native: &resource::HostTexture| -> CompletedVersion {
+        native.native_authority.lock().unwrap()[&None]
+    };
+    let (scene_version, overlay_version) = (version(&scene_native), version(&overlay_native));
+    let present_fence = host.completed_fence().expect("real fence after PresentX");
+    for v in [scene_version, overlay_version] {
+        assert_eq!(v.version.representation, Representation::NativeGpu);
+        assert!(v.fence.0 > 0 && v.fence.0 < present_fence.0);
+    }
+    assert_eq!(scene_version.version.number, 1, "primary clear only");
+    assert_eq!(overlay_version.version.number, 2, "overlay clear then draw");
+    assert!(scene_version.fence.0 < overlay_version.fence.0);
+
+    // The left half gains red and halves its old green. The right half is
+    // the clear-only control. Both halves show blue through the overlay.
+    const DRAWN: [u8; 3] = [128, 64, 127];
+    const RETAINED: [u8; 3] = [0, 128, 127];
+    let matches_rgb = |actual: &[u8], expected: [u8; 3]| {
+        actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1)
+    };
+    assert!(
+        matches_rgb(&observed.rgba[..3], DRAWN) && observed.rgba[3].abs_diff(255) <= 1,
+        "unscaled PresentX (0,0): RGBA {:?}, expected {DRAWN:?} + opaque alpha",
+        observed.rgba
+    );
+    let rows = native_present_capture();
+    assert_eq!(
+        &rows[1..4],
+        &observed.rgba[..3],
+        "same back-buffer readback"
+    );
+    const CAPTURE_EDGE: usize = EDGE / 2;
+    for (y, row) in rows.chunks_exact(1 + CAPTURE_EDGE * 3).enumerate() {
+        assert_eq!(row[0], 0, "diagnostic capture uses unfiltered rows");
+        for (x, actual) in row[1..].chunks_exact(3).enumerate() {
+            let expected = if x < CAPTURE_EDGE / 2 {
+                DRAWN
+            } else {
+                RETAINED
+            };
+            assert!(
+                matches_rgb(actual, expected),
+                "native PresentX ({},{}): RGB {actual:?}, expected {expected:?} (±1)",
+                x * 2,
+                y * 2
+            );
+        }
+    }
+    let retained = 1 + 3 * (CAPTURE_EDGE / 2);
+    eprintln!(
+        "native PresentX: drawn RGBA {:?}, retained RGB {:?}; verified all RGB samples of the {CAPTURE_EDGE}x{CAPTURE_EDGE} capture",
+        observed.rgba,
+        &rows[retained..retained + 3]
+    );
+}
+
+fn native_present_capture() -> Vec<u8> {
+    let folder = std::env::var_os("VICTORY_CAPTURE").expect("fixture capture directory");
+    let png = std::fs::read(std::path::Path::new(&folder).join("frame-1.png"))
+        .expect("diagnostic capture of the fenced back buffer");
+    // The built-in capture writer emits IHDR, one IDAT and IEND. It takes
+    // every second pixel of the real back buffer (no filtered resampling).
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR"));
+    let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+    assert_eq!((word(16), word(20)), (EDGE / 2, EDGE / 2));
+    assert_eq!(&png[24..29], &[8, 2, 0, 0, 0], "8-bit RGB PNG");
+    assert_eq!(&png[37..41], b"IDAT");
+    let len = (EDGE / 2) * (1 + (EDGE / 2) * 3);
+    let rows =
+        miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&png[41..41 + word(33)], len)
+            .expect("inflate diagnostic RGB rows");
+    assert_eq!(rows.len(), len);
+    rows
 }
